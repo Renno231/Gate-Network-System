@@ -33,15 +33,7 @@ local function mapToStr(t)
     return type(t) == "table" and string.char(unpack(t)) or tostring(t)
 end
 
-local bit32 = bit32 or load([[return {
-    band = function(a, b) return a & b end,
-    bor = function(a, b) return a | b end,
-    bxor = function(a, b) return a ~ b end,
-    bnot = function(a) return ~a end,
-    rshift = function(a, n) return a >> n end,
-    lshift = function(a, n) return a << n end,
-    arshift = function(int, by) local s = int / (2^by) return s - s%1 end
-}]])()
+local bit32 = require"bit32"
 
 local byteTableMT = {
     __tostring = mapToStr,
@@ -70,7 +62,8 @@ end
 -- http://www.computercraft.info/forums2/index.php?/user/12870-anavrins
 -- http://pastebin.com/6UV4qfNF
 -- Last update: October 10, 2017
-local sha256 = (function()
+local sha256 = {}
+do
     local mod32 = 2^32
     local band    = bit32.band
     local bnot    = bit32.bnot
@@ -241,12 +234,11 @@ local sha256 = (function()
         return setmetatable(out, byteTableMT)
     end
 
-    return {
-        digest = digest,
-        hmac = hmac,
-        pbkdf2 = pbkdf2
-    }
-end)()
+    
+    sha256.digest = digest
+    sha256.hmac = hmac
+    sha256.pbkdf2 = pbkdf2
+end
 
 -- Chacha20 cipher in ComputerCraft
 -- By Anavrins
@@ -255,7 +247,8 @@ end)()
 -- http://www.computercraft.info/forums2/index.php?/user/12870-anavrins
 -- http://pastebin.com/GPzf9JSa
 -- Last update: April 17, 2017
-local chacha20 = (function()
+local chacha20 = {}
+do
     local bxor = bit32.bxor
     local band = bit32.band
     local blshift = bit32.lshift
@@ -368,12 +361,11 @@ local chacha20 = (function()
         return setmetatable(out, byteTableMT)
     end
 
-    return {
-        crypt = crypt
-    }
-end)()
+    chacha20.crypt = crypt
+end
 -- random.lua - Random Byte Generator
-local random = (function()
+local random = {}
+do
     local entropy = ""
     local accumulator = ""
     local entropyPath = "/.random"
@@ -452,7 +444,7 @@ local random = (function()
         save()
     end
 
-    local function random()
+    local function newRandom()
         feed("random")
         feed(tostring(os.time()))
         feed(tostring({}))
@@ -465,16 +457,15 @@ local random = (function()
         return result
     end
 
-    return {
-        seed = seed,
-        save = save,
-        random = random
-    }
-end)()
+    random.seed = seed
+    random.save = save
+    random.random = newRandom
+end
 
 -- Big integer arithmetic for 168-bit (and 336-bit) numbers
 -- Numbers are represented as little-endian tables of 24-bit integers
-local arith = (function()
+local arith = {}
+do
     local function isEqual(a, b)
         return (
             a[1] == b[1]
@@ -881,24 +872,23 @@ local arith = (function()
 
         return t
     end
-
-    return {
-        isEqual = isEqual,
-        compare = compare,
-        add = add,
-        sub = sub,
-        addDouble = addDouble,
-        mult = mult,
-        square = square,
-        encodeInt = encodeInt,
-        decodeInt = decodeInt,
-        NAF = NAF
-    }
-end)()
+    
+    arith.isEqual = isEqual
+    arith.compare = compare
+    arith.add = add
+    arith.sub = sub
+    arith.addDouble = addDouble
+    arith.mult = mult
+    arith.square = square
+    arith.encodeInt = encodeInt
+    arith.decodeInt = decodeInt
+    arith.NAF = NAF
+end
 
 -- Arithmetic on the finite field of integers modulo p
 -- Where p is the finite field modulus
-local modp = (function()
+local modp = {}
+do
     local add = arith.add
     local sub = arith.sub
     local addDouble = arith.addDouble
@@ -1088,20 +1078,20 @@ local modp = (function()
         return result
     end
 
-    return {
-        addModP = addModP,
-        subModP = subModP,
-        multModP = multModP,
-        squareModP = squareModP,
-        montgomeryModP = montgomeryModP,
-        inverseMontgomeryModP = inverseMontgomeryModP,
-        expModP = expModP
-    }
-end)()
+    
+    modp.addModP = addModP
+    modp.subModP = subModP
+    modp.multModP = multModP
+    modp.squareModP = squareModP
+    modp.montgomeryModP = montgomeryModP
+    modp.inverseMontgomeryModP = inverseMontgomeryModP
+    modp.expModP = expModP
+end
 
 -- Arithmetic on the Finite Field of Integers modulo q
 -- Where q is the generator's subgroup order.
-local modq = (function()
+local modq = {}
+do
     local isEqual = arith.isEqual
     local compare = arith.compare
     local add = arith.add
@@ -1333,16 +1323,16 @@ local modq = (function()
         end
     }
 
-    return {
-        hashModQ = hashModQ,
-        randomModQ = randomModQ,
-        decodeModQ = decodeModQ,
-        inverseMontgomeryModQ = inverseMontgomeryModQ
-    }
-end)()
+    
+    modq.hashModQ = hashModQ
+    modq.randomModQ = randomModQ
+    modq.decodeModQ = decodeModQ
+    modq.inverseMontgomeryModQ = inverseMontgomeryModQ
+end
 
 -- Elliptic curve arithmetic
-local curve = (function()
+local curve = {}
+do
     ---- About the Curve Itself
     -- Field Size: 168 bits
     -- Field Modulus (p): 481 * 2^159 + 3
@@ -1658,12 +1648,10 @@ local curve = (function()
     G = setmetatable(G, pointMT)
     O = setmetatable(O, pointMT)
 
-    return {
-        G = G,
-        O = O,
-        pointDecode = pointDecode
-    }
-end)()
+    curve.G = G
+    curve.O = O
+    curve.pointDecode = pointDecode
+end
 
 local function getNonceFromEpoch()
     local nonce = {}
@@ -1780,6 +1768,7 @@ local function deriveKeyFromPassword(password, salt, iterations) --doesn't work 
     local derivedKey = sha256.pbkdf2(password, salt or random.random(), iterations or 10000, 21) --iterations, keyLength)
     return derivedKey
 end
+
 
 return {
     chacha20 = chacha20,
