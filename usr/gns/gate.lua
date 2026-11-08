@@ -3,7 +3,9 @@
 -- has passed gate.open (see handshake.lua). A gate is public until it joins a private network;
 -- from then on it serves only that network's members, each within their role.
 local api = require("api")
+local computer = require("computer")
 local ecc = require("ecc")
+local thread = require("thread")
 local serialization = require("serialization")
 local handshake = dofile("/usr/gns/handshake.lua")
 local entries = dofile("/usr/gns/entries.lua")
@@ -13,6 +15,8 @@ local fingerprint = dofile("/usr/gns/vault.lua").fingerprint
 local gate = {}
 
 local TYPE = {MILKYWAY = "MW", PEGASUS = "PG", UNIVERSE = "UN"}
+local ORIGIN = {MW = "Point of Origin", PG = "Subido", UN = "Glyph 17"}
+local DIAL_TIMEOUT = 120 -- seconds a whole dial may take
 
 -- The gate's saved state: key pair, entry sequence number, address book, pinned peer keys, the
 -- founder fingerprint it trusts (trust) and its private network (net = {network, revoked,
@@ -75,9 +79,43 @@ function gate.start(state, stargate, settings)
     local identity = state.identity
     publish(state, stargate, settings)
 
+    local dialing, lastDial -- the dialing thread, and how the last dial ended
+
     local function status()
         local gateState, outgoing = stargate.getGateStatus()
-        return {type = stargate.getGateType(), state = gateState, outgoing = outgoing, iris = stargate.getIrisState()}
+        return {type = stargate.getGateType(), state = gateState, outgoing = outgoing,
+            iris = stargate.getIrisState(), dialing = dialing ~= nil, lastDial = lastDial}
+    end
+
+    -- How many glyphs the gate has engaged, from its "[A, B, C]" dialedAddress.
+    local function engaged()
+        local text = tostring(stargate.dialedAddress or "[]"):match("^%[(.*)%]$") or ""
+        local count = 0
+        for _ in text:gmatch("[^,]+") do count = count + 1 end
+        return count
+    end
+
+    -- Waits until the gate is idle with count glyphs engaged, or until deadline.
+    local function settle(count, deadline)
+        while computer.uptime() < deadline do
+            if stargate.getGateStatus() == "idle" and engaged() >= count then return true end
+            os.sleep(0.1)
+        end
+        return false
+    end
+
+    -- Engages each glyph, then the gate, on a thread so the caller gets an answer right away.
+    local function startDial(glyphs)
+        dialing = thread.create(function()
+            local deadline = computer.uptime() + DIAL_TIMEOUT
+            lastDial = "timed out"
+            for i = 1, #glyphs do
+                if not settle(i - 1, deadline) then dialing = nil return end
+                stargate.engageSymbol(glyphs[i])
+            end
+            if settle(#glyphs, deadline) then lastDial = tostring(stargate.engageGate()) end
+            dialing = nil
+        end)
     end
 
     -- Changes whenever the network record or revocation list does, so sessions are checked again.
@@ -133,6 +171,22 @@ function gate.start(state, stargate, settings)
         end, "Proves both sides' keys (and the caller's membership on a private gate); returns the gate status"},
 
         status = {opened("user", function() return status() end), "The gate's type, state and iris"},
+
+        dial = {opened("user", function(_, address)
+            local own = TYPE[stargate.getGateType()] or "MW"
+            local glyphs = type(address) == "table" and address[own]
+            if type(glyphs) ~= "table" or #glyphs < 6 or #glyphs > 9 then error("no " .. own .. " address", 0) end
+            local list = {}
+            for i = 1, #glyphs do
+                if type(glyphs[i]) ~= "string" then error("bad address", 0) end
+                list[i] = glyphs[i]
+            end
+            if list[#list] ~= ORIGIN[own] then list[#list + 1] = ORIGIN[own] end
+            if dialing then error("already dialing", 0) end
+            if stargate.getGateStatus() ~= "idle" or engaged() > 0 then error("gate busy", 0) end
+            startDial(list)
+            return #list
+        end), "Dials an address {MW = {...}, PG = {...}, UN = {...}} with this gate's glyphs"},
 
         iris = {opened("moderator", function()
             stargate.toggleIris()

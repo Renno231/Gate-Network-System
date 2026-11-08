@@ -93,10 +93,7 @@ local fs = require"filesystem"
 -- local memory = require("memory")
 -- memory.setWidth(200)
 local ecc = require("ecc") --105kb of memory used at max load
-local gatenetstack = gns.gatenet.new()
-clientEnv.gatenetstack = gatenetstack
-clientEnv.gateconnections = {}
-clientEnv.clientconnections = {}
+clientEnv.gateconnections = {} -- open gate connections, shown under Nearby Gates
 
 component.gpu.freeAllBuffers()
 
@@ -109,7 +106,10 @@ local modem = component.modem
 local readFile = gns.utility.readFile
 local writeFile = gns.utility.writeFile
 
-local database = clientVault.state.database
+-- The vault also holds pinned gate keys, signed gate entries and private network memberships.
+local vaultState = clientVault.state
+vaultState.pins, vaultState.book, vaultState.networks = vaultState.pins or {}, vaultState.book or {}, vaultState.networks or {}
+local database = vaultState.database
 clientEnv.database = database
 clientEnv.vault = clientVault
 
@@ -232,6 +232,7 @@ while gns.clientActive do
     root:draw()
 end
 
+for _, connection in ipairs(clientEnv.gateconnections) do pcall(connection.proxy.close, connection.proxy) end
 local saved, saveError = clientVault:save()
 clientVault:lock()
 term.clear()
