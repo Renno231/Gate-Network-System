@@ -544,11 +544,6 @@ local function build()
         frame:size(R.w, R.h)
         frame:backgroundColor(C.page)
         frame:visible(false)
-        -- Only the shown screen takes touches: a frame passes a touch to the last child under
-        -- it, hidden or not, and all six screens cover the same cells.
-        frame.checkCollision = function(self, x, y)
-            return self:visible() and loom.widget.Frame.checkCollision(self, x, y)
-        end
         frames[s[1]] = frame
         local path = interfacePath .. s[1] .. ".lua"
         local loaded, err = loadfile(path)
