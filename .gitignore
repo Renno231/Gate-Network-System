@@ -1,2 +1,8 @@
 **/*.jpg
 *.PNG
+
+# Written on the computer at run time
+usr/gns/client/settings.lua
+usr/gns/client/vault
+usr/gns/server/settings.lua
+usr/gns/server/state

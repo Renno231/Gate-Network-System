@@ -36,89 +36,20 @@ local state = gate.load(gns.path.serverDirectory .. "state")
 local node = gate.start(state, stargate, settings, dhd)
 disco.offer("gns", handshake.PORT)
 
-local function networkName()
-    return state.net and ("private, founder " .. fingerprint(state.net.network.founder)) or "public"
-end
-
-print(("GNS gate %s (%s)"):format(settings.name, networkName()))
+print(("GNS gate %s (%s)"):format(settings.name,
+    state.net and ("private, founder " .. fingerprint(state.net.network.founder)) or "public"))
 print("Modem " .. component.modem.address)
 print("Device " .. fingerprint(state.identity.public))
 print("Type help for commands.")
 
-local commands = {}
+-- The console commands (console.lua); admins of the gate's network run the same ones remotely.
+local run = dofile(gns.path.gns .. "console.lua").new(node, settings, saveSettings, dhd, stargate)
+node.console = run
+local commands = {} -- only at the gate computer itself
 commands.help = function()
-    print("status              gate state and network")
-    print("book                the gates in this gate's address book")
-    print("sync <modem>        pull the address book (and network state) of another gate")
-    print("trust <fingerprint> let this gate join the network founded by that key")
-    print("close               stop dialing or close the outgoing wormhole")
-    print("log                 recent dialing, iris and IDC events")
-    print("idc                 list the IDCs that open the iris for incoming travellers")
-    print("idc add <code> <name> / idc remove <code>")
-    print("kawoosh on|off      close the iris while the wormhole forms (now " .. (settings.kawoosh and "on" or "off") .. ")")
-    print("clear               clear the screen")
-    print("quit                stop the gate")
-end
-commands.status = function()
-    local s = node.dialer.status()
-    print(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
-    print(("Server %.1f TPS, DHD %s, kawoosh avoidance %s"):format(s.tps, dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
-    print("Network: " .. networkName())
-    if state.trust then print("Trusts founder " .. state.trust) end
-end
-commands.book = function()
-    local count = 0
-    for _, e in pairs(state.book) do
-        count = count + 1
-        print(("%-16s %s seq %-3d %s%s"):format(e.name, e.type, e.seq, fingerprint(e.key), e.network and " (private)" or ""))
-    end
-    print(count .. " gates")
-end
-commands.sync = function(modem)
-    local taken, refused = node.sync(modem)
-    if not taken then
-        print("Sync failed: " .. tostring(refused))
-        return
-    end
-    print(("Synced from %s: %d new, %d refused"):format(modem:sub(1, 8), taken, #refused))
-    for _, r in ipairs(refused) do print("Refused " .. tostring(r[1] and r[1].name) .. ": " .. r[2]) end
-end
-commands.trust = function(founder)
-    if not founder:match("^GNS%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x$") then
-        print("Usage: trust GNS-xxxx-xxxx-xxxx-xxxx")
-        return
-    end
-    node.trust(founder)
-    print("Trusting founder " .. founder)
-end
-commands.close = function() print(node.dialer.close()) end
-commands.log = function()
-    for _, line in ipairs(node.dialer.log) do print(line) end
-end
-commands.idc = function(argument)
-    local action, code, name = argument:match("^(%S*)%s*(%S*)%s*(.-)%s*$")
-    code = math.tointeger(tonumber(code))
-    if action == "add" and code and name ~= "" then
-        settings.idcs[code] = name
-    elseif action == "remove" and code then
-        settings.idcs[code] = nil
-    elseif action ~= "" then
-        print("Usage: idc | idc add <code> <name> | idc remove <code>")
-        return
-    end
-    if action ~= "" then saveSettings() end
-    local count = 0
-    for c, n in pairs(settings.idcs) do
-        count = count + 1
-        print(("%-10d %s"):format(c, n))
-    end
-    print(count .. " IDCs")
-end
-commands.kawoosh = function(argument)
-    if argument ~= "on" and argument ~= "off" then print("Usage: kawoosh on|off") return end
-    settings.kawoosh = argument == "on"
-    saveSettings()
-    print("Kawoosh avoidance " .. argument)
+    run("help", print)
+    print(("%-22s %s"):format("clear", "clear the screen"))
+    print(("%-22s %s"):format("quit", "stop the gate"))
 end
 commands.clear = function() term.clear() end
 for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
@@ -132,8 +63,8 @@ while true do
     if command then
         local ok, err = pcall(command, argument)
         if not ok then print("Error: " .. tostring(err)) end
-    elseif name then
-        print("Unknown command " .. name .. "; type help.")
+    else
+        run(line, print)
     end
 end
 

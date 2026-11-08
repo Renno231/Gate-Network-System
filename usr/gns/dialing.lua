@@ -222,6 +222,7 @@ function dialing.new(stargate, dhd, settings)
             if prefix then from = #dialed + 1 else stargate.abortDialing() end
         end
 
+        dialer.target = glyphs
         local fast = opts.fast and dhd ~= nil and own ~= "UN"
         local avoid = settings.kawoosh ~= false and hasIris()
         local i, phase, openedAt, closedIris = from, "glyphs", nil, false
@@ -297,10 +298,16 @@ function dialing.new(stargate, dhd, settings)
         return "already idle"
     end
 
+    -- The gate now. glyphs: those engaged; target: the address being dialed (or last dialed)
+    -- with its point of origin, so a client can draw the chevrons.
     function dialer.status()
         local gateState, outgoing = stargate.getGateStatus()
+        local ok, capacity = pcall(stargate.getMaxEnergyStored)
+        local typed, irisType = pcall(stargate.getIrisType)
         return {type = stargate.getGateType(), state = gateState, outgoing = outgoing,
-            iris = stargate.getIrisState(), dialing = stepTimer ~= nil, lastDial = dialer.state,
+            iris = stargate.getIrisState(), irisType = typed and irisType or nil, dialing = stepTimer ~= nil, lastDial = dialer.state,
+            energy = stargate.getEnergyStored(), capacity = ok and tonumber(capacity) or nil,
+            glyphs = dialedGlyphs(stargate), target = dialer.target,
             tps = math.floor(probe.tps * 10 + 0.5) / 10}
     end
 

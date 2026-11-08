@@ -71,13 +71,18 @@ end
 -- Starts the gate. stargate is the JSG stargate component (or a stand-in with the same
 -- methods); dhd is the DHD component or nil; settings = {name, dim, port, kawoosh, idcs}, read
 -- live. Returns a node with the endpoint, the state, the dialer, sync(peerModem) and
--- trust(founderFingerprint); call node.stop() to stop.
+-- trust(founderFingerprint); call node.stop() to stop. node.console(line, out), when set (server.lua),
+-- runs a console command for an admin's console call.
 function gate.start(state, stargate, settings, dhd)
     local sessions = setmetatable({}, {__mode = "k"}) -- connection → {key, role, membership, version}
     local identity = state.identity
     publish(state, stargate, settings)
     local dialer = dialing.new(stargate, dhd, settings)
-    local status = dialer.status
+    local function status()
+        local s = dialer.status()
+        s.name, s.private = settings.name, state.net ~= nil
+        return s
+    end
 
     -- Changes whenever the network record or revocation list does, so sessions are checked again.
     local function netVersion()
@@ -112,6 +117,7 @@ function gate.start(state, stargate, settings, dhd)
         end
     end
 
+    local node
     local lib = {
         open = {function(request)
             local conn = api.caller()
@@ -131,7 +137,7 @@ function gate.start(state, stargate, settings, dhd)
             return reply
         end, "Proves both sides' keys (and the caller's membership on a private gate); returns the gate status"},
 
-        status = {opened("user", function() return status() end), "The gate's type, state and iris"},
+        status = {opened("user", function() return status() end), "The gate's name, type, state, iris, energy, TPS and last dial"},
 
         dial = {opened("user", function(_, address, opts)
             opts = type(opts) == "table" and opts or {}
@@ -180,13 +186,28 @@ function gate.start(state, stargate, settings, dhd)
             if not state.net then error("not in a network", 0) end
             return {network = state.net.network, revoked = state.net.revoked}
         end), "The network record and revocation list this gate holds"},
+
+        -- Admins configure the gate from anywhere: the gate's own console commands, its output
+        -- returned as lines. Each command run is noted in the gate's log.
+        console = {opened("admin", function(session, line)
+            if not node.console then error("this gate has no console", 0) end
+            if type(line) ~= "string" or #line > 256 then error("bad command line", 0) end
+            dialer.log[#dialer.log + 1] = "console " .. fingerprint(session.key):sub(1, 13) .. ": " .. line
+            if #dialer.log > 20 then table.remove(dialer.log, 1) end
+            local lines = {}
+            node.console(line, function(text) lines[#lines + 1] = tostring(text) end)
+            return lines
+        end), "Runs a gate console command (admin); returns its output lines"},
     }
-    local node = {state = state, dialer = dialer, endpoint = api.expose(handshake.ENDPOINT, lib, settings.port or handshake.PORT)}
+    node = {state = state, dialer = dialer, endpoint = api.expose(handshake.ENDPOINT, lib, settings.port or handshake.PORT)}
 
     function node.stop()
         node.endpoint:shutdown()
         dialer.stop()
     end
+
+    -- Signs the gate's entry again after its name or dimension changed.
+    function node.publish() return publish(state, stargate, settings) end
 
     -- Set by the gate's owner: the fingerprint of the founder whose network this gate may join.
     function node.trust(founderFingerprint)
