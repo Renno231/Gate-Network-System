@@ -4,6 +4,7 @@
 -- OC sets the sender address of a modem message, so a proof only works from the device that
 -- made it, to the gate it was made for. See docs/design/authentication.md.
 local ecc = require("ecc")
+local networks = dofile("/usr/gns/networks.lua")
 
 local handshake = {ENDPOINT = "gns", PORT = 160}
 
@@ -38,19 +39,26 @@ end
 -- modem address to the gate key seen there first. Returns the reply and whether this was the
 -- first contact, or nil, the reason and (when the key changed) the new key. Saving pins is the
 -- caller's job.
-function handshake.open(proxy, identity, pins, network)
+-- net is nil for the public network, or {network, revoked, membership} for a private one; the
+-- gate must then show a valid "gate" membership of that network.
+function handshake.open(proxy, identity, pins, net)
     local conn = proxy:getConnection()
     local clientModem, gateModem = conn.modem.address, conn.address
+    local network = net and net.network.id or ""
     local nonce = tostring(ecc.random.random()):sub(1, 16)
     local ok, reply = proxy.open({
         key = identity.public,
         nonce = nonce,
         network = network,
+        membership = net and net.membership,
         sig = tostring(ecc.sign(identity.private, message("client", nonce, clientModem, gateModem, network))),
     })
     if ok ~= true then return nil, tostring(reply) end
     if type(reply) ~= "table" or not verify(reply.key, message("gate", nonce, clientModem, gateModem, network), reply.sig) then
         return nil, "gate proof rejected"
+    end
+    if net and networks.check(net.network, net.revoked, reply.membership, reply.key) ~= "gate" then
+        return nil, "not a gate of this network"
     end
     local pinned = pins[gateModem]
     if pinned and pinned ~= reply.key then return nil, "gate key changed", reply.key end

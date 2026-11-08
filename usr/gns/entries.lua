@@ -2,7 +2,7 @@
 -- An address book maps a gate's public key to its newest valid entry.
 --
 -- entry = {key, seq, name, type = "MW" | "PG" | "UN", dim, address = {MW = {...}, PG = {...},
---          UN = {...}}, retired = true | nil, network = nil (public), sig}
+--          UN = {...}}, retired = true | nil, network = nil (public) or a network id, sig}
 local ecc = require("ecc")
 
 local entries = {MAX = 1000} -- the most entries one address book keeps
@@ -67,12 +67,13 @@ function entries.verify(e)
     return true
 end
 
--- Adds e to book if it is valid and newer than what book holds for that gate.
+-- Adds e to book if it is valid and newer than what book holds for that gate. A private entry is
+-- only taken by a book in the same network (network = that network's id, nil when public).
 -- Returns "added" or "updated", or nil and the reason it was refused.
-function entries.merge(book, e)
+function entries.merge(book, e, network)
     local ok, reason = entries.verify(e)
     if not ok then return nil, reason end
-    if e.network then return nil, "private entry" end -- private networks come later
+    if e.network and e.network ~= network then return nil, "private entry" end
     local current = book[e.key]
     if current and current.seq >= e.seq then return nil, "not newer" end
     if not current then
@@ -84,12 +85,12 @@ function entries.merge(book, e)
     return current and "updated" or "added"
 end
 
--- Merges a list of entries. Returns how many were taken and a list of {entry, reason} refused.
-function entries.mergeAll(book, list)
+-- Merges a list of entries (see merge for network). Returns how many were taken and a list of {entry, reason} refused.
+function entries.mergeAll(book, list, network)
     local taken, refused = 0, {}
     if type(list) ~= "table" then return 0, {{nil, "not a list"}} end
     for i = 1, #list do
-        local result, reason = entries.merge(book, list[i])
+        local result, reason = entries.merge(book, list[i], network)
         if result then taken = taken + 1
         elseif reason ~= "not newer" then refused[#refused + 1] = {list[i], reason} end
     end
