@@ -12,9 +12,12 @@ local gate = dofile(gns.path.gns .. "gate.lua")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
 
-local stargate = gns.stargate or component.stargate -- gns.stargate: a stand-in for tests
+-- gns.stargate and gns.dhd: stand-ins for tests.
+local stargate = gns.stargate or component.stargate
+local dhd = gns.dhd or (component.isAvailable("dhd") and component.dhd or nil)
 
--- settings.lua: the gate's published name and dimension.
+-- settings.lua: the gate's published name and dimension, kawoosh avoidance (on unless false)
+-- and the IDCs that open the iris for incoming travellers ({[code] = name}).
 local settingsPath = gns.path.serverDirectory .. "settings.lua"
 local settings = gns.utility.readFile(settingsPath)
 if type(settings) ~= "table" then
@@ -22,10 +25,15 @@ if type(settings) ~= "table" then
     settings = {name = file and file:read("*l") or "Gate", dim = 0}
     if file then file:close() end
 end
-gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
+settings.idcs = type(settings.idcs) == "table" and settings.idcs or {}
+if settings.kawoosh == nil then settings.kawoosh = true end
+local function saveSettings()
+    gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
+end
+saveSettings()
 
 local state = gate.load(gns.path.serverDirectory .. "state")
-local node = gate.start(state, stargate, settings)
+local node = gate.start(state, stargate, settings, dhd)
 disco.offer("gns", handshake.PORT)
 
 local function networkName()
@@ -43,12 +51,18 @@ commands.help = function()
     print("book                the gates in this gate's address book")
     print("sync <modem>        pull the address book (and network state) of another gate")
     print("trust <fingerprint> let this gate join the network founded by that key")
+    print("close               stop dialing or close the outgoing wormhole")
+    print("log                 recent dialing, iris and IDC events")
+    print("idc                 list the IDCs that open the iris for incoming travellers")
+    print("idc add <code> <name> / idc remove <code>")
+    print("kawoosh on|off      close the iris while the wormhole forms (now " .. (settings.kawoosh and "on" or "off") .. ")")
     print("clear               clear the screen")
     print("quit                stop the gate")
 end
 commands.status = function()
-    local gateState = stargate.getGateStatus()
-    print(("%s, %s, iris %s"):format(settings.name, gateState, tostring(stargate.getIrisState())))
+    local s = node.dialer.status()
+    print(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
+    print(("Server %.1f TPS, DHD %s, kawoosh avoidance %s"):format(s.tps, dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
     print("Network: " .. networkName())
     if state.trust then print("Trusts founder " .. state.trust) end
 end
@@ -77,13 +91,43 @@ commands.trust = function(founder)
     node.trust(founder)
     print("Trusting founder " .. founder)
 end
+commands.close = function() print(node.dialer.close()) end
+commands.log = function()
+    for _, line in ipairs(node.dialer.log) do print(line) end
+end
+commands.idc = function(argument)
+    local action, code, name = argument:match("^(%S*)%s*(%S*)%s*(.-)%s*$")
+    code = math.tointeger(tonumber(code))
+    if action == "add" and code and name ~= "" then
+        settings.idcs[code] = name
+    elseif action == "remove" and code then
+        settings.idcs[code] = nil
+    elseif action ~= "" then
+        print("Usage: idc | idc add <code> <name> | idc remove <code>")
+        return
+    end
+    if action ~= "" then saveSettings() end
+    local count = 0
+    for c, n in pairs(settings.idcs) do
+        count = count + 1
+        print(("%-10d %s"):format(c, n))
+    end
+    print(count .. " IDCs")
+end
+commands.kawoosh = function(argument)
+    if argument ~= "on" and argument ~= "off" then print("Usage: kawoosh on|off") return end
+    settings.kawoosh = argument == "on"
+    saveSettings()
+    print("Kawoosh avoidance " .. argument)
+end
 commands.clear = function() term.clear() end
+for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
 
 while true do
     io.write("gate> ")
     local line = io.read()
     if not line or line == "quit" then break end
-    local name, argument = line:match("^%s*(%S+)%s*(%S*)")
+    local name, argument = line:match("^%s*(%S+)%s*(.-)%s*$")
     local command = name and commands[name]
     if command then
         local ok, err = pcall(command, argument)
@@ -94,5 +138,5 @@ while true do
 end
 
 disco.withdraw("gns")
-node.endpoint:shutdown()
+node.stop()
 print("GNS gate stopped.")

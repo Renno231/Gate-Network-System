@@ -3,20 +3,17 @@
 -- has passed gate.open (see handshake.lua). A gate is public until it joins a private network;
 -- from then on it serves only that network's members, each within their role.
 local api = require("api")
-local computer = require("computer")
 local ecc = require("ecc")
-local event = require("event")
 local serialization = require("serialization")
 local handshake = dofile("/usr/gns/handshake.lua")
 local entries = dofile("/usr/gns/entries.lua")
 local networks = dofile("/usr/gns/networks.lua")
 local fingerprint = dofile("/usr/gns/vault.lua").fingerprint
+local dialing = dofile("/usr/gns/dialing.lua")
 
 local gate = {}
 
-local TYPE = {MILKYWAY = "MW", PEGASUS = "PG", UNIVERSE = "UN"}
-local ORIGIN = {MW = "Point of Origin", PG = "Subido", UN = "Glyph 17"}
-local DIAL_TIMEOUT = 120 -- seconds a whole dial may take
+local TYPE = dialing.TYPE
 
 -- The gate's saved state: key pair, entry sequence number, address book, pinned peer keys, the
 -- founder fingerprint it trusts (trust) and its private network (net = {network, revoked,
@@ -72,50 +69,15 @@ local function publish(state, stargate, settings)
 end
 
 -- Starts the gate. stargate is the JSG stargate component (or a stand-in with the same
--- methods); settings = {name, dim, port}. Returns a node with the endpoint, the state,
--- sync(peerModem) and trust(founderFingerprint); call node.endpoint:shutdown() to stop.
-function gate.start(state, stargate, settings)
+-- methods); dhd is the DHD component or nil; settings = {name, dim, port, kawoosh, idcs}, read
+-- live. Returns a node with the endpoint, the state, the dialer, sync(peerModem) and
+-- trust(founderFingerprint); call node.stop() to stop.
+function gate.start(state, stargate, settings, dhd)
     local sessions = setmetatable({}, {__mode = "k"}) -- connection → {key, role, membership, version}
     local identity = state.identity
     publish(state, stargate, settings)
-
-    local dialing, lastDial -- the dialing timer, and how the last dial ended
-
-    local function status()
-        local gateState, outgoing = stargate.getGateStatus()
-        return {type = stargate.getGateType(), state = gateState, outgoing = outgoing,
-            iris = stargate.getIrisState(), dialing = dialing ~= nil, lastDial = lastDial}
-    end
-
-    -- How many glyphs the gate has engaged, from its "[A, B, C]" dialedAddress.
-    local function engaged()
-        local text = tostring(stargate.dialedAddress or "[]"):match("^%[(.*)%]$") or ""
-        local count = 0
-        for _ in text:gmatch("[^,]+") do count = count + 1 end
-        return count
-    end
-
-    -- Engages each glyph, then the gate, from a timer so the caller gets an answer right away.
-    -- Each step waits until the gate is idle with the previous glyphs engaged.
-    local function startDial(glyphs)
-        local deadline, i = computer.uptime() + DIAL_TIMEOUT, 1
-        lastDial = "timed out"
-        dialing = event.timer(0.1, function()
-            if computer.uptime() >= deadline then
-                dialing = nil
-                return false
-            end
-            if stargate.getGateStatus() ~= "idle" or engaged() < i - 1 then return end
-            if i <= #glyphs then
-                stargate.engageSymbol(glyphs[i])
-                i = i + 1
-                return
-            end
-            lastDial = tostring(stargate.engageGate())
-            dialing = nil
-            return false
-        end, math.huge)
-    end
+    local dialer = dialing.new(stargate, dhd, settings)
+    local status = dialer.status
 
     -- Changes whenever the network record or revocation list does, so sessions are checked again.
     local function netVersion()
@@ -171,21 +133,14 @@ function gate.start(state, stargate, settings)
 
         status = {opened("user", function() return status() end), "The gate's type, state and iris"},
 
-        dial = {opened("user", function(_, address)
-            local own = TYPE[stargate.getGateType()] or "MW"
-            local glyphs = type(address) == "table" and address[own]
-            if type(glyphs) ~= "table" or #glyphs < 6 or #glyphs > 9 then error("no " .. own .. " address", 0) end
-            local list = {}
-            for i = 1, #glyphs do
-                if type(glyphs[i]) ~= "string" then error("bad address", 0) end
-                list[i] = glyphs[i]
-            end
-            if list[#list] ~= ORIGIN[own] then list[#list + 1] = ORIGIN[own] end
-            if dialing then error("already dialing", 0) end
-            if stargate.getGateStatus() ~= "idle" or engaged() > 0 then error("gate busy", 0) end
-            startDial(list)
-            return #list
-        end), "Dials an address {MW = {...}, PG = {...}, UN = {...}} with this gate's glyphs"},
+        dial = {opened("user", function(_, address, opts)
+            opts = type(opts) == "table" and opts or {}
+            return dialer.dial(address, {fast = opts.fast == true, idc = math.tointeger(opts.idc)})
+        end), "Dials an address {MW = {...}, PG = {...}, UN = {...}}; opts {fast, idc}. Returns the glyph count, cost and duration"},
+
+        closeWormhole = {opened("user", function()
+            return dialer.close()
+        end), "Stops a dial in progress or closes the outgoing wormhole"},
 
         iris = {opened("moderator", function()
             stargate.toggleIris()
@@ -226,7 +181,12 @@ function gate.start(state, stargate, settings)
             return {network = state.net.network, revoked = state.net.revoked}
         end), "The network record and revocation list this gate holds"},
     }
-    local node = {state = state, endpoint = api.expose(handshake.ENDPOINT, lib, settings.port or handshake.PORT)}
+    local node = {state = state, dialer = dialer, endpoint = api.expose(handshake.ENDPOINT, lib, settings.port or handshake.PORT)}
+
+    function node.stop()
+        node.endpoint:shutdown()
+        dialer.stop()
+    end
 
     -- Set by the gate's owner: the fingerprint of the founder whose network this gate may join.
     function node.trust(founderFingerprint)

@@ -8,6 +8,7 @@ local computer = require"computer"
 local yawl = require("yawl-e")
 local api = require("api")
 local disco = require("disco")
+local event = require("event")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local entries = dofile(gns.path.gns .. "entries.lua")
 local gui = yawl.widget
@@ -164,14 +165,39 @@ dialButton:callback(function(self, _, eventName, ...)
         return
     end
     connection.lastActive = computer.uptime()
+    -- A dial speed under 25 s presses the gate's DHD; the row's first IDC goes once open.
+    local idc
+    for _, code in pairs(destination.IDCs or {}) do
+        if math.tointeger(code) then idc = code break end
+    end
+    local opts = {fast = (tonumber(clientEnv.settings.dialSpeed) or 25) < 25, idc = idc}
     connection.proxy:async(guard(function(ok, result)
-        if ok == true then
-            log(connection, ("Dialing %s (%d glyphs)."):format(destination.Name, result))
-        else
+        if ok ~= true then
             log(connection, "Dial refused: " .. tostring(result))
+            return
         end
-    end)).dial(destination.Address)
+        log(connection, ("Dialing %s: %d glyphs%s, %d RF, open for %d s%s."):format(destination.Name,
+            result.glyphs, result.from > 1 and (" from glyph " .. result.from) or "", result.open,
+            result.seconds, result.fast and ", DHD" or ""))
+        -- Follow the gate until the dial ends: report each change of its dial state.
+        local last, polls = "dialing", 0
+        local timer
+        timer = event.timer(1, guard(function()
+            polls = polls + 1
+            connection.proxy:async(guard(function(got, status)
+                if got ~= true then return end
+                if status.lastDial ~= last then
+                    last = status.lastDial
+                    log(connection, "Gate: " .. tostring(last))
+                end
+                -- Done when the gate stops dialing, unless an IDC answer is still to come.
+                local ended = not status.dialing and not (idc and last == "open")
+                if ended or polls >= 60 then event.cancel(timer) end
+            end)).status()
+        end), math.huge)
+    end)).dial(destination.Address, opts)
 end)
+
 
 local scanButton = gui.TextButton(currenttab, dialButton:x() + dialButton:width() + 2, dialButton:y(), nil, 1, "[ SCAN ]", 0)
 scanButton:backgroundColor(0xffff00)
