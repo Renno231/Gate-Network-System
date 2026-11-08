@@ -1,5 +1,5 @@
 -- Dialing tab: find nearby gates (disco), open them (gate.open), pull their signed address books
--- and dial. Network work runs on threads, because widget callbacks cannot wait.
+-- and dial. Widget callbacks cannot wait, so every network step continues in a callback.
 local gns, clientEnv, selfPath = ...
 checkArg(1, gns, 'table')
 local mainWindow = clientEnv.mainWindow
@@ -8,7 +8,6 @@ local computer = require"computer"
 local yawl = require("yawl-e")
 local api = require("api")
 local disco = require("disco")
-local thread = require("thread")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local entries = dofile(gns.path.gns .. "entries.lua")
 local gui = yawl.widget
@@ -88,59 +87,71 @@ local function record(e)
     database[#database + 1] = {key = e.key, Name = e.name, Type = e.type, Address = address}
 end
 
--- Opens the gate at address: public first, then with each private network membership held.
--- Returns a connection, or nil and the reason.
-local function openGate(address)
-    local ok, proxy = pcall(api.connect, handshake.ENDPOINT, handshake.PORT, address, nil, 3)
-    if not ok then return nil, tostring(proxy) end
-    local reply, reason = handshake.open(proxy, identity, vaultState.pins)
-    local net
-    if not reply and reason == "private gate" then
-        for _, membership in pairs(vaultState.networks) do
-            reply, reason = handshake.open(proxy, identity, vaultState.pins, membership)
-            if reply then net = membership break end
+-- Network work never waits: each step hands its result to a callback. guard reports a
+-- callback's error in the feedback box instead of losing it in the event handler.
+local busy = false -- a scan is running
+local function guard(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then
+            output:push("Error: " .. tostring(err))
+            busy = false
         end
     end
-    if not reply then
-        proxy:close()
-        return nil, reason
-    end
-    return {proxy = proxy, address = address, key = reply.key, net = net, status = reply.status,
-        name = address:sub(1, 8), lastActive = computer.uptime(), _log = {}}
 end
 
--- Pulls the gate's address book into the vault. Returns how many entries were new.
-local function pull(connection)
-    local ok, list = connection.proxy.entries()
-    if ok ~= true then
-        log(connection, "Address book refused: " .. tostring(list))
-        return 0
-    end
-    local taken, refused = entries.mergeAll(vaultState.book, list, connection.net and connection.net.network.id)
-    for _, r in ipairs(refused) do log(connection, "Refused entry " .. tostring(r[1] and r[1].name) .. ": " .. r[2]) end
-    if clientEnv.settings.autoLogToDatabase then
-        for _, e in pairs(vaultState.book) do record(e) end
-    end
-    local own = vaultState.book[connection.key]
-    if own then connection.name = own.name end
-    return taken
+-- Opens the gate at address: public first, then with each private network membership held.
+-- Calls callback(connection), or callback(nil, reason).
+local function openGate(address, callback)
+    api.connectAsync(handshake.ENDPOINT, handshake.PORT, address, guard(function(proxy, err)
+        if not proxy then return callback(nil, err) end
+        local function finish(reply, reason, net)
+            if not reply then
+                proxy:close()
+                return callback(nil, reason)
+            end
+            callback({proxy = proxy, address = address, key = reply.key, net = net, status = reply.status,
+                name = address:sub(1, 8), lastActive = computer.uptime(), _log = {}})
+        end
+        local nets = {}
+        for _, net in pairs(vaultState.networks) do nets[#nets + 1] = net end
+        local function try(i, reason)
+            local net = nets[i]
+            if not net then return finish(nil, reason) end
+            handshake.openAsync(proxy, identity, vaultState.pins, net, guard(function(reply, why)
+                if reply then return finish(reply, nil, net) end
+                try(i + 1, why)
+            end))
+        end
+        handshake.openAsync(proxy, identity, vaultState.pins, nil, guard(function(reply, reason)
+            if reply or reason ~= "private gate" then return finish(reply, reason) end
+            try(1, reason)
+        end))
+    end), nil, 3)
+end
+
+-- Pulls the gate's address book into the vault. Calls callback(number of new entries).
+local function pull(connection, callback)
+    connection.proxy:async(guard(function(ok, list)
+        if ok ~= true then
+            log(connection, "Address book refused: " .. tostring(list))
+            return callback(0)
+        end
+        local taken, refused = entries.mergeAll(vaultState.book, list, connection.net and connection.net.network.id)
+        for _, r in ipairs(refused) do log(connection, "Refused entry " .. tostring(r[1] and r[1].name) .. ": " .. r[2]) end
+        if clientEnv.settings.autoLogToDatabase then
+            for _, e in pairs(vaultState.book) do record(e) end
+        end
+        local own = vaultState.book[connection.key]
+        if own then connection.name = own.name end
+        callback(taken)
+    end)).entries()
 end
 
 local function findConnection(address)
     for i, connection in ipairs(gateConnections) do
         if connection.address == address then return connection, i end
     end
-end
-
-local busy = false
-local function background(task)
-    if busy then return end
-    busy = true
-    thread.create(function()
-        local ok, err = pcall(task)
-        if not ok then output:push("Error: " .. tostring(err)) end
-        busy = false
-    end)
 end
 
 local dialButton = gui.TextButton(currenttab, nearbyList:x(), nearbyList:y() + nearbyList:height(), nil, 1, "[DIAL]", 0)
@@ -152,41 +163,52 @@ dialButton:callback(function(self, _, eventName, ...)
         output:push("Select a nearby gate to dial from and a database gate to dial.")
         return
     end
-    background(function()
-        connection.lastActive = computer.uptime()
-        local ok, result = connection.proxy.dial(destination.Address)
+    connection.lastActive = computer.uptime()
+    connection.proxy:async(guard(function(ok, result)
         if ok == true then
             log(connection, ("Dialing %s (%d glyphs)."):format(destination.Name, result))
         else
             log(connection, "Dial refused: " .. tostring(result))
         end
-    end)
+    end)).dial(destination.Address)
 end)
 
 local scanButton = gui.TextButton(currenttab, dialButton:x() + dialButton:width() + 2, dialButton:y(), nil, 1, "[ SCAN ]", 0)
 scanButton:backgroundColor(0xffff00)
 scanButton:callback(function(self, _, eventName, ...)
     if eventName ~= "touch" then return end
-    background(function()
-        output:push("Scanning for gates...")
-        local found, opened, learned = disco.find("gns", 2), 0, 0
+    if busy then return end
+    busy = true
+    output:push("Scanning for gates...")
+    disco.findAsync("gns", 2, guard(function(found)
+        local waiting, opened, learned = 1, 0, 0
+        local function done()
+            waiting = waiting - 1
+            if waiting > 0 then return end
+            output:push(("Found %d gates, opened %d, %d new address book entries."):format(#found, opened, learned))
+            local saved, err = clientEnv.vault:save()
+            if not saved then output:push("Vault not saved: " .. tostring(err)) end
+            busy = false
+        end
         for _, host in ipairs(found) do
             if not findConnection(host.address) then
-                local connection, reason = openGate(host.address)
-                if connection then
-                    learned = learned + pull(connection)
-                    gateConnections[#gateConnections + 1] = connection
-                    log(connection, ("Connected to %s (%s)."):format(connection.name, connection.net and "private" or "public"))
-                    opened = opened + 1
-                else
-                    output:push(("%s: %s"):format(host.name, reason))
-                end
+                waiting = waiting + 1
+                openGate(host.address, guard(function(connection, reason)
+                    if not connection then
+                        output:push(("%s: %s"):format(host.name, reason))
+                        return done()
+                    end
+                    pull(connection, guard(function(taken)
+                        learned, opened = learned + taken, opened + 1
+                        gateConnections[#gateConnections + 1] = connection
+                        log(connection, ("Connected to %s (%s)."):format(connection.name, connection.net and "private" or "public"))
+                        done()
+                    end))
+                end))
             end
         end
-        output:push(("Found %d gates, opened %d, %d new address book entries."):format(#found, opened, learned))
-        local saved, err = clientEnv.vault:save()
-        if not saved then output:push("Vault not saved: " .. tostring(err)) end
-    end)
+        done()
+    end))
 end)
 
 local closeButton = gui.TextButton(currenttab, scanButton:x() + scanButton:width() + 2, scanButton:y(), nil, 1, "[CLOSE]", 0)

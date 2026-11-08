@@ -5,7 +5,7 @@
 local api = require("api")
 local computer = require("computer")
 local ecc = require("ecc")
-local thread = require("thread")
+local event = require("event")
 local serialization = require("serialization")
 local handshake = dofile("/usr/gns/handshake.lua")
 local entries = dofile("/usr/gns/entries.lua")
@@ -79,7 +79,7 @@ function gate.start(state, stargate, settings)
     local identity = state.identity
     publish(state, stargate, settings)
 
-    local dialing, lastDial -- the dialing thread, and how the last dial ended
+    local dialing, lastDial -- the dialing timer, and how the last dial ended
 
     local function status()
         local gateState, outgoing = stargate.getGateStatus()
@@ -95,27 +95,26 @@ function gate.start(state, stargate, settings)
         return count
     end
 
-    -- Waits until the gate is idle with count glyphs engaged, or until deadline.
-    local function settle(count, deadline)
-        while computer.uptime() < deadline do
-            if stargate.getGateStatus() == "idle" and engaged() >= count then return true end
-            os.sleep(0.1)
-        end
-        return false
-    end
-
-    -- Engages each glyph, then the gate, on a thread so the caller gets an answer right away.
+    -- Engages each glyph, then the gate, from a timer so the caller gets an answer right away.
+    -- Each step waits until the gate is idle with the previous glyphs engaged.
     local function startDial(glyphs)
-        dialing = thread.create(function()
-            local deadline = computer.uptime() + DIAL_TIMEOUT
-            lastDial = "timed out"
-            for i = 1, #glyphs do
-                if not settle(i - 1, deadline) then dialing = nil return end
-                stargate.engageSymbol(glyphs[i])
+        local deadline, i = computer.uptime() + DIAL_TIMEOUT, 1
+        lastDial = "timed out"
+        dialing = event.timer(0.1, function()
+            if computer.uptime() >= deadline then
+                dialing = nil
+                return false
             end
-            if settle(#glyphs, deadline) then lastDial = tostring(stargate.engageGate()) end
+            if stargate.getGateStatus() ~= "idle" or engaged() < i - 1 then return end
+            if i <= #glyphs then
+                stargate.engageSymbol(glyphs[i])
+                i = i + 1
+                return
+            end
+            lastDial = tostring(stargate.engageGate())
             dialing = nil
-        end)
+            return false
+        end, math.huge)
     end
 
     -- Changes whenever the network record or revocation list does, so sessions are checked again.
