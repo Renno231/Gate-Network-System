@@ -22,6 +22,62 @@ event.listen("interrupted", function()
     return false
 end)
 
+-- Unlock the vault (identity key and address book) before the GUI takes the screen.
+-- The password is typed in the terminal because YAWL-E's TextInput cannot mask input.
+local vault = dofile(require("filesystem").concat(gns.path.gns, "vault.lua"))
+local function unlockVault()
+    local fs, term = require("filesystem"), require("term")
+    local vaultPath = fs.concat(gns.path.clientDirectory, "vault")
+    local function ask(prompt)
+        io.write(prompt)
+        local line = term.read(nil, nil, nil, "*")
+        return line and (line:gsub("\n$", ""))
+    end
+    if vault.exists(vaultPath) then
+        for _ = 1, 3 do
+            local password = ask("GNS password: ")
+            if not password then return nil end
+            print("Unlocking...")
+            local opened, reason = vault.open(vaultPath, password)
+            if opened then return opened end
+            print(reason)
+        end
+        return nil
+    end
+    print("First run: choose a password for this device's GNS vault.")
+    print("It protects this device's identity key and address book.")
+    local password
+    repeat
+        password = ask("New password: ")
+        if not password then return nil end
+        local again = ask("Repeat password: ")
+        if not again then return nil end
+        if password == "" or password ~= again then
+            print(password == "" and "The password cannot be empty." or "The passwords do not match.")
+            password = nil
+        end
+    until password
+    -- Move an existing plaintext address book into the vault.
+    local plainPath = fs.concat(gns.path.clientDirectory, "database/current.lua")
+    local database = gns.utility.readFile(plainPath)
+    print("Creating vault...")
+    local created, reason = vault.create(vaultPath, password, {database = type(database) == "table" and database or {}})
+    if not created then
+        print("Could not create the vault: " .. tostring(reason))
+        return nil
+    end
+    if fs.exists(plainPath) then fs.remove(plainPath) end
+    print("Device fingerprint: " .. created:fingerprint())
+    return created
+end
+local clientVault = unlockVault()
+if not clientVault then
+    gns.isRepeating = false
+    gns.clientActive = false
+    print("GNS client locked.")
+    return
+end
+
 local yawl = require("yawl-e")
 local gui = yawl.widget
 local term = require("term")
@@ -53,8 +109,9 @@ local modem = component.modem
 local readFile = gns.utility.readFile
 local writeFile = gns.utility.writeFile
 
-local database = readFile(gns.path.clientDirectory.."/database/current.lua")
+local database = clientVault.state.database
 clientEnv.database = database
+clientEnv.vault = clientVault
 
 local settingsPath = gns.path.clientDirectory.."settings.lua"
 local settings = { --add a read and save ability
@@ -87,7 +144,7 @@ readFile(settingsPath, function(settingsOverride)
 end)
 writeFile(settingsPath, "return " .. serialization.serialize(settings, 100))
 
-local bottomText = gui.TextLabel(root, 1, root:height(), " Press CTRL+C to exit." .. (gns.isRepeating and " Click the red button to reload." or ""), 0xffffff)
+local bottomText = gui.TextLabel(root, 1, root:height(), " Press CTRL+C to exit." .. (gns.isRepeating and " Click the red button to reload." or "") .. " Device " .. clientVault:fingerprint(), 0xffffff)
 bottomText:width(root:width())
 bottomText:backgroundColor(0x333333)
 bottomText:autoWidth(false)
@@ -175,8 +232,10 @@ while gns.clientActive do
     root:draw()
 end
 
+local saved, saveError = clientVault:save()
+clientVault:lock()
 term.clear()
-print("Closed GNS client")
+print(saved and "Closed GNS client" or ("Closed GNS client, but the vault was not saved: " .. tostring(saveError)))
 
 root:Destroy(true) --always call that on all Frame without a parent. This is used to unregister the event listeners for screen related events
 component.gpu.freeAllBuffers()
