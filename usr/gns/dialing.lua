@@ -283,8 +283,9 @@ function dialing.new(stargate, dhd, settings)
             stepTimer = nil
         end
         idc = nil
-        local gateState = stargate.getGateStatus()
+        local gateState, outgoing = stargate.getGateStatus()
         if gateState == "open" then
+            if not outgoing then return "incoming wormhole: only the dialing gate can close it" end
             stargate.disengageGate()
             return "closing"
         end

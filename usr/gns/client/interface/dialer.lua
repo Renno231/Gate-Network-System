@@ -199,6 +199,22 @@ dialButton:callback(function(self, _, eventName, ...)
 end)
 
 
+-- Under the feedback box: stops the selected gate's dial or closes its outgoing wormhole.
+local disengageButton = gui.TextButton(currenttab, output:x(), output:y() + output:height() + 1, nil, 1, "[DISENGAGE]", 0)
+disengageButton:backgroundColor(0xff8800)
+disengageButton:callback(function(self, _, eventName, ...)
+    if eventName ~= "touch" then return end
+    local connection = selected(nearbyList)
+    if not connection then
+        output:push("Select a nearby gate to disengage.")
+        return
+    end
+    connection.lastActive = computer.uptime()
+    connection.proxy:async(guard(function(ok, result)
+        log(connection, ok == true and ("Disengage: " .. tostring(result)) or ("Disengage refused: " .. tostring(result)))
+    end)).closeWormhole()
+end)
+
 local scanButton = gui.TextButton(currenttab, dialButton:x() + dialButton:width() + 2, dialButton:y(), nil, 1, "[ SCAN ]", 0)
 scanButton:backgroundColor(0xffff00)
 scanButton:callback(function(self, _, eventName, ...)
