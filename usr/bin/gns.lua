@@ -2,6 +2,11 @@
 -- gns client          run the client even where there is a stargate
 -- gns passwd          change the client vault's password
 -- gns autorun on|off  start gns when the computer boots (a line in /home/.shrc)
+-- gns update          install the newest GNS from GitHub (needs an internet card)
+-- gns floppy DEST     write GNS and its libraries to DEST/gns.bundle (a floppy, say), for
+--                     computers without an internet card: bundle unpack /mnt/xxx/gns.bundle
+-- gns floppy DEST --os[=GROUP,...] [--skip=PATH,...] [--name=gate-%02d] [--first=N] [--auto=S] [--label=TEXT]
+--                     make an installer floppy with QuickOS and GNS for empty computers (mkinstaller)
 -- gns help            this list
 -- --repeating reruns the program after it exits (for development).
 local shell = require("shell")
@@ -13,11 +18,80 @@ local command = args[1]
 local gnsPath = "/usr/gns/"
 local serverPath, clientPath = gnsPath .. "server/server.lua", gnsPath .. "client/client.lua"
 
-if command == "help" or (command and command ~= "client" and command ~= "passwd" and command ~= "autorun") then
+if command == "help" or (command and command ~= "client" and command ~= "passwd" and command ~= "autorun" and command ~= "update" and command ~= "floppy") then
     print("gns                 run the gate server (with a stargate) or the client")
     print("gns client          run the client")
     print("gns passwd          change the client vault's password")
     print("gns autorun on|off  start gns when the computer boots")
+    print("gns update          install the newest GNS from GitHub")
+    print("gns floppy DEST     write GNS to DEST/gns.bundle for bundle unpack elsewhere")
+    print("gns floppy DEST --os  make an installer floppy with QuickOS and GNS (mkinstaller's")
+    print("                    --os, --skip, --name, --first, --auto and --label pass through)")
+    return
+end
+
+-- The bundle carries this computer's GNS, loom and ecc, never its vault, address book,
+-- settings or gate state: those hold this computer's own keys and gates. With --os, mkinstaller
+-- packs QuickOS beside it and leaves everything GNS installs (excluded files too) out of the OS.
+if command == "floppy" then
+    if not args[2] then
+        io.stderr:write("Usage: gns floppy DEST [--os[=GROUP,...]]\n")
+        return
+    end
+    local dest = shell.resolve(args[2])
+    local out = fs.concat(dest, "gns.bundle")
+    local cfgPath = "/usr/bundle.cfg" -- bundle packs a folder by its bundle.cfg, so one goes in /usr for a moment
+    if fs.exists(cfgPath) then
+        io.stderr:write(cfgPath .. " is in the way; gns floppy writes its own there while it runs.\n")
+        return
+    end
+    local file = assert(io.open(cfgPath, "w"))
+    file:write(require("serialization").serialize({name = "gns", hostname = true,
+        paths = {{"gns", "usr/gns"}, {"bin/gns.lua", "usr/bin/gns.lua"}, {"lib/loom", "usr/lib/loom"}, {"lib/ecc", "usr/lib/ecc"}},
+        exclude = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}}))
+    file:close()
+    if options.os then
+        local argv, done = {dest, "/usr"}, fs.concat(dest, "install.cfg")
+        for _, key in ipairs({"os", "skip", "name", "first", "auto", "label"}) do
+            local value = options[key]
+            if value then argv[#argv + 1] = "--" .. key .. (value == true and "" or "=" .. tostring(value)) end
+        end
+        if fs.exists(done) then fs.remove(done) end -- mkinstaller writes it last, so it marks a whole floppy
+        shell.execute("mkinstaller", nil, table.unpack(argv))
+        fs.remove(cfgPath)
+        if not fs.exists(done) then
+            io.stderr:write("Could not make the installer floppy at " .. dest .. ".\n")
+            return
+        end
+        print("Boot an empty computer from it to install QuickOS and GNS.")
+        return
+    end
+    shell.execute("bundle", nil, "pack", "/usr", "--out=" .. out)
+    fs.remove(cfgPath)
+    -- bundle says why on the screen and removes a bundle it could not finish.
+    if not fs.exists(out) then
+        io.stderr:write("Could not write GNS to " .. out .. ".\n")
+        return
+    end
+    print(("Wrote %s (%d KB). On a QuickOS computer: bundle unpack %s"):format(out, fs.size(out) // 1024, out))
+    return
+end
+
+if command == "update" then
+    local installer = "/tmp/gns-install.lua"
+    if not component.isAvailable("internet") then
+        io.stderr:write("Updating GNS needs an internet card.\n")
+        return
+    end
+    if fs.exists(installer) then fs.remove(installer) end
+    shell.execute("wget -fq https://raw.githubusercontent.com/Renno231/Gate-Network-System/main/install.lua " .. installer)
+    if not fs.exists(installer) then
+        io.stderr:write("Could not download the GNS installer.\n")
+        return
+    end
+    shell.execute(installer)
+    fs.remove(installer)
+    print("Restart gns to run the new version.")
     return
 end
 
