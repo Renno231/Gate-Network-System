@@ -365,7 +365,7 @@ clientEnv.command({"set", "s"}, "set fast|learn|take|codes on|off, set speed <s>
         if not n or n < 0 then return "Usage: set sleep <minutes>|off (a tablet shuts down after that long without input)" end
         settings.tabletSleep = n
         save()
-        return n == 0 and "This tablet stays on." or ("A tablet shuts down after " .. n .. " minutes without input.")
+        return n == 0 and "This tablet stays on." or ("A tablet shuts down after %d minute%s without input."):format(n, n == 1 and "" or "s")
     elseif what == "speed" then
         local n = tonumber(v)
         if not n or n < 0 then return "Usage: set speed <seconds> (0: as fast as the gate goes)" end
