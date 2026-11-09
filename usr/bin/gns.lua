@@ -7,6 +7,8 @@
 --                     computers without an internet card: bundle unpack /mnt/xxx/gns.bundle
 -- gns floppy DEST --os[=GROUP,...] [--skip=PATH,...] [--name=gate-%02d] [--first=N] [--auto=S] [--label=TEXT]
 --                     make an installer floppy with QuickOS and GNS for empty computers (mkinstaller)
+-- --gate              (with floppy) only the gate server: no client, no loom. A gate server's
+--                     own install (install.lua gate) always makes these.
 -- gns help            this list
 -- --repeating reruns the program after it exits (for development).
 local shell = require("shell")
@@ -27,6 +29,7 @@ if command == "help" or (command and command ~= "client" and command ~= "passwd"
     print("gns floppy DEST     write GNS to DEST/gns.bundle for bundle unpack elsewhere")
     print("gns floppy DEST --os  make an installer floppy with QuickOS and GNS (mkinstaller's")
     print("                    --os, --skip, --name, --first, --auto and --label pass through)")
+    print("gns floppy ... --gate  only the gate server: no client or loom")
     return
 end
 
@@ -35,7 +38,7 @@ end
 -- packs QuickOS beside it and leaves everything GNS installs (excluded files too) out of the OS.
 if command == "floppy" then
     if not args[2] then
-        io.stderr:write("Usage: gns floppy DEST [--os[=GROUP,...]]\n")
+        io.stderr:write("Usage: gns floppy DEST [--gate] [--os[=GROUP,...]]\n")
         return
     end
     local dest = shell.resolve(args[2])
@@ -45,10 +48,29 @@ if command == "floppy" then
         io.stderr:write(cfgPath .. " is in the way; gns floppy writes its own there while it runs.\n")
         return
     end
+    -- Only the loom files the client uses (usr/gns/parts.lua); a gate server's floppy has neither.
+    -- Excluded files also stay out of the OS that --os packs.
+    local parts = dofile(gnsPath .. "parts.lua")
+    local gate = options.gate or not fs.exists(clientPath)
+    local paths = {{"gns", "usr/gns"}, {"bin/gns.lua", "usr/bin/gns.lua"}, {"lib/ecc", "usr/lib/ecc"}}
+    local exclude = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}
+    if gate then
+        for _, part in ipairs(parts.client) do exclude[#exclude + 1] = part end
+    end
+    if fs.exists("/usr/lib/loom") then
+        paths[#paths + 1] = {"lib/loom", "usr/lib/loom"}
+        local keep = {}
+        for _, path in ipairs(gate and {} or parts.loom) do keep[path] = true end
+        local function leaveOut(dir)
+            for name in fs.list("/usr/lib/loom/" .. dir) do
+                if name:sub(-1) == "/" then leaveOut(dir .. name)
+                elseif not keep[dir .. name] then exclude[#exclude + 1] = "lib/loom/" .. dir .. name end
+            end
+        end
+        leaveOut("")
+    end
     local file = assert(io.open(cfgPath, "w"))
-    file:write(require("serialization").serialize({name = "gns", hostname = true,
-        paths = {{"gns", "usr/gns"}, {"bin/gns.lua", "usr/bin/gns.lua"}, {"lib/loom", "usr/lib/loom"}, {"lib/ecc", "usr/lib/ecc"}},
-        exclude = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}}))
+    file:write(require("serialization").serialize({name = "gns", hostname = true, paths = paths, exclude = exclude}))
     file:close()
     if options.os then
         local argv, done = {dest, "/usr"}, fs.concat(dest, "install.cfg")
@@ -63,7 +85,7 @@ if command == "floppy" then
             io.stderr:write("Could not make the installer floppy at " .. dest .. ".\n")
             return
         end
-        print("Boot an empty computer from it to install QuickOS and GNS.")
+        print("Boot an empty computer from it to install QuickOS and GNS" .. (gate and " (the gate server)." or "."))
         return
     end
     shell.execute("bundle", nil, "pack", "/usr", "--out=" .. out)
@@ -89,7 +111,7 @@ if command == "update" then
         io.stderr:write("Could not download the GNS installer.\n")
         return
     end
-    shell.execute(installer)
+    shell.execute(installer .. (fs.exists(clientPath) and "" or " gate")) -- a gate server's install stays one
     fs.remove(installer)
     print("Restart gns to run the new version.")
     return
@@ -142,7 +164,8 @@ end
 
 local runServer = component.isAvailable("stargate") and not options.client and command ~= "client" and fs.exists(serverPath)
 if not runServer and not fs.exists(clientPath) then
-    error("Gate Network System client not found at " .. clientPath)
+    error(fs.exists(serverPath) and "This is a gate server's install (no client): it runs gns where there is a stargate."
+        or "Gate Network System client not found at " .. clientPath)
 end
 
 local function strsplit(inputstr, sep)

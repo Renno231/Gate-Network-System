@@ -53,9 +53,11 @@ wget -f https://raw.githubusercontent.com/Renno231/Gate-Network-System/main/inst
 /tmp/gns-install.lua
 ```
 
-This installs GNS with the `loom` and `ecc` libraries. `gns update` later fetches only what
-changed; nothing is replaced until every changed file has downloaded. The vault, settings and
-gate state are written at run time and never touched by an install or update.
+This installs GNS with `ecc` and the parts of `loom` the client uses. On a gate server, run
+`/tmp/gns-install.lua gate` instead: it leaves out the client and loom. `gns update` later
+fetches only what changed, keeps the install's kind, and removes files GNS no longer has;
+nothing is replaced until every changed file has downloaded. The vault, settings and gate state
+are written at run time and never touched by an install or update.
 
 Without internet, copy GNS onto a floppy from a computer that has it:
 
@@ -63,8 +65,9 @@ Without internet, copy GNS onto a floppy from a computer that has it:
 gns floppy /mnt/abc
 ```
 
-This writes `gns.bundle` (about 190 KB) with GNS, loom and ecc, never that computer's vault,
-address book, settings or gate state. On the other QuickOS computer, unpack it and start GNS at
+This writes `gns.bundle` (about 150 KB) with GNS, loom and ecc, never that computer's vault,
+address book, settings or gate state; `--gate` (or any floppy from a gate server) writes only
+the gate server (about 45 KB). On the other QuickOS computer, unpack it and start GNS at
 boot:
 
 ```
@@ -73,10 +76,11 @@ gns autorun on
 ```
 
 For an empty computer, make an installer floppy with QuickOS and GNS (it uses QuickOS's
-`mkinstaller`; together they take about 460 KB of the floppy's 512):
+`mkinstaller`; together they take under 460 KB of the floppy's 512, about 310 KB with
+`--gate`):
 
 ```
-gns floppy /mnt/abc --os --name=gate-%02d --auto=5
+gns floppy /mnt/abc --os --gate --name=gate-%02d --auto=5
 ```
 
 Boot the empty computer from it: it installs both hands-off after 5 s as gate-01, gate-02, ...
@@ -95,6 +99,7 @@ gns autorun on|off  start gns when the computer boots
 gns update          install the newest GNS from GitHub
 gns floppy DEST     write gns.bundle to DEST, for bundle unpack on another computer
 gns floppy DEST --os  make an installer floppy with QuickOS and GNS for an empty computer
+gns floppy ... --gate  only the gate server (no client or loom)
 ```
 
 The first client run asks for a password and creates the vault. The client's Guide screen

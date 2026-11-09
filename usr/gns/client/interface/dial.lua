@@ -181,9 +181,6 @@ local function row() -- the destination row
     clientEnv.dest = database[1]
     return clientEnv.dest
 end
-local function rowNumber(r)
-    for i, x in ipairs(database) do if x == r then return i end end
-end
 local function galaxyOf(connection)
     local s = connection and connection.status
     return s and dialing.TYPE[s.type] or "MW"
