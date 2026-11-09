@@ -1,8 +1,10 @@
--- Dial screen: finds the gates in range (disco), opens them (gate.open), pulls their signed
--- address books and dials. The stargate is drawn from the dialing gate's own status. Widget
--- callbacks cannot wait, so every network step continues in a callback.
+-- Dial screen: finds the gates in range on this device's ports (disco), wakes the sleeping ones
+-- it holds wake keys for, opens them (gate.open with the grants held), keeps each gate's own
+-- signed entry in the address book and dials. The stargate is drawn from the dialing gate's own
+-- status. Widget callbacks cannot wait, so every network step continues in a callback.
 --
--- Commands: d / dial, close / x, iris / i, scan, from / f, ssh.
+-- Commands: d / dial, close / x, iris / i, scan, from / f, ssh, setup, gdo, back, route, home,
+-- energy, schedule, update, gatelog, save, glyphs.
 local gns, clientEnv, _, frame, R = ...
 local ui = clientEnv.ui
 local C = ui.C
@@ -12,9 +14,12 @@ local unicode = require("unicode")
 local api = require("api")
 local disco = require("disco")
 local event = require("event")
+local component = require("component")
+local fs = require("filesystem")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local entries = dofile(gns.path.gns .. "entries.lua")
 local dialing = dofile(gns.path.gns .. "dialing.lua")
+local route = dofile(gns.path.gns .. "route.lua")
 local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
 
 local database = clientEnv.database
@@ -22,6 +27,7 @@ local vaultState = clientEnv.vault.state
 local identity = vaultState.identity
 local connections = clientEnv.gateconnections
 local log = clientEnv.log
+local settings = clientEnv.settings
 local wide = R.wide
 local GALAXY = {MW = "Milky Way", PG = "Pegasus", UN = "Universe"}
 
@@ -47,59 +53,13 @@ local function record(e)
         if row.key == e.key then
             row.Name, row.Type, row.Address, row.retired = e.name, e.type, address, e.retired
             if e.dim and type(row.Location) ~= "table" then row.Location = {dimension = e.dim} end
-            return
+            return row
         end
     end
-    database[#database + 1] = {key = e.key, Name = e.name, Type = e.type, Address = address, IDCs = {},
+    local row = {key = e.key, Name = e.name, Type = e.type, Address = address, IDCs = {},
         Location = e.dim and {dimension = e.dim} or nil}
-end
-
--- Opens the gate at address: public first, then with each private network membership held.
--- Calls callback(connection), or callback(nil, reason).
-local function openGate(address, callback)
-    api.connectAsync(handshake.ENDPOINT, handshake.PORT, address, guard(function(proxy, err)
-        if not proxy then return callback(nil, err) end
-        local function finish(reply, reason, net)
-            if not reply then
-                proxy:close()
-                return callback(nil, reason)
-            end
-            callback({proxy = proxy, address = address, key = reply.key, net = net, status = reply.status,
-                name = reply.status and reply.status.name or address:sub(1, 8)})
-        end
-        local nets = {}
-        for _, net in pairs(vaultState.networks) do nets[#nets + 1] = net end
-        local function try(i, reason)
-            local net = nets[i]
-            if not net then return finish(nil, reason) end
-            handshake.openAsync(proxy, identity, vaultState.pins, net, guard(function(reply, why)
-                if reply then return finish(reply, nil, net) end
-                try(i + 1, why)
-            end))
-        end
-        handshake.openAsync(proxy, identity, vaultState.pins, nil, guard(function(reply, reason)
-            if reply or reason ~= "private gate" then return finish(reply, reason) end
-            try(1, reason)
-        end))
-    end), nil, 3)
-end
-
--- Pulls the gate's address book into the vault. Calls callback(number of new entries).
-local function pull(connection, callback)
-    connection.proxy:async(guard(function(ok, list)
-        if ok ~= true then
-            log(connection.name .. ": address book refused: " .. tostring(list))
-            return callback(0)
-        end
-        local taken, refused = entries.mergeAll(vaultState.book, list, connection.net and connection.net.network.id)
-        for _, r in ipairs(refused) do log(connection.name .. ": refused entry " .. tostring(r[1] and r[1].name) .. ": " .. r[2]) end
-        if clientEnv.settings.autoLogToDatabase then
-            for _, e in pairs(vaultState.book) do record(e) end
-        end
-        local own = vaultState.book[connection.key]
-        if own then connection.name = own.name end
-        callback(taken)
-    end)).entries()
+    database[#database + 1] = row
+    return row
 end
 
 local function findConnection(address)
@@ -107,46 +67,154 @@ local function findConnection(address)
         if connection.address == address then return connection, i end
     end
 end
-
 local function byDistance(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end
+local function isAdmin(c) return c and (c.role == "admin" or c.role == "owner") end
+
+-- The grants to show a gate: those of its owner when it is known, else all of them (a gate
+-- reads at most 16).
+local function grantsFor(owner)
+    local list = {}
+    for _, g in ipairs(vaultState.grants) do
+        if #list >= 16 then break end
+        if not owner or g.owner == owner then list[#list + 1] = g end
+    end
+    return list
+end
+local function accessByModem(address)
+    for key, a in pairs(vaultState.access) do
+        if a.modem == address then return a, key end
+    end
+end
+
+-- Keeps what opening a gate told this device: its entry, and for a gate where it holds a named
+-- role (owner or grant) how to reach and wake it. Returns true for a gate new to the book.
+local function remember(c, wake)
+    local e, new = c.entry, false
+    if type(e) == "table" and e.key == c.key then
+        new = vaultState.book[c.key] == nil
+        pcall(entries.merge, vaultState.book, e)
+        local own = vaultState.book[c.key]
+        if own then
+            c.name = own.name
+            local row = settings.autoLogToDatabase and record(own)
+            if row then clientEnv.joinByPort(row, c.port) end
+        end
+    end
+    if c.tag == "public" or c.tag == "unregistered" then return new end
+    local a = vaultState.access[c.key] or {}
+    a.name, a.modem, a.port, a.owner, a.role = c.name, c.address, c.port, c.owner, c.role
+    a.wake = wake or a.wake
+    vaultState.access[c.key] = a
+    clientEnv.changed()
+    return new
+end
+
+-- Grants this device cut off reach every gate they cover that it administers: on each open.
+local function pushCuts(c)
+    if not isAdmin(c) then return end
+    local list = {}
+    for _, issued in ipairs(vaultState.issued) do
+        local g = issued.grant
+        if issued.cut and g.owner == c.owner and (g.gate == "" or g.gate == c.key) and (c.role == "owner" or g.role == "user") then
+            list[#list + 1] = g
+        end
+    end
+    if #list == 0 then return end
+    c.proxy:async(guard(function(ok, count)
+        if ok ~= true then log(c.name .. ": cut-offs refused: " .. tostring(count)) return end
+        if count > 0 then log(("%s: %d grant%s cut off."):format(c.name, count, count == 1 and "" or "s")) end
+    end)).cut(list)
+end
+clientEnv.pushCuts = function() for _, c in ipairs(connections) do pushCuts(c) end end
+
+-- Opens the gate at address on port with the grants held. Calls callback(connection), or
+-- callback(nil, reason) when the gate refused this device (a private gate) or did not answer.
+local function openGate(address, port, callback)
+    api.connectAsync(handshake.ENDPOINT, port, address, guard(function(proxy, err)
+        if not proxy then return callback(nil, err) end
+        local known = accessByModem(address)
+        handshake.openAsync(proxy, identity, vaultState.pins, {grants = grantsFor(known and known.owner)}, guard(function(reply, reason)
+            if not reply then
+                proxy:close()
+                return callback(nil, reason)
+            end
+            if not reply.role then
+                proxy:close()
+                return callback(nil, tostring(reply.refused or "private gate"))
+            end
+            local c = {proxy = proxy, address = address, port = port, key = reply.key, role = reply.role, owner = reply.owner,
+                registered = reply.registered, status = reply.status, entry = reply.entry,
+                name = reply.status and reply.status.name or address:sub(1, 8)}
+            -- What the top bar shows: the role from ownership or a grant, else how the gate is open.
+            c.tag = not reply.registered and "unregistered" or (reply.wake and reply.role) or "public"
+            c.new = remember(c, reply.wake)
+            pushCuts(c)
+            callback(c)
+        end))
+    end), nil, 3)
+end
+
+-- Wakes the gates this device holds wake keys for that are not open here: a message to each
+-- gate's own modem (never a broadcast). Returns how many.
+local function wakeKnown()
+    local modem, sent = component.modem, 0
+    for _, a in pairs(vaultState.access) do
+        if a.wake and a.modem and clientEnv.ports()[a.port or 160] and not findConnection(a.modem) then
+            if pcall(modem.send, a.modem, a.port or 160, a.wake) then sent = sent + 1 end
+        end
+    end
+    return sent
+end
 
 -- Finds gates on disco and opens the ones not yet open. quiet (the automatic rescan) reports
--- only when it opened a gate.
+-- only when it opened a gate. A scan asked for wakes the known gates first and looks again once
+-- they have had time to start.
+local wakeTimer
 local function scan(quiet)
     if dial.busy then return "A scan is already running." end
     dial.busy, dial.sinceScan = true, 0
-    if not quiet then log("Scanning for gates...") end
+    local woken = 0
+    if not quiet then
+        woken = wakeKnown()
+        log(woken > 0 and ("Waking %d gate%s; scanning..."):format(woken, woken == 1 and "" or "s") or "Scanning for gates...")
+    end
     disco.findAsync("gns", 2, guard(function(found)
-        local waiting, opened, learned = 1, 0, 0
+        local waiting, opened, refused, new = 1, 0, 0, 0
         local function done()
             waiting = waiting - 1
             if waiting > 0 then return end
             table.sort(connections, byDistance)
             dial.busy = false
             loom.invalidate()
+            if woken > 0 then
+                if wakeTimer then event.cancel(wakeTimer) end
+                wakeTimer = event.timer(15, guard(function() wakeTimer = nil scan(true) end))
+            end
             if quiet and opened == 0 then return end
-            log(("Found %d gates, opened %d, %d new address book entries."):format(#found, opened, learned))
+            log(("Found %d gates, opened %d, %d new%s."):format(#found, opened, new, refused > 0 and (", " .. refused .. " private") or ""))
             local saved, err = clientEnv.vault:save()
             if not saved then log("Vault not saved: " .. tostring(err)) end
         end
         for _, host in ipairs(found) do
+            local port = (host.services or {}).gns or handshake.PORT
             local known = findConnection(host.address)
             if known then
                 known.distance = host.distance
-            else
+            elseif clientEnv.ports()[port] then
                 waiting = waiting + 1
-                openGate(host.address, guard(function(connection, reason)
+                openGate(host.address, port, guard(function(connection, reason)
                     if not connection then
-                        log(("%s: %s"):format(host.name, reason))
+                        refused = refused + 1
+                        local a = accessByModem(host.address)
+                        if not quiet then log(("%s: %s"):format(a and a.name or host.name, reason)) end
                         return done()
                     end
                     connection.distance = host.distance
-                    pull(connection, guard(function(taken)
-                        learned, opened = learned + taken, opened + 1
-                        connections[#connections + 1] = connection
-                        log(("Connected to %s (%s)."):format(connection.name, connection.net and "private" or "public"))
-                        done()
-                    end))
+                    opened = opened + 1
+                    if connection.new then new = new + 1 end
+                    connections[#connections + 1] = connection
+                    log(("Connected to %s (%s)."):format(connection.name, connection.tag))
+                    done()
                 end))
             end
         end
@@ -154,9 +222,10 @@ local function scan(quiet)
     end))
 end
 clientEnv.scan = scan
+clientEnv.onClose[#clientEnv.onClose + 1] = function() if wakeTimer then event.cancel(wakeTimer) end end
 
--- Closes every gate connection and scans again, so gates open with the memberships held now
--- (after joining a network, say).
+-- Closes every gate connection and scans again, so gates open with the grants held now (after
+-- joining, say).
 function clientEnv.reconnect()
     for i = #connections, 1, -1 do
         pcall(connections[i].proxy.close, connections[i].proxy)
@@ -238,9 +307,18 @@ local function poll(connection)
             return
         end
         connection.lost, connection.reported = 0, false
+        local hand, before = s.handDialed, connection.status and connection.status.handDialed
+        if type(hand) == "table" and connection.status and (not before or before.time ~= hand.time) then
+            clientEnv.noticeHandDial(connection, hand)
+        end
         connection.status = s
         local f = connection.follow
-        if f then
+        if f and f.start and not s.dialing then
+            -- A route dials once the gate is free: until it starts, the last dial's state is old news.
+            f.polls = f.polls + 1
+            if f.polls > 240 then connection.follow = nil end
+        elseif f then
+            f.start = nil
             if s.lastDial ~= f.last then
                 f.last = s.lastDial
                 log(connection.name .. ": " .. tostring(f.last))
@@ -251,11 +329,36 @@ local function poll(connection)
         loom.invalidate()
     end)).status()
 end
+-- What the chosen dial would cost (the gate's energy check), for the destination card; asked
+-- again when the gate or destination changes and every ten seconds.
+local cost = {}
+local function checkCost(c, r)
+    if not c or not r or cost.asking then return end
+    cost.asking = true
+    c.proxy:async(guard(function(ok, result)
+        cost.asking = false
+        cost.from, cost.dest, cost.at = c, r, computer.uptime()
+        cost.result, cost.error = ok == true and result or nil, ok ~= true and tostring(result) or nil
+        loom.invalidate()
+    end)).energy(r.Address)
+end
+local function costText(c, r)
+    if cost.from ~= c or cost.dest ~= r then return "" end
+    if cost.error then return "Cannot dial: " .. cost.error end
+    local x = cost.result
+    if not x then return "" end
+    local k = function(n) n = tonumber(n) or 0 return n >= 1e4 and ("%dk"):format(n // 1000) or tostring(math.floor(n)) end
+    if not x.canOpen then return ("Not enough power: %s RF to open, %s stored"):format(k(x.open), k(x.energy)) end
+    return ("%s RF to open · %s RF/t open · %d s on stored power"):format(k(x.open), k(x.keepAlive), x.seconds)
+end
+
 local ticks = 0
 local statusTimer = event.timer(0.5, guard(function()
     ticks = ticks + 1
     local c = clientEnv.fromGate()
     if c and (c.follow or (c.status and c.status.dialing) or ticks % 4 == 0) then poll(c) end
+    local r = row()
+    if c and r and (cost.from ~= c or cost.dest ~= r or computer.uptime() - (cost.at or 0) > 10) then checkCost(c, r) end
     if ticks % 2 == 0 then
         local rate = tonumber(clientEnv.settings.nearbyScanRate) or 0
         dial.sinceScan = dial.sinceScan + 1
@@ -265,18 +368,17 @@ end), math.huge)
 clientEnv.onClose[#clientEnv.onClose + 1] = function() event.cancel(statusTimer) end
 
 ---------------------------------------------------------------------------- actions
-local function doDial(connection, r, idc)
+local function doDial(connection, r, idc, onBusy)
     if not connection then return "No gate in range to dial from. SCAN looks for gates." end
     if not r then return "Choose a gate to dial." end
-    if not idc then
-        for _, code in pairs(r.IDCs or {}) do
-            if math.tointeger(code) then idc = code break end
-        end
-    end
+    idc = idc or clientEnv.idcFor(r)
     clientEnv.from, clientEnv.dest = connection, r
-    local opts = {fast = clientEnv.settings.fastDial ~= false, idc = idc}
+    local opts = {fast = clientEnv.settings.fastDial ~= false, idc = idc, speed = clientEnv.settings.dialSpeed}
     connection.proxy:async(guard(function(ok, result)
         if ok ~= true then
+            if onBusy and (result == "incoming wormhole" or result == "already dialing" or result == "your dial is in progress") then
+                return onBusy(result)
+            end
             log(connection.name .. ": dial refused: " .. tostring(result))
             return
         end
@@ -288,19 +390,65 @@ local function doDial(connection, r, idc)
     end)).dial(r.Address, opts)
     return ("Dialing %s from %s%s..."):format(r.Name, connection.name, idc and (" with IDC " .. idc) or "")
 end
-local function disengage(connection)
+-- DIAL while the gate is busy, as GDS did. Over the gate's open outgoing wormhole the gate
+-- itself closes it and dials. When the gate refuses for an incoming wormhole or a dial in
+-- progress (this device's own, to another gate, is stopped first), the dial waits and goes out
+-- once the gate is idle, within five minutes; DISENGAGE at that gate or another DIAL drops it.
+local queued
+local function dropQueued()
+    if queued then event.cancel(queued.timer) queued = nil end
+end
+clientEnv.onClose[#clientEnv.onClose + 1] = dropQueued
+local disengage
+local function waitToDial(c, r, idc, deadline)
+    dropQueued()
+    local q = {gate = c}
+    queued = q
+    q.timer = event.timer(1, guard(function()
+        poll(c)
+        local now = c.status or {}
+        if queued ~= q then return false end
+        if not now.dialing and now.state == "idle" then
+            dropQueued()
+            -- Another player may have dialed first: then wait again, to the same deadline.
+            local said = doDial(c, r, idc, function() waitToDial(c, r, idc, deadline) end)
+            if said then log(said) end
+        elseif computer.uptime() >= deadline then
+            dropQueued()
+            log(("%s stayed busy: %s was not dialed."):format(c.name, r.Name))
+        end
+    end), math.huge)
+end
+local function dialWhenFree(c, r, idc)
+    dropQueued()
+    if not c or not r then return doDial(c, r, idc) end
+    local was, deadline = clientEnv.dest, computer.uptime() + 300
+    return doDial(c, r, idc, function(why)
+        if why == "your dial is in progress" then
+            if was == r then log("Already dialing " .. r.Name .. ".") return end
+            disengage(c)
+        end
+        waitToDial(c, r, idc, deadline)
+        log((why == "incoming wormhole" and "%s has an incoming wormhole: dialing %s once it closes."
+            or why == "your dial is in progress" and "%s: stopping your dial, then dialing %s."
+            or "%s is busy: dialing %s once it is free."):format(c.name, r.Name))
+    end)
+end
+function disengage(connection)
+    if queued and queued.gate == connection then dropQueued() end
     if not connection then return "No gate in range." end
     connection.proxy:async(guard(function(ok, result)
         log(connection.name .. (ok == true and (": " .. tostring(result)) or (": disengage refused: " .. tostring(result))))
         poll(connection)
     end)).closeWormhole()
 end
-local function iris(connection)
+-- want: "open", "close" or nil (the other way).
+local function iris(connection, want)
     if not connection then return "No gate in range." end
     connection.proxy:async(guard(function(ok, result)
         log(connection.name .. (ok == true and (": iris " .. tostring(result)) or (": iris refused: " .. tostring(result))))
         poll(connection)
-    end)).iris()
+    end)).iris(want)
 end
 
 -- The gate console of a gate whose network this device administers: the commands the gate's
@@ -333,40 +481,280 @@ local function console(connection)
         remote(connection, text, out)
     end})
     ui.Button(box, w - 11, h - 1, 10, 1, "CLOSE", C.raised, C.text, close)
+    ui.Button(box, w - 19, h - 1, 7, 1, "LOG", C.blue, C.black, function()
+        close()
+        clientEnv.gateLog(connection)
+    end)
     ui.focusSoon(field)
 end
 local function say(message) if message then log(message) end end
-local function isAdmin(connection)
-    return connection and connection.net and clientEnv.roleOf(connection.net) == "admin"
+
+-- The gate log (admins): what happened at the gate, newest first, each entry wrapped.
+function clientEnv.gateLog(connection)
+    if not connection then return "No gate in range." end
+    if not isAdmin(connection) then return "The gate log needs the admin role." end
+    connection.proxy:async(guard(function(ok, entries)
+        if ok ~= true then log(connection.name .. ": no gate log: " .. tostring(entries)) return end
+        if ui.modalOpen() then return end
+        local w, h = math.min(ui.W - 4, 110), math.min(ui.H - 2, 34)
+        local box, close = ui.modal(clientEnv.root, clientEnv.shell, w, h, "GATE LOG · " .. connection.name)
+        local rows = {}
+        for _, e in ipairs(entries) do
+            for j, line in ipairs(ui.wrap(tostring(e[2]), w - 14)) do rows[#rows + 1] = {j == 1 and tostring(e[1]) or "", line} end
+        end
+        local list = ui.List(box, 2, 3, w - 2, h - 5, {items = rows, scrollOnly = true, empty = "Nothing logged yet.",
+            cells = function(r) return {{1, r[1], C.faint}, {11, r[2], C.text}} end})
+        ui.Paint(box, 3, h - 1, w - 16, 1, function(self)
+            self:text(1, 1, ui.pad(("%d entries, newest first · Tab, Enter: CLOSE"):format(#entries), w - 16), C.faint, C.card)
+        end)
+        ui.Button(box, w - 11, h - 1, 10, 1, "CLOSE", C.raised, C.text, close)
+        ui.focusSoon(list)
+    end)).gatelog()
+    return ("Reading %s's gate log..."):format(connection.name)
+end
+
+-- Registers an unregistered gate to this device: its key becomes the owner, the player its OC
+-- user, and a new wake key starts it from now on.
+local function setup(c)
+    if not c then return "No gate in range." end
+    if c.registered then return c.name .. " already has an owner." end
+    local player = clientEnv.player
+    if not player then return "Press a key on this device first, so OC names the player." end
+    local wake = handshake.wakeKey()
+    c.proxy:async(guard(function(ok, result)
+        if ok ~= true then log(c.name .. ": not set up: " .. tostring(result)) return end
+        c.role, c.registered, c.owner, c.tag = "owner", true, identity.public, "owner"
+        remember(c, wake)
+        local saved, err = clientEnv.vault:save()
+        if not saved then log("Vault not saved: " .. tostring(err)) end
+        log(("%s is yours: %s is its OC user, and this device holds its wake key."):format(c.name, player))
+    end)).register(player, wake)
+    return ("Setting up %s for %s..."):format(c.name, player)
+end
+
+-- Calls done(open) once c's outgoing wormhole is open, or after seconds.
+local function waitOpen(c, seconds, done)
+    local deadline, id = computer.uptime() + seconds, nil
+    id = event.timer(1, guard(function()
+        poll(c)
+        local s = c.status or {}
+        local open = s.state == "open" and s.outgoing and not s.dialing
+        if open or computer.uptime() >= deadline then
+            event.cancel(id)
+            done(open)
+        end
+    end), math.huge)
+end
+
+-- The gate at the far end of c's open outgoing wormhole (OC modem messages cross it): r's gate
+-- when it is known, else the gate with an incoming wormhole. Calls done(connection, temporary),
+-- or done(nil, why); a temporary connection is the caller's to close.
+local function reachFar(c, r, done)
+    for _, x in ipairs(connections) do
+        if x ~= c and r and r.key and x.key == r.key then return done(x, false) end
+    end
+    disco.findAsync("gns", 2, guard(function(found)
+        local waiting, best, why = 1, nil, "no GNS gate answers through the wormhole"
+        local function finish()
+            waiting = waiting - 1
+            if waiting == 0 then
+                if best then done(best, true) else done(nil, why) end
+            end
+        end
+        for _, host in ipairs(found) do
+            if host.address ~= c.address and not findConnection(host.address) then
+                waiting = waiting + 1
+                openGate(host.address, (host.services or {}).gns or handshake.PORT, guard(function(x, reason)
+                    if not x then why = host.name .. ": " .. tostring(reason) return finish() end
+                    local s = x.status or {}
+                    local isIt = (r and r.key and x.key == r.key) or (not (r and r.key) and s.state == "open" and not s.outgoing)
+                    if isIt and not best then best = x else x.proxy:close() end
+                    finish()
+                end))
+            end
+        end
+        finish()
+    end))
+end
+
+-- The IDC a gate row sends for the player pressing: theirs, else the row's first; or nil.
+local idcOf = clientEnv.idcFor
+local function rowOf(c)
+    for _, r in ipairs(database) do if c.key and r.key == c.key then return r end end
+end
+
+-- GDO: through c's open outgoing wormhole, a signed pass to a GNS gate that knows this device,
+-- else a numeric IDC (code, or the destination's first one).
+local function gdo(c, code)
+    if not c then return "No gate in range." end
+    local s = c.status or {}
+    if not (s.state == "open" and s.outgoing) then return c.name .. " has no open outgoing wormhole." end
+    local r = row()
+    local function numeric(why)
+        local idc = code or idcOf(r)
+        if not idc then log("GDO: " .. (why or "no IDC for " .. tostring(r and r.Name))) return end
+        c.proxy:async(guard(function(ok, result)
+            log(ok == true and ("GDO: IDC sent to " .. tostring(r and r.Name or "the far gate") .. ".") or ("GDO refused: " .. tostring(result)))
+        end)).sendIdc(idc)
+    end
+    if code then numeric() return "GDO: sending IDC..." end
+    reachFar(c, r, function(far, temporary)
+        if not far then return numeric() end
+        local function finish() if temporary then far.proxy:close() end end
+        far.proxy:async(guard(function(ok, challenge)
+            if ok ~= true then finish() return numeric() end
+            far.proxy:async(guard(function(passed, result)
+                finish()
+                if passed == true then log("GDO: " .. far.name .. " took your signed pass; its iris opens.") return end
+                log(far.name .. ": pass refused: " .. tostring(result))
+                numeric()
+            end)).pass(handshake.pass(identity, challenge, far.key))
+        end)).challenge()
+    end)
+    return "GDO: sending your pass..."
+end
+
+-- Dial-back: once c's outgoing wormhole is open, the far gate is handed a signed route back to
+-- c (with c's IDC) to dial after delay seconds, and c's side is closed so it is free.
+local function dialBack(c, delay)
+    if not c then return "No gate in range." end
+    local own = c.entry and c.entry.address
+    if not own then return c.name .. " has not published its address." end
+    local back = rowOf(c)
+    waitOpen(c, 90, function(open)
+        if not open then log("Dial-back: the wormhole from " .. c.name .. " did not open.") return end
+        reachFar(c, row(), function(far, temporary)
+            if not far then log("Dial-back: " .. tostring(temporary)) return end
+            local r = route.sign(identity, {{address = own, idc = idcOf(back), delay = delay}}, 0, grantsFor(far.owner))
+            far.proxy:async(guard(function(ok, result)
+                if temporary then far.proxy:close() end
+                if ok ~= true then log(far.name .. ": dial-back refused: " .. tostring(result)) return end
+                log(("%s dials %s back in %d s; closing this side."):format(far.name, c.name, delay))
+                disengage(c)
+            end)).queue(r, 1)
+        end)
+    end)
+    return ("Dial-back to %s once the wormhole is open..."):format(c.name)
+end
+
+-- Hands c a signed route: it dials rows[1], the gate there dials rows[2] once free, and so on.
+-- every > 0 repeats it (a scheduled dial, admins only).
+local function sendRoute(c, rows, every)
+    if not c then return "No gate in range." end
+    local hops = {}
+    for i, r in ipairs(rows) do hops[i] = {address = r.Address, idc = idcOf(r), delay = 0} end
+    if #hops == 0 or #hops > route.MAX_HOPS then return "A route has 1 to " .. route.MAX_HOPS .. " gates." end
+    c.proxy:async(guard(function(ok, result)
+        if ok ~= true then log(c.name .. ": route refused: " .. tostring(result)) return end
+        log(("%s: route %s (%d hop%s)."):format(c.name, tostring(result), #hops, #hops == 1 and "" or "s"))
+        if not every or every == 0 then c.follow = {last = "dialing", polls = 0, start = true} poll(c) end
+    end)).queue(route.sign(identity, hops, every or 0, grantsFor(c.owner)), 1)
+    return ("Sending %s a route of %d hop%s..."):format(c.name, #hops, #hops == 1 and "" or "s")
+end
+
+-- Remote update: this device's gate-side GNS files (or the paths given, under /usr), pushed to
+-- a gate this device administers. A gate that starts gns at boot restarts on them.
+local function gateFiles()
+    local parts = dofile(gns.path.gns .. "parts.lua")
+    local skip = {["gns/server/settings.lua"] = true}
+    local function clientOnly(path)
+        for _, p in ipairs(parts.client) do
+            if path == p or path:sub(1, #p + 1) == p .. "/" then return true end
+        end
+    end
+    local list = {}
+    local function walk(dir)
+        for name in fs.list("/usr/" .. dir) do
+            local path = dir .. name
+            if name:sub(-1) == "/" then walk(path)
+            elseif path:sub(-4) == ".lua" and not skip[path] and not clientOnly(path) then list[#list + 1] = path end
+        end
+    end
+    walk("gns/")
+    list[#list + 1] = "bin/gns.lua"
+    return list
+end
+local function update(c, paths)
+    if not c then return "No gate in range." end
+    if not isAdmin(c) then return c.name .. ": updates need the admin role." end
+    paths = #paths > 0 and paths or gateFiles()
+    local files = {}
+    for _, path in ipairs(paths) do
+        local file = io.open("/usr/" .. path, "rb")
+        if not file then return "No file /usr/" .. path .. " here." end
+        files[#files + 1] = {path, file:read("*a")}
+        file:close()
+    end
+    c.proxy:async(guard(function(ok, count, restart)
+        if ok ~= true then log(c.name .. ": update refused: " .. tostring(count)) return end
+        log(("%s: %d files updated%s."):format(c.name, count, restart and "; it restarts" or ""))
+        if restart then closeConnection(c) end
+    end)).update(files)
+    return ("Pushing %d files to %s..."):format(#files, c.name)
 end
 
 ---------------------------------------------------------------------------- commands
+-- A gate's last address dialed by hand on its DHD (status.handDialed), and saving it.
+local function samePlace(a, b)
+    local n = math.min(type(a) == "table" and #a or 0, type(b) == "table" and #b or 0)
+    if n < 6 then return false end
+    for i = 1, n do if a[i] ~= b[i] then return false end end
+    return true
+end
+local function inBook(hand)
+    for galaxy, glyphs in pairs(hand.address) do
+        for _, r in ipairs(database) do
+            if samePlace(r.Address and r.Address[galaxy], glyphs) then return r end
+        end
+    end
+end
+function clientEnv.noticeHandDial(c, hand)
+    if type(hand.address) ~= "table" or inBook(hand) then return end
+    log(("%s was dialed by hand at %s: save [name] keeps the address."):format(c.name, tostring(hand.time)))
+end
+local function saveHandDial(c, name)
+    local hand = c.status and c.status.handDialed
+    if type(hand) ~= "table" or type(hand.address) ~= "table" then return c.name .. " has not been dialed by hand." end
+    local known = inBook(hand)
+    if known then return ("%s's last hand dial is %s, already in the address book."):format(c.name, known.Name) end
+    local galaxy, glyphs = next(hand.address)
+    if not GALAXY[galaxy] or type(glyphs) ~= "table" then return c.name .. " sent a bad address." end
+    local address = {MW = {}, PG = {}, UN = {}}
+    for i, glyph in ipairs(glyphs) do address[galaxy][i] = tostring(glyph) end
+    database[#database + 1] = {Name = name, Type = galaxy, Address = address, IDCs = {}}
+    clientEnv.changed()
+    loom.invalidate()
+    if not settings.showCodes then return ("Saved %s as gate %d (addresses are hidden on this device)."):format(name, #database) end
+    return ("Saved %s as gate %d: %s."):format(name, #database, table.concat(glyphs, ", "))
+end
+
 local function gateOrFrom(selector)
     if selector then return findGate(selector), true end
     return clientEnv.fromGate()
 end
 clientEnv.command({"dial", "d"}, "d [from] <to> [idc]: dial a gate (by number or name); with one gate, from the nearest gate in range; with none, the chosen ones", function(args)
-    if #args == 0 then return doDial(clientEnv.fromGate(), row()) end
+    if #args == 0 then return dialWhenFree(clientEnv.fromGate(), row()) end
     if #args == 1 then
         local r = clientEnv.findEntry(args[1])
         if not r then return "No gate " .. args[1] .. " in the address book." end
-        return doDial(nearest(r), r)
+        return dialWhenFree(nearest(r), r)
     end
     local from = findGate(args[1])
     if not from then return "No gate " .. args[1] .. " in range." end
     local r = clientEnv.findEntry(args[2])
     if not r then return "No gate " .. args[2] .. " in the address book." end
-    return doDial(from, r, math.tointeger(tonumber(args[3])))
+    return dialWhenFree(from, r, math.tointeger(tonumber(args[3])))
 end)
 clientEnv.command({"close", "x"}, "close [gate]: stop dialing or close the outgoing wormhole", function(args)
     local c, named = gateOrFrom(args[1])
     if named and not c then return "No gate " .. args[1] .. " in range." end
     return disengage(c)
 end)
-clientEnv.command({"iris", "i"}, "iris [gate]: open or close a gate's iris (moderators and admins)", function(args)
+clientEnv.command({"iris", "i"}, "iris [gate] [open|close]: open or close a gate's iris (alone: the other way)", function(args)
+    local want = (args[#args] == "open" or args[#args] == "close") and table.remove(args) or nil
     local c, named = gateOrFrom(args[1])
     if named and not c then return "No gate " .. args[1] .. " in range." end
-    return iris(c)
+    return iris(c, want)
 end)
 clientEnv.command({"scan"}, "scan: look for gates in range", function() return scan(false) end)
 clientEnv.command({"from", "f"}, "from [gate]: choose the gate to dial from; alone, list the gates in range", function(args)
@@ -384,16 +772,106 @@ clientEnv.command({"from", "f"}, "from [gate]: choose the gate to dial from; alo
     poll(c)
     return "Dialing from " .. c.name .. "."
 end)
-clientEnv.command({"ssh", "console"}, "ssh [gate] [command]: a gate's console, for admins of its network; with a command, run just that", function(args)
+clientEnv.command({"ssh", "console"}, "ssh [gate] [command]: a gate's console, for its owner and admins; with a command, run just that", function(args)
     local c = args[1] and findGate(args[1])
     local rest = 2
     if not c then c, rest = clientEnv.fromGate(), 1 end
     if not c then return "No gate in range." end
-    if not isAdmin(c) then return c.name .. ": the console needs the admin role in the gate's network." end
+    if not isAdmin(c) then return c.name .. ": the console needs the admin role."  end
     if #args < rest then return console(c) end
     local line = table.concat(args, " ", rest)
     remote(c, line, function(text) log("  " .. c.name .. ": " .. text) end)
     return c.name .. "> " .. line
+end)
+
+clientEnv.command({"setup"}, "setup [gate]: make an unregistered gate yours (you own it; your player is its OC user)", function(args)
+    local c, named = gateOrFrom(args[1])
+    if named and not c then return "No gate " .. args[1] .. " in range." end
+    return setup(c)
+end)
+clientEnv.command({"gdo"}, "gdo [idc]: through the open wormhole, your signed pass to a GNS gate, or an IDC (the destination's, or this one)", function(args)
+    return gdo(clientEnv.fromGate(), math.tointeger(tonumber(args[1])))
+end)
+clientEnv.command({"back"}, "back [seconds]: once the wormhole is open, the far gate dials this one back after that long (5 s)", function(args)
+    return dialBack(clientEnv.fromGate(), math.tointeger(tonumber(args[1])) or 5)
+end)
+clientEnv.command({"route"}, "route <gate> <gate> ...: the dialing gate dials the first, which dials the next once free, and so on", function(args)
+    local rows = {}
+    for _, a in ipairs(args) do
+        local r = clientEnv.findEntry(a)
+        if not r then return "No gate " .. a .. " in the address book." end
+        rows[#rows + 1] = r
+    end
+    return sendRoute(clientEnv.fromGate(), rows)
+end)
+clientEnv.command({"home"}, "home [back [seconds]] | home set <gate> | home none: dial the home gate with its IDC; back: home dials you back", function(args)
+    local word = (args[1] or ""):lower()
+    if word == "set" then
+        local r = clientEnv.findEntry(args[2])
+        if not r then return "No gate " .. tostring(args[2]) .. " in the address book." end
+        clientEnv.setHome(r)
+        return r.Name .. " is the home gate."
+    elseif word == "none" then
+        clientEnv.setHome(nil)
+        return "No home gate."
+    end
+    local home
+    for _, r in ipairs(database) do if r.home then home = r end end
+    if not home then return "No home gate: home set <gate>, or HOME on Gates." end
+    local c = nearest(home)
+    local said = doDial(c, home)
+    if not c then return said end
+    if word == "back" then
+        dialBack(c, math.tointeger(tonumber(args[2])) or 5)
+    elseif not idcOf(home) and home.key then
+        waitOpen(c, 90, function(open) if open then say(gdo(c)) end end)
+    end
+    return said
+end)
+clientEnv.command({"gatelog"}, "gatelog [gate]: what happened at a gate, newest first (admins; also LOG in the console)", function(args)
+    local c = gateOrFrom(args[1])
+    if not c then return args[1] and ("No gate " .. args[1] .. " in range.") or "No gate in range." end
+    return clientEnv.gateLog(c)
+end)
+clientEnv.command({"save"}, "save [name]: add the address last dialed by hand at the dialing gate's DHD to the address book", function(args)
+    local c = clientEnv.fromGate()
+    if not c then return "No gate in range." end
+    if args[1] then return saveHandDial(c, table.concat(args, " ")) end
+    local hand = c.status and c.status.handDialed
+    if type(hand) ~= "table" then return c.name .. " has not been dialed by hand." end
+    if inBook(hand) then return saveHandDial(c, "") end
+    clientEnv.ask("Name for the gate dialed by hand at " .. c.name, {text = c.name .. " dial " .. tostring(hand.time), title = "SAVE"}, guard(function(name)
+        if name and name:match("%S") then log(saveHandDial(c, name)) end
+    end))
+end)
+clientEnv.command({"energy", "e"}, "energy [gate]: what dialing it from the dialing gate costs, and how long the wormhole can stay open", function(args)
+    local c = clientEnv.fromGate()
+    local r = args[1] and clientEnv.findEntry(args[1]) or row()
+    if not c then return "No gate in range." end
+    if not r then return "Choose a gate to dial." end
+    c.proxy:async(guard(function(ok, x)
+        if ok ~= true then log(("%s to %s: %s"):format(c.name, r.Name, tostring(x))) return end
+        cost.from, cost.dest, cost.at, cost.result, cost.error = c, r, computer.uptime(), x, nil
+        log(("%s to %s: %d glyphs. %s."):format(c.name, r.Name, x.glyphs, costText(c, r)))
+    end)).energy(r.Address)
+end)
+clientEnv.command({"schedule"}, "schedule <minutes> <gate> | schedule [remove <n>]: the dialing gate dials a gate every so often (admins)", function(args)
+    local c = clientEnv.fromGate()
+    if not c then return "No gate in range." end
+    local minutes = math.tointeger(tonumber(args[1]))
+    if minutes and args[2] then
+        local r = clientEnv.findEntry(args[2])
+        if not r then return "No gate " .. args[2] .. " in the address book." end
+        if minutes < 1 then return "At least every minute." end
+        return sendRoute(c, {r}, minutes * 60)
+    end
+    if not isAdmin(c) then return c.name .. ": scheduled dials need the admin role." end
+    remote(c, "schedule " .. table.concat(args, " "), function(text) log("  " .. c.name .. ": " .. text) end)
+end)
+clientEnv.command({"update"}, "update [gate] [path ...]: push this device's GNS gate files (or those paths under /usr) to a gate you administer", function(args)
+    local c, rest = args[1] and findGate(args[1]), 2
+    if not c then c, rest = clientEnv.fromGate(), 1 end
+    return update(c, {table.unpack(args, rest)})
 end)
 
 ---------------------------------------------------------------------------- the screen
@@ -436,7 +914,8 @@ local function headline()
         return engaged == 0 and "DIALING" or (engaged >= total and ("CHEVRON " .. total .. " LOCKED") or ("CHEVRON " .. engaged .. " ENGAGED")),
             ("Dialing · chevron %d of %d engaged"):format(engaged, total), C.amber
     end
-    return "READY", ("Ready · %s to %s, %d glyphs"):format(c.name, name, #plannedGlyphs(c, r)), C.dim
+    local price = wide and "" or costText(c, r)
+    return "READY", ("Ready · %s to %s, %d glyphs%s"):format(c.name, name, #plannedGlyphs(c, r), price ~= "" and (" · " .. price) or ""), C.dim
 end
 local function chips(self, x, y, w, pitch, h)
     local c = clientEnv.fromGate()
@@ -449,7 +928,7 @@ local function chips(self, x, y, w, pitch, h)
         local bg = on and C.amber or (nextUp and C.raised or C.card)
         self:fill(gx, y, pitch - 1, h, bg)
         self:text(gx + 1, y, tostring(i), on and C.black or C.faint, bg)
-        local name = glyphs[i] == "Point of Origin" and "Origin" or glyphs[i]
+        local name = glyphs[i] == "Point of Origin" and "Origin" or (settings.showCodes and glyphs[i] or "·")
         self:text(gx, y + h - 1, ui.center(name, pitch - 1), on and C.black or (nextUp and C.amber or C.dim), bg)
     end
 end
@@ -461,8 +940,7 @@ end
 local function fromNote()
     local c = clientEnv.fromGate()
     if not c then return "none in range" end
-    if c.net then return "[" .. clientEnv.roleOf(c.net) .. "] " .. (c.net.name or "private") end
-    return "[public]"
+    return "[" .. c.tag .. "]"
 end
 local function cycle(step)
     if #connections == 0 then return end
@@ -473,18 +951,32 @@ local function cycle(step)
 end
 local function fromName() local c = clientEnv.fromGate() return c and c.name or "no gate" end
 
--- The address book, searched by name, type or location.
+-- The address book, searched by name, type or location, and by glyph where addresses are shown.
 local search = ""
+-- A gate's address on one line: each glyph's first three letters (a Universe glyph's number).
+local function shortAddress(r)
+    local out = {}
+    for i, g in ipairs((r.Address or {})[r.Type or "MW"] or {}) do
+        out[i] = tostring(g):match("^Glyph (%d+)$") or unicode.sub(tostring(g), 1, 3)
+    end
+    return #out > 0 and table.concat(out, " ") or "no address"
+end
 local function bookItems()
     local list, want = {}, search:lower()
     for i, r in ipairs(database) do
-        local hay = (tostring(r.Name) .. " " .. tostring(r.Type) .. " " .. (clientEnv.place(r) or "")):lower()
-        if want == "" or hay:find(want, 1, true) then list[#list + 1] = {r = r, i = i} end
+        local hay = clientEnv.inProfile(r) and clientEnv.searchText(r)
+        if hay and (want == "" or hay:find(want, 1, true)) then list[#list + 1] = {r = r, i = i} end
     end
     return list
 end
-local function bookList(x, y, w, h, columns)
-    return ui.List(frame, x, y, w, h, {items = bookItems, empty = "No gates yet. SCAN learns the gates in range; Gates adds your own.",
+-- "142 gates", or with a profile in use "Profile · 12 gates".
+local function bookNote()
+    local p = clientEnv.profile()
+    if not p then return #database .. " gates" end
+    return ("%s · %d gates"):format(p.name, #bookItems())
+end
+local function bookList(x, y, w, h, columns, pitch)
+    return ui.List(frame, x, y, w, h, {items = bookItems, pitch = pitch, empty = "No gates yet. SCAN learns the gates in range; Gates adds your own.",
         cells = columns, selected = function(item) return item.r == row() end,
         press = function(item) clientEnv.dest = item.r end})
 end
@@ -525,18 +1017,19 @@ if wide then
         self:text(11, 5, tostring(s.iris), s.iris == "CLOSED" and C.red or C.green, C.card)
         self:text(23, 5, ("Server %.1f TPS"):format(tonumber(s.tps) or 0), C.dim, C.card)
     end)
-    local left = ui.chooser(frame, rx + 1, 2, 26, fromName, function() cycle(-1) end, function() cycle(1) end)
+    local left = ui.chooser(frame, rx + 1, 2, 22, fromName, function() cycle(-1) end, function() cycle(1) end)
     first = left
-    ui.Button(frame, rx + 29, 2, 8, 1, "SCAN", C.amber, C.black, function() say(scan(false)) end)
-    ui.Button(frame, rx + 39, 2, 8, 1, "CLOSE", C.raised, C.text, function()
+    ui.Button(frame, rx + 24, 2, 7, 1, "SCAN", C.amber, C.black, function() say(scan(false)) end)
+    ui.Button(frame, rx + 33, 2, 7, 1, "CLOSE", C.raised, C.text, function()
         local c = clientEnv.fromGate()
         if c then closeConnection(c) end
     end)
-    ui.Button(frame, rx + 49, 2, 10, 1, "CONSOLE", function() return isAdmin(clientEnv.fromGate()) and C.blue or C.raised end,
+    ui.Button(frame, rx + 42, 2, 9, 1, "CONSOLE", function() return isAdmin(clientEnv.fromGate()) and C.blue or C.raised end,
         function() return isAdmin(clientEnv.fromGate()) and C.black or C.faint end, function()
             local c = clientEnv.fromGate()
-            if isAdmin(c) then console(c) else log("The console needs the admin role in the gate's network.") end
+            if isAdmin(c) then console(c) else log("The console needs the admin role.") end
         end)
+    ui.Button(frame, rx + 53, 2, 6, 1, "GDO", C.amber, C.black, function() say(gdo(clientEnv.fromGate())) end)
 
     ui.card(frame, rx, 7, rw, 8, "DESTINATION", function() local r = row() return r and ("[" .. tostring(r.Type or "MW") .. "]") end, function(self)
         local r = row()
@@ -544,9 +1037,11 @@ if wide then
         self:text(3, 2, r.Name, C.amber, C.card)
         local place = (GALAXY[r.Type] or tostring(r.Type or "")) .. (clientEnv.place(r) and (" · " .. clientEnv.place(r)) or "")
         self:text(5 + unicode.len(r.Name), 2, ui.pad(place, rw - 8 - unicode.len(r.Name)), C.dim, C.card)
-        local codes = #(r.IDCs or {}) > 0 and ("IDC " .. table.concat(r.IDCs, ", ")) or "No IDC"
+        local codes = #(r.IDCs or {}) > 0 and (settings.showCodes and ("IDC " .. table.concat(r.IDCs, ", ")) or "IDC hidden") or "No IDC"
         local signed = r.key and vaultState.book[r.key] and ("signed by its gate, " .. fingerprint(r.key):sub(1, 13)) or "added by hand"
-        self:text(3, 3, ui.pad(codes .. " · " .. signed, rw - 4), C.faint, C.card)
+        self:text(3, 3, ui.pad(codes .. " · " .. signed .. (r.home and " · home" or ""), rw - 4), C.faint, C.card)
+        self:text(3, 4, ui.pad(costText(clientEnv.fromGate(), r), rw - 4), cost.error or (cost.result and not cost.result.canOpen) and C.red or C.dim, C.card)
+        if not settings.showCodes then self:text(3, 5, "Address hidden on this device.", C.faint, C.card) return end
         -- Four to a row, each row's blocks sharing its width (so the last row's are wider).
         local glyphs = plannedGlyphs(clientEnv.fromGate(), r)
         for i, glyph in ipairs(glyphs) do
@@ -556,16 +1051,16 @@ if wide then
             self:block(3 + (i - 1 - rowStart) * (bw + 1), 5 + (i - 1) // 4 * 2, bw, glyph, C.raised, C.text)
         end
     end)
-    ui.card(frame, rx, 16, rw, 13, "ADDRESS BOOK", function() return #database .. " gates" end)
-    ui.Field(frame, rx + 1, 17, rw - 2, {placeholder = "⌕ search gates", changed = function(t) search = t end})
+    ui.card(frame, rx, 16, rw, 13, "ADDRESS BOOK", bookNote)
+    ui.Field(frame, rx + 1, 17, rw - 12, {placeholder = "⌕ search gates", changed = function(t) search = t end})
+    ui.Button(frame, rx + rw - 10, 17, 9, 1, "GLYPHS", C.raised, C.text, function() clientEnv.showGlyphs() end)
     bookList(rx, 18, rw, 11, function(item, _, w)
         local r = item.r
         return {{1, ui.pad(tostring(item.i), 3), C.faint}, {5, ui.pad(r.Name, 20)}, {26, tostring(r.Type or ""), C.dim},
-            {30, ui.pad(clientEnv.place(r) or "", w - 40), C.faint}, {w - 8, #(r.IDCs or {}) > 0 and "[IDC]" or "", C.amber}}
+            {30, ui.pad(clientEnv.place(r) or "", w - 40), C.faint}, {w - 8, settings.showCodes and #(r.IDCs or {}) > 0 and "[IDC]" or (r.home and "[⌂]" or ""), C.amber}}
     end)
     ui.Button(frame, rx, 30, rw, 3, dialLabel, C.green, C.black, function()
-        local state = gateLook()
-        if state == "idle" then say(doDial(clientEnv.fromGate(), row())) else log("The gate is busy; DISENGAGE first.") end
+        say(dialWhenFree(clientEnv.fromGate(), row()))
     end, {around = C.page})
     local half = (rw - 2) // 2
     ui.Button(frame, rx, 34, half, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
@@ -612,7 +1107,7 @@ else
     ui.Button(frame, rx + rw - 13, 1, 6, 1, "SSH", function() return isAdmin(clientEnv.fromGate()) and C.blue or C.head end,
         function() return isAdmin(clientEnv.fromGate()) and C.black or C.faint end, function()
             local c = clientEnv.fromGate()
-            if isAdmin(c) then console(c) else log("The console needs the admin role in the gate's network.") end
+            if isAdmin(c) then console(c) else log("The console needs the admin role.") end
         end, {around = C.head})
     ui.Button(frame, rx + rw - 6, 1, 6, 1, "SCAN", C.amber, C.black, function() say(scan(false)) end, {around = C.head})
     first = ui.chooser(frame, rx + 1, 2, rw - 7, fromName, function() cycle(-1) end, function() cycle(1) end)
@@ -620,21 +1115,84 @@ else
         local c = clientEnv.fromGate()
         if c then closeConnection(c) end
     end)
-    ui.card(frame, rx, 6, rw, 8, "TO", function() return #database .. " gates" end)
-    ui.Field(frame, rx + 1, 7, rw - 2, {placeholder = "⌕ search", changed = function(t) search = t end})
+    ui.card(frame, rx, 6, rw, 8, "TO", bookNote)
+    ui.Field(frame, rx + 1, 7, rw - 11, {placeholder = "⌕ search", changed = function(t) search = t end})
+    ui.Button(frame, rx + rw - 9, 7, 8, 1, "GLYPHS", C.raised, C.text, function() clientEnv.showGlyphs() end)
+    -- With addresses shown, each gate takes two lines: its address goes under its name.
     bookList(rx, 8, rw, 6, function(item, _, w)
         local r = item.r
-        return {{1, ui.pad(tostring(item.i), 3), C.faint}, {4, ui.pad(r.Name, w - 13)}, {w - 8, tostring(r.Type or ""), C.dim},
-            {w - 4, #(r.IDCs or {}) > 0 and "IDC" or "", C.amber}}
-    end)
+        local cells = {{1, ui.pad(tostring(item.i), 3), C.faint, 0}, {4, ui.pad(r.Name, w - 13), C.text, 0}, {w - 8, tostring(r.Type or ""), C.dim, 0},
+            {w - 4, settings.showCodes and #(r.IDCs or {}) > 0 and "IDC" or (r.home and "⌂" or ""), C.amber, 0}}
+        if settings.showCodes then cells[#cells + 1] = {2, ui.pad(shortAddress(r), w - 3), C.faint, 1} end
+        return cells
+    end, function() return settings.showCodes and 2 or 1 end)
     local third = R.w // 3
     ui.Button(frame, 1, 19, third, 3, dialLabel, C.green, C.black, function()
-        local state = gateLook()
-        if state == "idle" then say(doDial(clientEnv.fromGate(), row())) else log("The gate is busy; DISENGAGE first.") end
+        say(dialWhenFree(clientEnv.fromGate(), row()))
     end, {around = C.page})
     ui.Button(frame, third + 2, 19, third - 1, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
     ui.Button(frame, 2 * third + 2, 19, R.w - 2 * third - 2, 3, "IRIS", C.blue, C.black, function() say(iris(clientEnv.fromGate())) end, {around = C.page})
 end
+
+---------------------------------------------------------------------------- glyph touch view
+-- The dialing gate's galaxy glyphs as buttons, like a DHD: tapping one adds it to the address
+-- (a glyph once, at most eight), RESET starts over as on AGS, DIAL dials the address and SAVE
+-- adds it to the address book. GLYPHS on Dial, or the glyphs command.
+function clientEnv.showGlyphs()
+    if ui.modalOpen() then return end
+    local c = clientEnv.fromGate()
+    local galaxy = galaxyOf(c)
+    local glyphs = (clientEnv.GLYPHS or {})[galaxy] or {}
+    local typed = {}
+    local cell = galaxy == "UN" and 10 or 18
+    local w = math.min(ui.W - 4, 2 + ((ui.W - 8) // cell) * cell + 2)
+    local columns = (w - 4) // cell
+    local rows = (#glyphs + columns - 1) // columns
+    local pitch = rows * 2 + 8 <= ui.H - 2 and 2 or 1 -- a blank line between rows where they fit
+    local h = math.min(ui.H - 2, rows * pitch + 8)
+    local box, close = ui.modal(clientEnv.root, clientEnv.shell, w, h, ("GLYPHS · %s · %s"):format(c and c.name or "no gate", GALAXY[galaxy]))
+    local function has(g) for _, t in ipairs(typed) do if t == g then return true end end end
+    for i, g in ipairs(glyphs) do
+        local x, y = 3 + ((i - 1) % columns) * cell, 3 + ((i - 1) // columns) * pitch
+        ui.Button(box, x, y, cell - 1, 1, g, function() return has(g) and C.amber or C.raised end,
+            function() return has(g) and C.black or C.text end, function()
+                if has(g) or #typed >= 8 then return end
+                typed[#typed + 1] = g
+            end)
+    end
+    ui.Paint(box, 3, h - 4, w - 4, 2, function(self)
+        self:text(1, 1, ui.pad(#typed == 0 and "Tap the glyphs of the address, as on a DHD." or table.concat(typed, " · "), w - 4), C.amber, C.card)
+        self:text(1, 2, ui.pad(("%d of 6 to 8 glyphs; the point of origin is added when it dials"):format(#typed), w - 4), C.faint, C.card)
+    end)
+    local function typedRow(name)
+        return {Name = name, Type = galaxy, IDCs = {}, Address = {MW = {}, PG = {}, UN = {}, [galaxy] = {table.unpack(typed)}}}
+    end
+    local bw = (w - 12) // 4
+    ui.Button(box, 3, h - 1, bw, 1, "RESET", C.raised, C.text, function() typed = {} end)
+    ui.Button(box, 5 + bw, h - 1, bw, 1, "DIAL", C.green, C.black, function()
+        if #typed < 6 then log("An address has 6 to 8 glyphs.") return end
+        close()
+        say(dialWhenFree(c, typedRow(table.concat(typed, " "))))
+    end)
+    ui.Button(box, 7 + 2 * bw, h - 1, bw, 1, "SAVE", C.amber, C.black, function()
+        if #typed < 6 then log("An address has 6 to 8 glyphs.") return end
+        local r = typedRow("")
+        close()
+        clientEnv.ask("Name of the gate at this address", {text = "", title = "SAVE"}, function(name)
+            if not name or not name:match("%S") then return end
+            r.Name = name
+            local p = clientEnv.profile()
+            if p then r.Profiles = {[p.name] = true} end
+            database[#database + 1] = r
+            clientEnv.changed()
+            log(("Added %s as gate %d: %s."):format(name, #database, table.concat(r.Address[galaxy], ", ")))
+        end)
+    end)
+    ui.Button(box, 9 + 3 * bw, h - 1, bw, 1, "CLOSE", C.raised, C.text, close)
+end
+clientEnv.command({"glyphs"}, "glyphs: the dialing gate's glyphs as buttons, to dial or save an address by touch", function()
+    clientEnv.showGlyphs()
+end)
 
 -- The first time the client opens, look for gates straight away.
 if not dial.scanned then

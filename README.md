@@ -2,8 +2,8 @@
 
 GNS dials Just Stargate Mod gates in OpenComputers from a tablet or computer. Every gate runs the
 GNS gate server; players run the GNS client and talk to the gates within wireless range. Gates
-and devices prove who they are with keys, so a gate can be kept private to a network of players,
-and an address shared between players cannot be altered on the way.
+and devices prove who they are with keys, so a gate can belong to its owner and the players they
+grant, and an address shared between players cannot be altered on the way.
 
 ## What it does
 
@@ -19,18 +19,38 @@ and an address shared between players cannot be altered on the way.
 - **Keyboard and touch.** Arrows, Tab and Enter move between and press every control; 1-6 open
   the screens. Touch and the mouse work too.
 - **Incoming wormholes.** The gate closes its iris for every incoming wormhole and opens it only
-  for a known IDC, answering the traveller either way.
+  for a known IDC or a signed pass, answering the traveller either way. Until then its
+  off-world alarm is up: it can drive redstone out to the base's lights or doors, and the
+  devices of its owner and admins in range show it.
+- **GDO.** Through an open wormhole, the client sends your signed pass to a GNS gate that knows
+  you (each pass answers a fresh challenge, so it cannot be replayed), or an IDC to any gate.
+- **Dial-back and routes.** Dial a gate and have it dial you back, paying for the trip; or hand
+  your gate a route of several gates, each dialing the next once free. OC modem messages cross
+  an open wormhole, so the far gate hears you however far away it is. Routes are signed, so no
+  gate on the way needs your address book. Admins can schedule a dial to repeat.
+- **Home gate, energy check.** Mark one gate home and dial it with its IDC in one step. Before
+  a dial the client shows what it costs and how long the wormhole can stay open.
+- **Hand dials.** When a player dials out by hand on a gate's DHD, the gate keeps the address;
+  `save` adds it to the address book of any device that opens the gate (a kiosk keeps it
+  hidden).
 - **Address book.** Each gate signs its own entry; scanning copies the signed entries into your
-  vault, and a changed copy is refused. Edit names, types, addresses, locations and IDCs.
-- **Private networks.** A founder creates a network, invites members by fingerprint as user,
-  moderator or admin, and adds gates. A private gate serves only members; revoking a member cuts
-  them off at every gate.
-- **Remote gate console.** An admin of a gate's network runs that gate's console from the client
-  (`ssh`, or CONSOLE on Dial), to set up a gate nobody sits at: rename it, set its IDCs, read its
-  log, sync its address book. The gate logs each command with the admin's fingerprint.
+  vault, and a changed copy is refused. Edit names, types, addresses, locations and IDCs. A
+  setting hides addresses and IDCs, as a client on a gate's own computer (a kiosk) does.
+- **Owners and grants.** A network is layered: a port; wake keys (gate servers sleep when idle
+  and wake on their own key, or on the DHD's redstone); registration (the device that sets a
+  gate up owns it, and its player becomes the gate computer's OC user, so nobody else can type
+  there); and roles, through grants. The owner signs a grant for a player's key, as user or
+  admin, for one gate or every gate they own; admins grant users too. The gate checks the
+  signature, so it keeps no member list, and a grant cut off is refused at every gate it covers
+  once the owner's or admin's device has opened it. Grants do not expire.
+- **Remote gate console and update.** The owner and admins run a gate's console from the client
+  (`ssh`, or CONSOLE on Dial), to set up a gate nobody sits at, and push new GNS code to a gate
+  without an internet card (`update`). The gate logs each command with the player's name.
+- **Gate room mode.** The gate computer's screen becomes the dialing room display: the gate with
+  its chevrons locking, the wormhole's time left and the traveller log.
 - **Chat and sharing.** Chat with GNS devices nearby and share gates with them, with or without
   their IDCs; shares wait for you to accept, and devices can be blocked.
-- **Vault.** Your device's key, address book and memberships are kept encrypted under your
+- **Vault.** Your device's key, address book and grants are kept encrypted under your
   password.
 
 ## Requirements
@@ -57,7 +77,8 @@ This installs GNS with `ecc` and the parts of `loom` the client uses. On a gate 
 `/tmp/gns-install.lua gate` instead: it leaves out the client and loom. `gns update` later
 fetches only what changed, keeps the install's kind, and removes files GNS no longer has;
 nothing is replaced until every changed file has downloaded. The vault, settings and gate state
-are written at run time and never touched by an install or update.
+are written at run time and never touched by an install or update. `gns uninstall` keeps them
+too, for a reinstall; `gns uninstall --all` deletes them. Both leave the loom and ecc libraries.
 
 Without internet, copy GNS onto a floppy from a computer that has it:
 
@@ -80,8 +101,12 @@ For an empty computer, make an installer floppy with QuickOS and GNS (it uses Qu
 `--gate`):
 
 ```
-gns floppy /mnt/abc --os --gate --name=gate-%02d --auto=5
+gns floppy /mnt/abc --os --gate --own --name=gate-%02d --auto=5
 ```
+
+`--own` registers every gate installed from the floppy to this device: it asks for the vault
+password and your player name. Each gate makes its own wake key, which your device learns the
+first time it opens the gate.
 
 Boot the empty computer from it: it installs both hands-off after 5 s as gate-01, gate-02, ...
 (a gate server takes its gate's name from the hostname) and reboots into QuickOS once the floppy
@@ -97,17 +122,22 @@ gns client          run the client
 gns passwd          change the client vault's password
 gns autorun on|off  start gns when the computer boots
 gns update          install the newest GNS from GitHub
+gns uninstall       remove GNS; the vault, settings and gate state stay (--all removes them)
 gns floppy DEST     write gns.bundle to DEST, for bundle unpack on another computer
 gns floppy DEST --os  make an installer floppy with QuickOS and GNS for an empty computer
 gns floppy ... --gate  only the gate server (no client or loom)
+gns floppy ... --own   gates installed from it belong to this device
 ```
 
 The first client run asks for a password and creates the vault. The client's Guide screen
 explains every screen and command. The gate server's console takes `help`, `status`, `close`,
-`iris`, `log`, `idc`, `kawoosh`, `name`, `dim`, `book`, `sync`, `trust`, `clear` and `quit`; all but
-`clear` and `quit` also run remotely for admins.
+`iris`, `log`, `idc`, `kawoosh`, `name`, `dim`, `public`, `port`, `sleep`, `wake`, `redstone`,
+`alarm`, `schedule`, `users`, `cut`, `room`, `clear` and `quit`; all but `room`, `clear` and
+`quit` also run remotely for the owner and admins. Only the gate computer's OC users (the owner
+and admins) can type at it.
 
 ## Design
 
 [docs/design/authentication.md](docs/design/authentication.md) describes the identities,
-handshake, signed entries, networks and vault.
+handshake, signed entries and vault; [docs/design/networks.md](docs/design/networks.md) the
+layered networks: ports, wake keys, owners, grants, dial-back, passes and the off-world alarm.

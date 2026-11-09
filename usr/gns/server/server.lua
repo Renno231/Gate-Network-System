@@ -1,10 +1,12 @@
--- GNS gate server: serves this computer's stargate to GNS clients and gates, announces it on
--- disco, and gives the gate's owner a console. Started by /usr/bin/gns.
+-- GNS gate server: serves this computer's stargate to GNS clients, announces it on disco, and
+-- gives the gate's owner and admins a console (or the gate room display). Started by
+-- /usr/bin/gns.
 local gns = ...
 if type(gns) ~= "table" or type(gns.path) ~= "table" or type(gns.utility) ~= "table" then
     error("Gate Network System environment not loaded")
 end
 local component = require("component")
+local computer = require("computer")
 local disco = require("disco")
 local serialization = require("serialization")
 local term = require("term")
@@ -16,8 +18,9 @@ local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
 local stargate = gns.stargate or component.stargate
 local dhd = gns.dhd or (component.isAvailable("dhd") and component.dhd or nil)
 
--- settings.lua: the gate's published name and dimension, kawoosh avoidance (on unless false)
--- and the IDCs that open the iris for incoming travellers ({[code] = name}).
+-- settings.lua: the gate's published name and dimension, kawoosh avoidance (on unless false),
+-- the IDCs that open the iris ({[code] = name}), port, public, sleep (idle minutes before it
+-- shuts down; 0 never), alarm, redstoneWake and room (start in gate room mode).
 local settingsPath = gns.path.serverDirectory .. "settings.lua"
 local settings = gns.utility.readFile(settingsPath)
 if type(settings) ~= "table" then
@@ -27,33 +30,60 @@ if type(settings) ~= "table" then
 end
 settings.idcs = type(settings.idcs) == "table" and settings.idcs or {}
 if settings.kawoosh == nil then settings.kawoosh = true end
+if settings.sleep == nil then settings.sleep = 5 end
 local function saveSettings()
     gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
 end
+
+-- owner.lua, from a floppy made with gns floppy --own: {owner, ownerName}. An unregistered gate
+-- takes it once, as if that device had set it up, and makes its own wake key (the owner's device
+-- gets it the first time it opens the gate).
+local state = gate.load(gns.path.serverDirectory .. "state")
+local ownerPath = gns.path.serverDirectory .. "owner.lua"
+local given = gns.utility.readFile(ownerPath)
+if type(given) == "table" and not state.owner and type(given.owner) == "string" and #given.owner == 22
+    and type(given.ownerName) == "string" and #given.ownerName > 0 then
+    state.owner, state.ownerName, state.wake = given.owner, given.ownerName, handshake.wakeKey()
+    pcall(computer.addUser, given.ownerName)
+    gate.save(state)
+end
+if given ~= nil then require("filesystem").remove(ownerPath) end
 saveSettings()
 
-local state = gate.load(gns.path.serverDirectory .. "state")
 local node = gate.start(state, stargate, settings, dhd)
-disco.offer("gns", handshake.PORT)
+disco.offer("gns", settings.port or handshake.PORT)
 
-print(("GNS gate %s (%s)"):format(settings.name,
-    state.net and ("private, founder " .. fingerprint(state.net.network.founder)) or "public"))
-print("Modem " .. component.modem.address)
+print(("GNS gate %s"):format(settings.name))
+print(state.owner and ("Owner %s (%s)%s"):format(tostring(state.ownerName), fingerprint(state.owner), settings.public and ", public" or "")
+    or "Not registered: the first client to set it up becomes its owner.")
+print("Modem " .. component.modem.address .. ", port " .. (settings.port or handshake.PORT))
 print("Device " .. fingerprint(state.identity.public))
 print("Type help for commands.")
 
--- The console commands (console.lua); admins of the gate's network run the same ones remotely.
+-- The console commands (console.lua); admins run the same ones remotely.
 local run = dofile(gns.path.gns .. "console.lua").new(node, settings, saveSettings, dhd, stargate)
 node.console = run
+local room = dofile(gns.path.serverDirectory .. "room.lua")
 local commands = {} -- only at the gate computer itself
 commands.help = function()
     run("help", print)
+    print(("%-22s %s"):format("room [on|off]", "the gate room display; on: start in it"))
     print(("%-22s %s"):format("clear", "clear the screen"))
     print(("%-22s %s"):format("quit", "stop the gate"))
 end
 commands.clear = function() term.clear() end
+commands.room = function(argument)
+    if argument == "on" or argument == "off" then
+        settings.room = argument == "on"
+        saveSettings()
+        print("Gate room mode at start " .. argument)
+        if argument == "off" then return end
+    end
+    room.run(node, settings)
+end
 for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
 
+if settings.room then room.run(node, settings) end
 while true do
     io.write("gate> ")
     local line = io.read()

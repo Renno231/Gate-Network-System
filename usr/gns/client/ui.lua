@@ -286,7 +286,9 @@ ui.Field = Field
 -- Rows of an items table (or a function returning one). opts:
 --   cells(item, i, width) -> {{column, text, colour}, ...}
 --   selected(item, i) -> true for rows shown amber; press(item, i) on Enter/Space or touch
---   pitch: rows per item (default 1); empty: text shown when there are no items
+--   pitch: rows per item, or a function returning it (default 1); a cell's fourth value puts it
+--   on that line of its item (0 is the first), which the cursor colour then covers whole
+--   empty: text shown when there are no items
 --   scrollOnly: Up/Down scroll the text instead of moving a cursor (for reading)
 -- Up/Down move the cursor; past the first or last row they move focus out of the list.
 local List = class(Widget)
@@ -299,7 +301,7 @@ function List:new(parent, x, y, w, h, opts)
     return o
 end
 function List:items() return value(self._opts.items) or {} end
-function List:rows() return math.max(1, self:height() // (self._opts.pitch or 1)) end
+function List:rows() return math.max(1, self:height() // (value(self._opts.pitch) or 1)) end
 -- Keep the cursor inside the list and on screen.
 function List:_clamp()
     local n, rows = #self:items(), self:rows()
@@ -319,7 +321,7 @@ function List:draw()
     self:_clamp()
     local opts, items = self._opts, self:items()
     local x, y, w, h = self:absX(), self:absY(), self:width(), self:height()
-    local pitch = opts.pitch or 1
+    local pitch = value(opts.pitch) or 1
     local focused = self:focused() and not opts.scrollOnly
     gpu.setBackground(C.card)
     self:_gpufill(x, y, w, h, " ")
@@ -334,14 +336,17 @@ function List:draw()
         local i = self._scroll + r
         local item = items[i]
         if not item then break end
-        local ry = y + (r - 1) * pitch + (pitch - 1) // 2
+        local top = y + (r - 1) * pitch
+        local ry = top + (pitch - 1) // 2
         local selected = opts.selected and opts.selected(item, i)
         local bg = selected and C.amber or ((focused and i == self._cursor) and C.hover or C.card)
+        local cells, lines = opts.cells(item, i, w), false
+        for _, cell in ipairs(cells) do lines = lines or cell[4] ~= nil end
         gpu.setBackground(bg)
-        self:_gpufill(x, ry, w, 1, " ")
-        for _, cell in ipairs(opts.cells(item, i, w)) do
+        if lines then self:_gpufill(x, top, w, pitch, " ") else self:_gpufill(x, ry, w, 1, " ") end
+        for _, cell in ipairs(cells) do
             gpu.setForeground(selected and C.black or (cell[3] or C.text))
-            self:_gpuset(x + cell[1], ry, usub(tostring(cell[2]), 1, math.max(0, w - cell[1])))
+            self:_gpuset(x + cell[1], cell[4] and (top + cell[4]) or ry, usub(tostring(cell[2]), 1, math.max(0, w - cell[1])))
         end
     end
     -- More above or below: a faint arrow on the right edge.
@@ -355,7 +360,7 @@ end
 function List:_drawFocus()
     local x, y, w, h = self:absX(), self:absY(), self:width(), self:height()
     if not self._opts.scrollOnly and #self:items() > 0 then
-        local pitch = self._opts.pitch or 1
+        local pitch = value(self._opts.pitch) or 1
         y, h = y + (self._cursor - self._scroll - 1) * pitch + (pitch - 1) // 2, 1
     end
     brackets(x, y, w, h, value(self._around) or C.card)
@@ -383,7 +388,7 @@ end
 function List:defaultCallback(_, eventName, _, x, y, button)
     if eventName == "touch" and button == 0 then
         if self._opts.scrollOnly then return true end
-        local pitch = self._opts.pitch or 1
+        local pitch = value(self._opts.pitch) or 1
         local i = self._scroll + (y - self:absY()) // pitch + 1
         if self:items()[i] then
             self._cursor = i

@@ -54,8 +54,12 @@ end
 
 -- stargate: the JSG component (or a stand-in); dhd: the DHD component or nil; settings: the
 -- gate's settings, read live: kawoosh (false turns avoidance off) and idcs {[code] = name}.
+-- dialer.on.incoming(), on.admitted(name) and on.closed(), when set, are told of an incoming
+-- wormhole, a traveller let through the iris, and the wormhole closing; on.handDialed(address)
+-- of an outgoing wormhole the gate did not dial (a player at the DHD), with its address
+-- {[type] = glyphs, without the point of origin}. travellers lists the last ten {time, name}.
 function dialing.new(stargate, dhd, settings)
-    local dialer = {state = "idle", log = {}}
+    local dialer = {state = "idle", log = {}, on = {}, travellers = {}}
     local stepTimer, listeners, idc = nil, {}, nil
     local probe = tpsProbe()
 
@@ -123,11 +127,35 @@ function dialing.new(stargate, dhd, settings)
         idc = nil
     end
 
-    -- Incoming wormholes: the iris closes; a known IDC opens it again.
+    -- Incoming wormholes: the iris closes; a known IDC or a signed pass opens it again.
     local function onIncoming()
-        dialer.incoming = true
+        dialer.incoming, dialer.openedAt = true, computer.uptime()
         if hasIris() then irisTo("CLOSED") end
         note("incoming wormhole")
+        if dialer.on.incoming then dialer.on.incoming() end
+    end
+
+    -- Lets a traveller through: the iris opens once the wormhole is open.
+    local function admit(name)
+        local log = dialer.travellers
+        log[#log + 1] = {time = os.date("%H:%M"), name = name}
+        if #log > 10 then table.remove(log, 1) end
+        if dialer.on.admitted then dialer.on.admitted(name) end
+        if not hasIris() then return end
+        every(function()
+            if stargate.getGateStatus() ~= "open" or not irisTo("OPENED") then return false end
+            stargate.sendMessageToIncoming("Gate is open!")
+            note("iris open for " .. name)
+            return true
+        end, computer.uptime() + 30)
+    end
+
+    -- A signed pass was accepted (gate.lua checks it): the same as a known IDC.
+    function dialer.admit(name)
+        if not dialer.incoming then error("no incoming wormhole", 0) end
+        note("pass from " .. name)
+        admit(name)
+        return true
     end
 
     local function onCode(code)
@@ -144,18 +172,29 @@ function dialing.new(stargate, dhd, settings)
             return
         end
         note("IDC from " .. name)
-        every(function()
-            if stargate.getGateStatus() ~= "open" or not irisTo("OPENED") then return false end
-            stargate.sendMessageToIncoming("Gate is open!")
-            note("iris open for " .. name)
-            return true
-        end, computer.uptime() + 30)
+        admit(name)
+    end
+
+    -- An outgoing wormhole this dialer did not open: a player dialed it by hand on the DHD. JSG
+    -- still holds the dialed glyphs when stargate_open comes.
+    local function onHandDialed()
+        local own = dialing.TYPE[stargate.getGateType()] or "MW"
+        local glyphs = {}
+        for _, glyph in ipairs(dialedGlyphs(stargate)) do
+            if glyph ~= dialing.ORIGIN[own] then glyphs[#glyphs + 1] = glyph end
+        end
+        dialer.openedAt, dialer.by, dialer.target = computer.uptime(), nil, nil
+        local ok, cost = pcall(stargate.getEnergyRequiredToDial, table.unpack(dialedGlyphs(stargate)))
+        dialer.keepAlive = ok and type(cost) == "table" and cost.keepAlive or nil
+        note("dialed by hand")
+        if #glyphs >= 6 and dialer.on.handDialed then dialer.on.handDialed({[own] = glyphs}) end
     end
 
     local function onClose()
-        dialer.incoming, idc = false, nil
+        dialer.incoming, dialer.openedAt, idc = false, nil, nil
         if hasIris() and stargate.getIrisState() == "CLOSED" then stargate.toggleIris() end
         note("closed")
+        if dialer.on.closed then dialer.on.closed() end
     end
 
     for name, handler in pairs({
@@ -163,15 +202,27 @@ function dialing.new(stargate, dhd, settings)
         received_code = function(_, _, _, code) onCode(code) end,
         code_respond = function(_, _, _, message) onCodeRespond(message) end,
         stargate_close = function() onClose() end,
+        -- A dial of ours is still stepping, or has finished (openedAt) when the event comes late.
+        stargate_open = function(_, _, _, initiating)
+            if initiating and not stepTimer and not dialer.openedAt then onHandDialed() end
+        end,
     }) do
         listeners[#listeners + 1] = {name, handler}
         event.listen(name, handler)
+    end
+
+    -- An outgoing wormhole already open when the server starts (a player at the DHD woke the
+    -- computer): dialed by hand. Called once the on handlers are set.
+    function dialer.adopt()
+        local gateState, outgoing = stargate.getGateStatus()
+        if gateState == "open" and outgoing and not dialer.openedAt then onHandDialed() end
     end
 
     -- An open incoming wormhole at start (the computer restarted): close the iris until the
     -- traveller's gate resends its IDC.
     do
         local gateState, outgoing = stargate.getGateStatus()
+        if gateState == "open" and not outgoing then dialer.incoming, dialer.openedAt = true, computer.uptime() end
         if gateState == "open" and not outgoing and hasIris() and next(settings.idcs or {}) then
             irisTo("CLOSED")
             pcall(stargate.sendMessageToIncoming, "Iris closed. Resend IDC.")
@@ -188,10 +239,9 @@ function dialing.new(stargate, dhd, settings)
         end
     end
 
-    -- Dials address {MW = {...}, PG = {...}, UN = {...}}. opts: fast (use the DHD), idc (a
-    -- code to send once open). Returns {glyphs, from, open, keepAlive, seconds, fast} or errors.
-    function dialer.dial(address, opts)
-        opts = opts or {}
+    -- The glyphs this gate dials for address {MW = {...}, PG = {...}, UN = {...}}, with its
+    -- point of origin, and their energy cost. Errors when the gate cannot dial it.
+    local function plan(address)
         local own = dialing.TYPE[stargate.getGateType()] or "MW"
         local origin = dialing.ORIGIN[own]
         local given = type(address) == "table" and address[own]
@@ -203,13 +253,35 @@ function dialing.new(stargate, dhd, settings)
         end
         if #glyphs < 6 or #glyphs > 8 then error("bad address", 0) end
         glyphs[#glyphs + 1] = origin
-        if stepTimer then error("already dialing", 0) end
-        local gateState, outgoing = stargate.getGateStatus()
-        if gateState == "open" and not outgoing then error("incoming wormhole", 0) end
-
         local cost
         glyphs, cost = shortest(glyphs, origin)
         if not glyphs then error("the gate cannot dial that address", 0) end
+        return glyphs, cost, own
+    end
+
+    -- How long a wormhole can stay open on stored energy after paying open, in seconds.
+    local function openFor(cost)
+        return math.max(0, math.floor((stargate.getEnergyStored() - cost.open) / math.max(cost.keepAlive, 1) / 20))
+    end
+
+    -- What a dial of address would cost, without dialing: {glyphs, open, keepAlive, seconds,
+    -- canOpen, energy}.
+    function dialer.cost(address)
+        local glyphs, cost = plan(address)
+        return {glyphs = #glyphs, open = cost.open, keepAlive = cost.keepAlive, canOpen = cost.canOpen == true,
+            seconds = openFor(cost), energy = stargate.getEnergyStored()}
+    end
+
+    -- Dials address {MW = {...}, PG = {...}, UN = {...}}. opts: fast (use the DHD), idc (a
+    -- code to send once open), speed (seconds the whole dial takes, spread evenly over the
+    -- glyphs and the engage, as on GDS; the DHD is only pressed under 25 s; absent or 0: as fast
+    -- as the gate goes). Returns {glyphs, from, open, keepAlive, seconds, fast} or errors.
+    function dialer.dial(address, opts)
+        opts = opts or {}
+        local glyphs, cost, own = plan(address)
+        if stepTimer then error("already dialing", 0) end
+        local gateState, outgoing = stargate.getGateStatus()
+        if gateState == "open" and not outgoing then error("incoming wormhole", 0) end
         if not cost.canOpen then error(("not enough power: %d RF to open"):format(cost.open), 0) end
 
         -- Keep glyphs already engaged when they start this address; otherwise start over.
@@ -223,7 +295,9 @@ function dialing.new(stargate, dhd, settings)
         end
 
         dialer.target = glyphs
-        local fast = opts.fast and dhd ~= nil and own ~= "UN"
+        local speed = math.max(0, math.min(tonumber(opts.speed) or 0, DIAL_TIMEOUT))
+        local fast = opts.fast and dhd ~= nil and own ~= "UN" and speed < 25
+        local gap, nextAt = speed / #glyphs, 0
         local avoid = settings.kawoosh ~= false and hasIris()
         local i, phase, openedAt, closedIris = from, "glyphs", nil, false
         note("dialing")
@@ -235,7 +309,9 @@ function dialing.new(stargate, dhd, settings)
             local status = stargate.getGateStatus()
             if phase == "glyphs" then
                 if status ~= "idle" or #dialedGlyphs(stargate) ~= i - 1 then return false end
+                if computer.uptime() < nextAt then return false end
                 if i <= #glyphs then
+                    nextAt = computer.uptime() + gap
                     if fast then dhd.pressButton(glyphs[i]) else stargate.engageSymbol(glyphs[i]) end
                     -- The iris shuts while the last glyph locks, so the kawoosh meets it.
                     if i == #glyphs and avoid then closedIris = true irisTo("CLOSED") end
@@ -264,17 +340,25 @@ function dialing.new(stargate, dhd, settings)
                 if closedIris and computer.uptime() - openedAt < KAWOOSH_TICKS / 20 then return false end
                 if closedIris and not irisTo("OPENED") then return false end
                 finish("open")
+                dialer.openedAt, dialer.keepAlive = computer.uptime(), cost.keepAlive
                 if opts.idc then sendIdc(opts.idc) end
                 return true
             end
-        end, computer.uptime() + DIAL_TIMEOUT, function()
+        end, computer.uptime() + DIAL_TIMEOUT + speed, function()
             if closedIris then irisTo("OPENED") end
             finish("timed out")
         end)
 
-        local seconds = math.floor((stargate.getEnergyStored() - cost.open) / cost.keepAlive / 20)
         return {glyphs = #glyphs, from = from, open = cost.open, keepAlive = cost.keepAlive,
-            seconds = seconds, fast = fast}
+            seconds = openFor(cost), fast = fast}
+    end
+
+    -- The GDO: sends code through this gate's open outgoing wormhole to the far gate's iris.
+    function dialer.sendCode(code)
+        local gateState, outgoing = stargate.getGateStatus()
+        if gateState ~= "open" or not outgoing then error("no outgoing wormhole", 0) end
+        sendIdc(code)
+        return true
     end
 
     -- Stops a dial in progress, or closes an outgoing wormhole. Returns what it did.
@@ -304,10 +388,16 @@ function dialing.new(stargate, dhd, settings)
         local gateState, outgoing = stargate.getGateStatus()
         local ok, capacity = pcall(stargate.getMaxEnergyStored)
         local typed, irisType = pcall(stargate.getIrisType)
+        -- open: seconds the wormhole has been open; left: how long an outgoing one can stay open.
+        local open, left = nil, nil
+        if gateState == "open" and dialer.openedAt then
+            open = math.floor(computer.uptime() - dialer.openedAt)
+            if outgoing and dialer.keepAlive then left = math.floor(stargate.getEnergyStored() / math.max(dialer.keepAlive, 1) / 20) end
+        end
         return {type = stargate.getGateType(), state = gateState, outgoing = outgoing,
             iris = stargate.getIrisState(), irisType = typed and irisType or nil, dialing = stepTimer ~= nil, lastDial = dialer.state,
             energy = stargate.getEnergyStored(), capacity = ok and tonumber(capacity) or nil,
-            glyphs = dialedGlyphs(stargate), target = dialer.target,
+            glyphs = dialedGlyphs(stargate), target = dialer.target, open = open, left = left,
             tps = math.floor(probe.tps * 10 + 0.5) / 10}
     end
 

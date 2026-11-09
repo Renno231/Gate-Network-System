@@ -97,9 +97,13 @@ local modem = component.modem
 local readFile = gns.utility.readFile
 local writeFile = gns.utility.writeFile
 
--- The vault also holds pinned gate keys, signed gate entries and private network memberships.
+-- The vault also holds pinned gate keys, the gates' own signed entries (book), the grants this
+-- device holds and has issued, and what it knows of the gates it may use (access[gate key] =
+-- {name, modem, port, wake, owner, role}: how to reach and wake them).
 local vaultState = clientVault.state
-vaultState.pins, vaultState.book, vaultState.networks = vaultState.pins or {}, vaultState.book or {}, vaultState.networks or {}
+vaultState.pins, vaultState.book = vaultState.pins or {}, vaultState.book or {}
+vaultState.grants, vaultState.issued, vaultState.access = vaultState.grants or {}, vaultState.issued or {}, vaultState.access or {}
+vaultState.networks = nil -- founder networks are gone: grants replaced them
 local database = vaultState.database
 clientEnv.database = database
 clientEnv.vault = clientVault
@@ -109,12 +113,19 @@ local settingsPath = gns.path.clientDirectory .. "settings.lua"
 -- are ignored.
 local settings = {
     fastDial = true, -- press the gate's DHD instead of spinning the ring
+    dialSpeed = 0, -- seconds a whole dial takes, spread over the glyphs (GDS's speed); 0: fastest
     autoLogToDatabase = true, -- add gates learned from scans to the address book
     nearbyScanRate = 30, -- seconds between automatic scans for gates; 0 turns them off
     modemRange = 400, -- wireless strength in blocks (16 to 400)
     autoAcceptShared = false, -- take gates shared by other devices without asking
     chatBlacklist = {}, -- device fingerprint -> true: their chat and shares are dropped
     layout = "auto", -- "auto", "compact" (80x25) or "wide" (160x50)
+    -- Show gate addresses and IDCs. A client on a gate's own computer (a kiosk) hides them; only
+    -- its OC users, the owner and admins, can type there to change it.
+    showCodes = not component.isAvailable("stargate"),
+    port = 160, -- the modem port of the gates this device uses (a network's base layer)
+    tabletSleep = 5, -- minutes without a key or touch before a tablet saves and shuts down; 0: never
+    profile = "", -- the network profile in use (its name), or "" for every gate
 }
 clientEnv.settings = settings
 
@@ -122,6 +133,9 @@ local function applySettings()
     settings.modemRange = math.min(math.max(math.floor(tonumber(settings.modemRange) or 400), 16), 400)
     settings.nearbyScanRate = math.min(math.max(math.floor(tonumber(settings.nearbyScanRate) or 0), 0), 600)
     if settings.layout ~= "compact" and settings.layout ~= "wide" then settings.layout = "auto" end
+    settings.port = math.min(math.max(math.floor(tonumber(settings.port) or 160), 1), 65535)
+    settings.tabletSleep = math.min(math.max(math.floor(tonumber(settings.tabletSleep) or 5), 0), 600)
+    settings.dialSpeed = math.min(math.max(math.floor(tonumber(settings.dialSpeed) or 0), 0), 120)
     if modem.setStrength then modem.setStrength(settings.modemRange) end
 end
 function clientEnv.saveSettings()
@@ -135,6 +149,38 @@ readFile(settingsPath, function(saved)
     end
 end)
 clientEnv.saveSettings()
+
+-- Network profiles: a name, a port and the gates that belong to it (row.Profiles[name]), kept in
+-- the vault. The client listens on every profile's port as well as its own, so one device takes
+-- part in several networks; with a profile in use (settings.profile) the address book and Dial
+-- show only its gates. Profiles grant nothing: grants and roles stay as they are.
+vaultState.profiles = vaultState.profiles or {}
+function clientEnv.profile()
+    for _, p in ipairs(vaultState.profiles) do if p.name == settings.profile then return p end end
+end
+function clientEnv.inProfile(r)
+    local p = clientEnv.profile()
+    return not p or (r.Profiles or {})[p.name] == true
+end
+function clientEnv.ports()
+    local ports = {[settings.port] = true}
+    for _, p in ipairs(vaultState.profiles) do ports[p.port] = true end
+    return ports
+end
+function clientEnv.listen()
+    for port in pairs(clientEnv.ports()) do
+        if not modem.isOpen(port) then pcall(modem.open, port) end
+    end
+end
+-- A gate reached on a profile's port belongs to that profile.
+function clientEnv.joinByPort(r, port)
+    for _, p in ipairs(vaultState.profiles) do
+        if p.port == port then
+            r.Profiles = r.Profiles or {}
+            r.Profiles[p.name] = true
+        end
+    end
+end
 
 ---------------------------------------------------------------------------- activity
 -- One activity log for everything the client does; the latest line also shows in the bottom bar.
@@ -183,6 +229,17 @@ function clientEnv.place(row)
     local s = "dim " .. tostring(l.dimension)
     if l.x then s = s .. " · " .. tostring(l.x) .. " " .. tostring(l.y) .. " " .. tostring(l.z) end
     return s
+end
+-- What the address book's search looks in: name, galaxy, location, and the glyphs of each
+-- address where addresses are shown on this device.
+function clientEnv.searchText(r)
+    local hay = tostring(r.Name) .. " " .. tostring(r.Type) .. " " .. (clientEnv.place(r) or "")
+    if settings.showCodes then
+        for _, galaxy in ipairs({"MW", "PG", "UN"}) do
+            hay = hay .. " " .. table.concat((r.Address or {})[galaxy] or {}, " ")
+        end
+    end
+    return hay:lower()
 end
 
 ---------------------------------------------------------------------------- chat
@@ -257,6 +314,56 @@ clientEnv.peer = peer.start(vaultState.identity, vaultState.peerPins, deviceName
         end
     end,
 })
+
+---------------------------------------------------------------------------- player and alarms
+-- The player using the device: OC names them in every key and touch event. A gate registered
+-- from here makes them its OC user.
+clientEnv.player = vaultState.player
+local function noticePlayer(name)
+    if type(name) == "string" and name ~= "" and name ~= clientEnv.player then
+        clientEnv.player, vaultState.player = name, name
+        clientEnv.changed()
+    end
+end
+-- The IDC a gate row sends for the player using the device: their own (PlayerIDCs[player],
+-- for a device several players share), else the row's first IDC; nil if it has none.
+function clientEnv.idcFor(r)
+    local own = r and r.PlayerIDCs and clientEnv.player and r.PlayerIDCs[clientEnv.player]
+    if math.tointeger(own) then return own end
+    for _, code in ipairs(r and r.IDCs or {}) do if math.tointeger(code) then return code end end
+end
+-- Power saving, as on GDS: a tablet shuts down after settings.tabletSleep minutes without a key
+-- or touch, once the vault is saved. A computer that is not a tablet never does.
+local lastInput = computer.uptime()
+local onTablet = component.isAvailable("tablet")
+local sleepTimer = event.timer(15, function()
+    local minutes = settings.tabletSleep
+    if not onTablet or minutes <= 0 or computer.uptime() - lastInput < minutes * 60 then return end
+    local saved, err = clientVault:save()
+    if not saved then clientEnv.log("Not shutting down: the vault was not saved: " .. tostring(err)) lastInput = computer.uptime() return end
+    computer.shutdown()
+end, math.huge)
+local function onKey(_, _, _, _, player) lastInput = computer.uptime() noticePlayer(player) end
+local function onTouch(_, _, _, _, _, player) lastInput = computer.uptime() noticePlayer(player) end
+event.listen("key_down", onKey)
+event.listen("touch", onTouch)
+
+-- Off-world activations: a gate broadcasts gns-alarm on its port when a wormhole comes in
+-- unannounced. Gates this device administers show it here.
+local function onAlarm(_, _, from, port, _, kind, name)
+    if kind ~= "gns-alarm" or not clientEnv.ports()[port] then return end
+    for _, a in pairs(vaultState.access) do
+        if a.modem == from and (a.role == "admin" or a.role == "owner") then
+            local text = ("Unscheduled off-world activation at %s"):format(tostring(a.name or name))
+            clientEnv.log(text)
+            chat.show(text)
+            pcall(computer.beep, 1000, 0.3)
+            return
+        end
+    end
+end
+clientEnv.listen()
+event.listen("modem_message", onAlarm)
 
 ---------------------------------------------------------------------------- commands
 -- The command bar: ; focuses it. Commands are separated by ;, words by spaces. Each screen adds
@@ -347,10 +454,47 @@ function clientEnv.ask(message, opts, confirm, deny)
     return true
 end
 
+-- The whole activity log in a dialog, newest at the bottom, each entry wrapped (keeping a command
+-- result's indent): L, or the log command. The compact layout has no room for the Activity card,
+-- and the bottom bar shows only the latest line.
+function clientEnv.showLog()
+    if ui.modalOpen() then return false end
+    local w, h = math.min(ui.W - 4, 110), math.min(ui.H - 2, 34)
+    local width = w - 12
+    local frame, close = ui.modal(root, shell, w, h, "ACTIVITY")
+    local rows, count, newest = {}, -1, nil
+    local function items()
+        -- Wraps again only when the log has changed.
+        if count ~= #activity or newest ~= activity[#activity] then
+            count, newest = #activity, activity[#activity]
+            rows = {}
+            for i, a in ipairs(activity) do
+                local indent, text = a.text:match("^(%s*)(.*)$")
+                for j, line in ipairs(ui.wrap(text, width - #indent)) do
+                    rows[#rows + 1] = {j == 1 and a.time or "", indent .. line, i == #activity}
+                end
+            end
+        end
+        return rows
+    end
+    local list = ui.List(frame, 2, 3, w - 2, h - 5, {items = items, scrollOnly = true, empty = "Nothing yet.",
+        cells = function(r) return {{1, r[1], C.faint}, {8, r[2], r[3] and C.text or C.dim}} end})
+    list._scroll = math.huge
+    ui.Button(frame, w - 11, h - 1, 10, 1, "CLOSE", C.raised, C.text, close)
+    ui.Paint(frame, 3, h - 1, w - 16, 1, function(self)
+        self:text(1, 1, ui.pad("Up and Down or the wheel scroll · Tab, Enter: CLOSE", w - 16), C.faint, C.card)
+    end)
+    ui.focusSoon(list)
+    return true
+end
+clientEnv.command({"log", "activity"}, "log: the whole activity log (or press L)", function()
+    clientEnv.showLog()
+end)
+
 ---------------------------------------------------------------------------- the shell
 local SCREENS = {
     {"dial", "DIAL", "Dial"}, {"gates", "GATES", "Address book"}, {"chat", "CHAT", "Chat & share"},
-    {"networks", "NETWORKS", "Networks"}, {"settings", "SETTINGS", "Settings"}, {"guide", "GUIDE", "Guide"},
+    {"access", "ACCESS", "Access & grants"}, {"settings", "SETTINGS", "Settings"}, {"guide", "GUIDE", "Guide"},
 }
 local frames, screenInfo = {}, {}
 clientEnv.screen = "dial"
@@ -368,7 +512,7 @@ function clientEnv.show(name)
     if screenInfo[name] and screenInfo[name].shown then screenInfo[name].shown() end
     loom.invalidate()
 end
-clientEnv.command({"go", "screen"}, "go <dial|gates|chat|networks|settings|guide or 1-6>: show a screen", function(args)
+clientEnv.command({"go", "screen"}, "go <dial|gates|chat|access|settings|guide or 1-6>: show a screen", function(args)
     local want = args[1] and args[1]:lower()
     for i, s in ipairs(SCREENS) do
         if want == s[1] or want == tostring(i) or (want and s[1]:sub(1, #want) == want) then clientEnv.show(s[1]) return end
@@ -376,11 +520,6 @@ clientEnv.command({"go", "screen"}, "go <dial|gates|chat|networks|settings|guide
     return "No screen " .. tostring(args[1]) .. "."
 end)
 
--- The role this device holds in a network it belongs to.
-local networks = dofile(gns.path.gns .. "networks.lua")
-function clientEnv.roleOf(net)
-    return networks.check(net.network, net.revoked, net.membership, vaultState.identity.public) or "revoked"
-end
 -- The gate to dial from: the one chosen, else the nearest open one.
 function clientEnv.fromGate()
     local list = clientEnv.gateconnections
@@ -416,8 +555,7 @@ local function build()
         self:text(x, 1, os.date("%H:%M"), C.dim, C.side)
         local from = clientEnv.fromGate()
         if from then
-            local tag, colour, name = "public", C.dim, from.name
-            if from.net then tag, colour, name = clientEnv.roleOf(from.net), C.amber, from.net.name or from.name end
+            local tag, colour, name = from.tag, from.tag == "public" and C.dim or C.amber, from.name
             x = x - unicode.len(tag) - 4
             self:tag(x, 1, tag, colour, C.side)
             if wide then
@@ -502,8 +640,8 @@ local function build()
         runCommands(line)
     end})
     cmd:backgroundColor(C.side)
-    local hint = wide and "Press ; for commands (help lists them)  ·  arrows, Tab, Enter move and press  ·  1-6 screens"
-        or "; commands · arrows Tab Enter · 1-6 screens"
+    local hint = wide and "Press ; for commands (help lists them)  ·  arrows, Tab, Enter move and press  ·  1-6 screens  ·  L log"
+        or "; commands · Tab Enter · 1-6 screens · L log"
     -- The latest activity shows for 8 seconds, then the key hint.
     local placeholderDraw = cmd.draw
     cmd.draw = function(self)
@@ -563,7 +701,7 @@ local function build()
     return root
 end
 
--- Keys no control used: 1-6 screens, ; the command bar, Q quit.
+-- Keys no control used: 1-6 screens, ; the command bar, L the activity log, Q quit.
 loom.onKey(function(char, code)
     if code == 1 then -- Escape: drop the focus (closes nothing)
         local f = loom.focused()
@@ -574,6 +712,7 @@ loom.onKey(function(char, code)
     if char == 59 then clientEnv.commandBar:focus() return end
     local n = char - 48
     if SCREENS[n] then clientEnv.show(SCREENS[n][1]) return end
+    if char == 108 or char == 76 then clientEnv.showLog() return end
     if char == 113 or char == 81 then gns.clientActive = false loom.stop() end
 end)
 
@@ -598,6 +737,10 @@ end
 
 loom.onKey(nil)
 event.cancel(saveTimer)
+event.cancel(sleepTimer)
+event.ignore("key_down", onKey)
+event.ignore("touch", onTouch)
+event.ignore("modem_message", onAlarm)
 pcall(clientEnv.peer.stop)
 for _, connection in ipairs(clientEnv.gateconnections) do pcall(connection.proxy.close, connection.proxy) end
 local saved, saveError = clientVault:save()

@@ -2,13 +2,15 @@
 --
 -- File layout: "GNSV1" | salt (16 bytes) | iterations (4 bytes, big-endian) | ecc.encrypt(state)
 -- The key comes from PBKDF2 (ecc.keyFromPassword); a wrong password fails the MAC check.
+-- Copies (address book backups) use the same layout with "GNSC1", sealed under the password the
+-- vault had when they were made.
 local ecc = require("ecc")
 local fs = require("filesystem")
 local serialization = require("serialization")
 
 local vault = {}
 vault.ITERATIONS = 10000 -- about 0.5 s on a tier-3 computer
-local MAGIC = "GNSV1"
+local MAGIC, COPY = "GNSV1", "GNSC1"
 
 -- "GNS-1a2b-3c4d-5e6f-7a8b": the first 8 bytes of SHA-256 of a public key.
 function vault.fingerprint(publicKey)
@@ -23,17 +25,58 @@ end
 local Vault = {}
 Vault.__index = Vault
 
--- Writes the vault next to the old one, then replaces it, so a failed write keeps the old file.
-function Vault:save()
-    local data = MAGIC .. self.salt .. string.pack(">I4", self.iterations)
-        .. tostring(ecc.encrypt(serialization.serialize(self.state), self.key))
-    local temp = self.path .. ".new"
+local function seal(self, magic, data)
+    return magic .. self.salt .. string.pack(">I4", self.iterations)
+        .. tostring(ecc.encrypt(serialization.serialize(data), self.key))
+end
+-- The salt, iterations and ciphertext of sealed bytes, or nil if they are not magic's.
+local function split(magic, data)
+    if data:sub(1, #magic) ~= magic or #data < #magic + 20 then return nil end
+    return data:sub(#magic + 1, #magic + 16), string.unpack(">I4", data, #magic + 17), data:sub(#magic + 21)
+end
+local function readAll(path)
+    local file, reason = io.open(path, "rb")
+    if not file then return nil, reason end
+    local data = file:read("*a")
+    file:close()
+    return data
+end
+-- Writes next to the old file, then replaces it, so a failed write keeps the old file.
+local function replace(path, data)
+    local temp = path .. ".new"
     local file, reason = io.open(temp, "wb")
     if not file then return nil, reason end
     file:write(data)
     file:close()
-    if fs.exists(self.path) then fs.remove(self.path) end
-    return fs.rename(temp, self.path)
+    if fs.exists(path) then fs.remove(path) end
+    return fs.rename(temp, path)
+end
+
+function Vault:save()
+    return replace(self.path, seal(self, MAGIC, self.state))
+end
+
+-- Writes data (a table) to path, sealed under the vault's password.
+function Vault:writeCopy(path, data)
+    return replace(path, seal(self, COPY, data))
+end
+-- Reads a copy written by writeCopy. One sealed under an older password returns nil and
+-- "older password" unless that password is given.
+function Vault:readCopy(path, password)
+    local data, reason = readAll(path)
+    if not data then return nil, reason end
+    local salt, iterations, sealed = split(COPY, data)
+    if not salt then return nil, "not a GNS backup" end
+    local key = self.key
+    if salt ~= self.salt or iterations ~= self.iterations then
+        if not password then return nil, "older password" end
+        key = tostring(ecc.keyFromPassword(password, salt, iterations))
+    end
+    local ok, plain = pcall(ecc.decrypt, sealed, key)
+    if not ok then return nil, "wrong password" end
+    local copy = serialization.unserialize(tostring(plain))
+    if type(copy) ~= "table" then return nil, "damaged backup" end
+    return copy
 end
 
 function Vault:changePassword(password)
@@ -72,15 +115,12 @@ end
 
 -- Opens the vault at path. Returns the vault, or nil and "wrong password" / another reason.
 function vault.open(path, password)
-    local file, reason = io.open(path, "rb")
-    if not file then return nil, reason end
-    local data = file:read("*a")
-    file:close()
-    if data:sub(1, #MAGIC) ~= MAGIC or #data < #MAGIC + 20 then return nil, "not a GNS vault" end
-    local salt = data:sub(#MAGIC + 1, #MAGIC + 16)
-    local iterations = string.unpack(">I4", data, #MAGIC + 17)
+    local data, reason = readAll(path)
+    if not data then return nil, reason end
+    local salt, iterations, sealed = split(MAGIC, data)
+    if not salt then return nil, "not a GNS vault" end
     local key = tostring(ecc.keyFromPassword(password, salt, iterations))
-    local ok, plain = pcall(ecc.decrypt, data:sub(#MAGIC + 21), key)
+    local ok, plain = pcall(ecc.decrypt, sealed, key)
     if not ok then return nil, "wrong password" end
     local state = serialization.unserialize(tostring(plain))
     if type(state) ~= "table" or type(state.identity) ~= "table" then return nil, "damaged vault" end

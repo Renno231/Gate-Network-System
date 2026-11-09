@@ -3,12 +3,16 @@
 -- gns passwd          change the client vault's password
 -- gns autorun on|off  start gns when the computer boots (a line in /home/.shrc)
 -- gns update          install the newest GNS from GitHub (needs an internet card)
+-- gns uninstall       remove GNS, keeping the vault, settings and gate state for a reinstall;
+--                     --all deletes those too. The loom and ecc libraries stay.
 -- gns floppy DEST     write GNS and its libraries to DEST/gns.bundle (a floppy, say), for
 --                     computers without an internet card: bundle unpack /mnt/xxx/gns.bundle
 -- gns floppy DEST --os[=GROUP,...] [--skip=PATH,...] [--name=gate-%02d] [--first=N] [--auto=S] [--label=TEXT]
 --                     make an installer floppy with QuickOS and GNS for empty computers (mkinstaller)
 -- --gate              (with floppy) only the gate server: no client, no loom. A gate server's
 --                     own install (install.lua gate) always makes these.
+-- --own               (with floppy) gates installed from it are registered to this device: it
+--                     asks for the vault password and the owner's player name
 -- gns help            this list
 -- --repeating reruns the program after it exits (for development).
 local shell = require("shell")
@@ -19,17 +23,24 @@ local command = args[1]
 
 local gnsPath = "/usr/gns/"
 local serverPath, clientPath = gnsPath .. "server/server.lua", gnsPath .. "client/client.lua"
+-- What GNS writes at run time, under /usr: this computer's keys, gates and state. A floppy
+-- never carries it and gns uninstall keeps it, unless --all.
+local DATA = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}
+local COMMANDS = {client = true, passwd = true, autorun = true, update = true, uninstall = true, floppy = true}
 
-if command == "help" or (command and command ~= "client" and command ~= "passwd" and command ~= "autorun" and command ~= "update" and command ~= "floppy") then
+if command == "help" or (command and not COMMANDS[command]) then
     print("gns                 run the gate server (with a stargate) or the client")
     print("gns client          run the client")
     print("gns passwd          change the client vault's password")
     print("gns autorun on|off  start gns when the computer boots")
     print("gns update          install the newest GNS from GitHub")
+    print("gns uninstall       remove GNS but keep the vault, settings and gate state")
+    print("gns uninstall --all remove those too")
     print("gns floppy DEST     write GNS to DEST/gns.bundle for bundle unpack elsewhere")
     print("gns floppy DEST --os  make an installer floppy with QuickOS and GNS (mkinstaller's")
     print("                    --os, --skip, --name, --first, --auto and --label pass through)")
     print("gns floppy ... --gate  only the gate server: no client or loom")
+    print("gns floppy ... --own   gates installed from it are this device's")
     return
 end
 
@@ -38,7 +49,7 @@ end
 -- packs QuickOS beside it and leaves everything GNS installs (excluded files too) out of the OS.
 if command == "floppy" then
     if not args[2] then
-        io.stderr:write("Usage: gns floppy DEST [--gate] [--os[=GROUP,...]]\n")
+        io.stderr:write("Usage: gns floppy DEST [--gate] [--own] [--os[=GROUP,...]]\n")
         return
     end
     local dest = shell.resolve(args[2])
@@ -53,7 +64,7 @@ if command == "floppy" then
     local parts = dofile(gnsPath .. "parts.lua")
     local gate = options.gate or not fs.exists(clientPath)
     local paths = {{"gns", "usr/gns"}, {"bin/gns.lua", "usr/bin/gns.lua"}, {"lib/ecc", "usr/lib/ecc"}}
-    local exclude = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}
+    local exclude = {table.unpack(DATA)}
     if gate then
         for _, part in ipairs(parts.client) do exclude[#exclude + 1] = part end
     end
@@ -69,6 +80,37 @@ if command == "floppy" then
         end
         leaveOut("")
     end
+    -- --own: the owner's key and player name ride in server/owner.lua, which a gate takes once.
+    -- No wake key: each gate makes its own.
+    local ownerPath = gnsPath .. "server/owner.lua"
+    if options.own then
+        local vaultPath = gnsPath .. "client/vault"
+        local vault = dofile(gnsPath .. "vault.lua")
+        if not vault.exists(vaultPath) then
+            io.stderr:write("--own needs this device's GNS vault: run gns once first.\n")
+            return
+        end
+        local term = require("term")
+        io.write("GNS password: ")
+        local password = (term.read(nil, nil, nil, "*") or ""):gsub("\n$", "")
+        local opened, reason = vault.open(vaultPath, password)
+        if not opened then
+            io.stderr:write(tostring(reason) .. "\n")
+            return
+        end
+        local key = opened:publicKey()
+        opened:lock()
+        io.write("Owner's player name: ")
+        local player = (term.read() or ""):gsub("%s+$", "")
+        if player == "" then
+            io.stderr:write("No player name given.\n")
+            return
+        end
+        local file = assert(io.open(ownerPath, "w"))
+        file:write("return " .. require("serialization").serialize({owner = key, ownerName = player}))
+        file:close()
+        print(("Gates installed from it will belong to %s (%s)."):format(player, vault.fingerprint(key)))
+    end
     local file = assert(io.open(cfgPath, "w"))
     file:write(require("serialization").serialize({name = "gns", hostname = true, paths = paths, exclude = exclude}))
     file:close()
@@ -81,6 +123,7 @@ if command == "floppy" then
         if fs.exists(done) then fs.remove(done) end -- mkinstaller writes it last, so it marks a whole floppy
         shell.execute("mkinstaller", nil, table.unpack(argv))
         fs.remove(cfgPath)
+        if fs.exists(ownerPath) then fs.remove(ownerPath) end
         if not fs.exists(done) then
             io.stderr:write("Could not make the installer floppy at " .. dest .. ".\n")
             return
@@ -90,6 +133,7 @@ if command == "floppy" then
     end
     shell.execute("bundle", nil, "pack", "/usr", "--out=" .. out)
     fs.remove(cfgPath)
+    if fs.exists(ownerPath) then fs.remove(ownerPath) end
     -- bundle says why on the screen and removes a bundle it could not finish.
     if not fs.exists(out) then
         io.stderr:write("Could not write GNS to " .. out .. ".\n")
@@ -117,24 +161,68 @@ if command == "update" then
     return
 end
 
-if command == "autorun" then
-    local rcPath, line = "/home/.shrc", "gns"
+-- Autorun is a gns line in /home/.shrc: the file's other lines, and whether it has that one.
+local rcPath = "/home/.shrc"
+local function readRc()
     local lines, present = {}, false
     local file = io.open(rcPath)
     if file then
         for l in file:lines() do
-            if l == line then present = true else lines[#lines + 1] = l end
+            if l == "gns" then present = true else lines[#lines + 1] = l end
         end
         file:close()
     end
-    if args[2] == "on" then lines[#lines + 1] = line elseif args[2] ~= "off" then
+    return lines, present
+end
+local function writeRc(lines)
+    local file = assert(io.open(rcPath, "w"))
+    file:write(table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
+    file:close()
+end
+
+if command == "autorun" then
+    local lines, present = readRc()
+    if args[2] == "on" then lines[#lines + 1] = "gns" elseif args[2] ~= "off" then
         print("gns autorun is " .. (present and "on" or "off") .. "; use gns autorun on|off")
         return
     end
-    file = assert(io.open(rcPath, "w"))
-    file:write(table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
-    file:close()
+    writeRc(lines)
     print("gns autorun " .. args[2])
+    return
+end
+
+if command == "uninstall" then
+    if options.all then
+        io.write("This also deletes the vault (this computer's identity and address book), settings and gate state.\nType yes to go on: ")
+        if io.read() ~= "yes" then print("Nothing was removed.") return end
+    end
+    local keep = {}
+    if not options.all then
+        for _, path in ipairs(DATA) do keep["/usr/" .. path] = true end
+    end
+    local removed = 0
+    -- Removes path, except what is kept; true when nothing of it is left.
+    local function remove(path)
+        if keep[path] then return false end
+        if not fs.exists(path) then return true end
+        if fs.isDirectory(path) then
+            local gone = true
+            for name in fs.list(path) do
+                gone = remove(fs.concat(path, name)) and gone
+            end
+            if gone then fs.remove(path) end
+            return gone
+        end
+        fs.remove(path)
+        removed = removed + 1
+        return true
+    end
+    remove("/usr/gns")
+    remove("/usr/bin/gns.lua")
+    local lines, present = readRc()
+    if present then writeRc(lines) end
+    print(("Removed %d files of GNS. %sThe loom and ecc libraries stay."):format(removed,
+        options.all and "" or "The vault, settings and gate state stay for a reinstall. "))
     return
 end
 

@@ -1,8 +1,8 @@
--- GNS gate entries: each gate signs its own entry, so a server that relays it cannot change it.
--- An address book maps a gate's public key to its newest valid entry.
+-- GNS gate entries: each gate signs its own entry, so a device that passes it on cannot change
+-- it. A client's address book of signed entries maps a gate's public key to its newest entry.
 --
 -- entry = {key, seq, name, type = "MW" | "PG" | "UN", dim, address = {MW = {...}, PG = {...},
---          UN = {...}}, retired = true | nil, network = nil (public) or a network id, sig}
+--          UN = {...}}, retired = true | nil, sig}
 local ecc = require("ecc")
 
 local entries = {MAX = 1000} -- the most entries one address book keeps
@@ -32,7 +32,6 @@ local function valid(e)
     if type(e.name) ~= "string" or #e.name == 0 or #e.name > 32 then return nil, "bad name" end
     if not TYPES[e.type] then return nil, "bad type" end
     if math.type(e.dim) ~= "integer" or e.dim < -0x80000000 or e.dim > 0x7FFFFFFF then return nil, "bad dim" end
-    if e.network ~= nil and (type(e.network) ~= "string" or #e.network > 32) then return nil, "bad network" end
     local a = e.address
     if type(a) ~= "table" or not (validGlyphs(a.MW) and validGlyphs(a.PG) and validGlyphs(a.UN)) then
         return nil, "bad address"
@@ -43,15 +42,14 @@ end
 -- The exact bytes a gate signs. Every field except sig is covered.
 function entries.signedBytes(e)
     local a = e.address
-    return string.pack(">s1s1I4s1s1i4Bs1", "GNSE1", e.key, e.seq, e.name, e.type, e.dim,
-        e.retired and 1 or 0, e.network or "")
+    return string.pack(">s1s1I4s1s1i4B", "GNSE2", e.key, e.seq, e.name, e.type, e.dim, e.retired and 1 or 0)
         .. glyphs(a.MW or {}) .. glyphs(a.PG or {}) .. glyphs(a.UN or {})
 end
 
 -- Signs fields as the gate with this identity. fields.seq must be higher than any earlier entry.
 function entries.sign(identity, fields)
     local e = {key = identity.public, seq = fields.seq, name = fields.name, type = fields.type,
-        dim = fields.dim, address = fields.address, retired = fields.retired or nil, network = fields.network}
+        dim = fields.dim, address = fields.address, retired = fields.retired or nil}
     assert(valid(e))
     e.sig = tostring(ecc.sign(identity.private, entries.signedBytes(e)))
     return e
@@ -67,13 +65,11 @@ function entries.verify(e)
     return true
 end
 
--- Adds e to book if it is valid and newer than what book holds for that gate. A private entry is
--- only taken by a book in the same network (network = that network's id, nil when public).
+-- Adds e to book if it is valid and newer than what book holds for that gate.
 -- Returns "added" or "updated", or nil and the reason it was refused.
-function entries.merge(book, e, network)
+function entries.merge(book, e)
     local ok, reason = entries.verify(e)
     if not ok then return nil, reason end
-    if e.network and e.network ~= network then return nil, "private entry" end
     local current = book[e.key]
     if current and current.seq >= e.seq then return nil, "not newer" end
     if not current then
@@ -85,12 +81,12 @@ function entries.merge(book, e, network)
     return current and "updated" or "added"
 end
 
--- Merges a list of entries (see merge for network). Returns how many were taken and a list of {entry, reason} refused.
-function entries.mergeAll(book, list, network)
+-- Merges a list of entries. Returns how many were taken and a list of {entry, reason} refused.
+function entries.mergeAll(book, list)
     local taken, refused = 0, {}
     if type(list) ~= "table" then return 0, {{nil, "not a list"}} end
     for i = 1, #list do
-        local result, reason = entries.merge(book, list[i], network)
+        local result, reason = entries.merge(book, list[i])
         if result then taken = taken + 1
         elseif reason ~= "not newer" then refused[#refused + 1] = {list[i], reason} end
     end
