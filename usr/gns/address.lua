@@ -43,11 +43,12 @@ local GlyphsUN = {blacklist = {[37] = true, [17] = true}}
 GlyphsMW.blacklist = {[4] = true}
 GlyphsPG.blacklist = {[18] =true, [14] = true, [29]= true}
 
--- BlockPos.hashCode() * 31 + dimension, in Java int arithmetic: wrapped to a signed 32-bit
--- value, as Java wraps it, or gates far from spawn would get the wrong addresses.
+-- JSG's seed, pos.hashCode() * 31L + dimension: the hash is a Java int, wrapped to a signed
+-- 32-bit value, and the rest is long arithmetic, so gates far from spawn get the right addresses.
 local function calculateSeed(dim, x, y, z)
-	local seed = (((y + z * 31) * 31 + x) * 31 + dim) & 0xFFFFFFFF
-	return seed >= 0x80000000 and seed - 0x100000000 or seed
+	local hash = ((y + z * 31) * 31 + x) & 0xFFFFFFFF
+	if hash >= 0x80000000 then hash = hash - 0x100000000 end
+	return hash * 31 + dim
 end
 
 local function addressFromDimXYZ(dimension, x,y,z)

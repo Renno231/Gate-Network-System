@@ -3,8 +3,10 @@
 -- hop. Every gate checks the signature and the signer's role offline, so no gate on the way needs
 -- the signer's address book or connection.
 --
--- route = {id, key, every, hops = {{address = {MW, PG, UN}, idc, delay}, ...}, grants, sig}
+-- route = {id, key, every, hops = {{address = {MW, PG, UN}, idc, delay, gate}, ...}, grants, sig}
 --   key     the signer's public key; grants: the signer's grants, for the gates of the route
+--   gate    the key of the gate that carries out the hop, when the signer knows it: a relaying
+--           gate hands the route on only to the gate proving that key (its IDCs stay on route)
 --   every   seconds between repeats (a scheduled dial; admins only), or 0
 --   delay   seconds a gate waits before it dials that hop
 local ecc = require("ecc")
@@ -26,12 +28,15 @@ end
 
 local function whole(n, max) return math.type(n) == "integer" and n >= 0 and n <= max end
 
+-- GNSQ1 for a route that names no hop's gate (as older clients sign), GNSQ2 with the keys.
 local function bytes(r)
-    local parts = {string.pack(">s1s1s1I4B", "GNSQ1", r.id, r.key, r.every, #r.hops)}
+    local keyed = false
+    for _, h in ipairs(r.hops) do keyed = keyed or h.gate ~= nil end
+    local parts = {string.pack(">s1s1s1I4B", keyed and "GNSQ2" or "GNSQ1", r.id, r.key, r.every, #r.hops)}
     for _, h in ipairs(r.hops) do
         local a = h.address
         parts[#parts + 1] = glyphs(a.MW or {}) .. glyphs(a.PG or {}) .. glyphs(a.UN or {})
-            .. string.pack(">i4I2", h.idc or -1, h.delay)
+            .. string.pack(">i4I2", h.idc or -1, h.delay) .. (keyed and string.pack(">s1", h.gate or "") or "")
     end
     return table.concat(parts)
 end
@@ -45,7 +50,8 @@ function route.verify(r)
     for _, h in ipairs(r.hops) do
         local a = type(h) == "table" and h.address
         if type(a) ~= "table" or not (validGlyphs(a.MW) and validGlyphs(a.PG) and validGlyphs(a.UN))
-            or not whole(h.delay, 3600) or (h.idc ~= nil and not whole(h.idc, 0x7FFFFFFF)) then
+            or not whole(h.delay, 3600) or (h.idc ~= nil and not whole(h.idc, 0x7FFFFFFF))
+            or (h.gate ~= nil and (type(h.gate) ~= "string" or #h.gate ~= 22)) then
             return nil, "bad route"
         end
     end

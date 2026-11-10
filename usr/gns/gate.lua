@@ -1,10 +1,11 @@
--- GNS gate: a controller for its clients, served over QuickOS api. The gate keeps its settings,
--- its own key pair and signed entry, its owner's key, the grants it has cut off and the OC users
--- of its computer; never other gates' entries (the address book lives on clients). See
--- docs/design/networks.md. Every function except open needs a connection that has passed open
--- (handshake.lua), and a role:
---   user   dial, close their own dial, the iris, status, energy, GDO, signed pass, routes and
---          dial-back
+-- GNS gate: a controller for its clients. Commands come as single modem messages (link.lua), as
+-- in GDS; console, update and gatelog, too big for one message, over QuickOS api. The gate keeps
+-- its settings, its own key pair and signed entry, its owner's key, the grants it has cut off and
+-- the OC users of its computer; never other gates' entries (the address book lives on clients).
+-- See docs/design/networks.md. Every function except open needs a device that has passed open
+-- (handshake.lua: over link the gate keeps what each modem proved), and a role:
+--   user   dial, close their own dial, the iris (on a registered gate, only with ownership or
+--          a grant: not the public's), status, energy, GDO, signed pass, routes and dial-back
 --   admin  also the console, the gate log, cutting off users, scheduled dials and remote updates
 --          (a gate with an internet card also updates itself from GitHub every 2 hours)
 --   owner  also cutting off admins
@@ -14,7 +15,6 @@
 local api = require("api")
 local component = require("component")
 local computer = require("computer")
-local disco = require("disco")
 local ecc = require("ecc")
 local event = require("event")
 local fs = require("filesystem")
@@ -25,6 +25,8 @@ local entries = dofile("/usr/gns/entries.lua")
 local grants = dofile("/usr/gns/grants.lua")
 local route = dofile("/usr/gns/route.lua")
 local dialing = dofile("/usr/gns/dialing.lua")
+local link = dofile("/usr/gns/link.lua")
+local replace = dofile("/usr/gns/vault.lua").replace
 
 local gate = {}
 
@@ -39,10 +41,11 @@ local INSTALLER = "https://raw.githubusercontent.com/Renno231/Gate-Network-Syste
 
 -- The gate's saved state: key pair (made on first run), its signed entry and sequence number,
 -- owner (key and player), wake key, cut-off grant serials (cut, cutSeq), the admins it made OC
--- users ({[name] = serial}), scheduled routes and the last address dialed by hand on the DHD. Gate computers start unattended, so the file
+-- users ({[name] = serial}), scheduled routes, the last address dialed by hand on the DHD
+-- and irisAsleep (the iris was shut for sleep). Gate computers start unattended, so the file
 -- is not password-protected; the computer itself has to be kept out of reach.
 function gate.load(path)
-    local file = io.open(path, "rb")
+    local file = io.open(path, "rb") or io.open(path .. ".new", "rb") -- .new: cut off mid-replace
     local state = file and serialization.unserialize(file:read("*a"))
     if file then file:close() end
     if type(state) ~= "table" or type(state.identity) ~= "table" then
@@ -62,10 +65,11 @@ end
 function gate.save(state)
     local path = state.path
     state.path = nil
-    local file = assert(io.open(path, "wb"))
-    file:write(serialization.serialize(state))
-    file:close()
+    local data = serialization.serialize(state)
     state.path = path
+    -- A short write would cost the gate its key pair and owner on the next start, so a full disk
+    -- keeps the old state (vault.replace) and the save fails.
+    assert(replace(path, data))
 end
 
 -- The gate's own address in every galaxy form JSG gives: {MW = {...}, PG = {...}, UN = {...}}.
@@ -99,7 +103,23 @@ end
 -- the dialer, applyWake() and stop(). node.console(line, out), when set (server.lua), runs a
 -- console command for an admin's console call.
 function gate.start(state, stargate, settings, dhd)
-    local sessions = setmetatable({}, {__mode = "k"}) -- connection → {key, role, name, grant, cutSeq}
+    local sessions = setmetatable({}, {__mode = "k"}) -- tnet connection → {key, role, name, grant, cutSeq}
+    -- Over link: modem address → its session, and → the proofs it last sent and was sent
+    -- (handshake.lua), so opening again costs no signature check. At most MAX_DEVICES each.
+    local devices, proofs, MAX_DEVICES = {}, {}, 128
+    local caller -- {address, modem = {address}} while a link call is served
+    -- Whether t holds MAX_DEVICES entries and not address.
+    local function full(t, address)
+        if t[address] then return false end
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        return n >= MAX_DEVICES
+    end
+    local function sessionOf()
+        if caller then return devices[caller.address] end
+        local conn = api.caller()
+        return sessions[conn] or (conn and devices[conn.address])
+    end
     local identity = state.identity
     local port = settings.port or handshake.PORT
     local modem = component.modem
@@ -107,11 +127,21 @@ function gate.start(state, stargate, settings, dhd)
     local dialer = dialing.new(stargate, dhd, settings)
     local node
     local lastUse, pending, alarm = computer.uptime(), 0, false
+    local publicQueued = 0 -- routes queued by signers with no grant here (a public gate's)
+    -- Every timer of this node goes through timer: once node.stop runs, each one drops the next
+    -- time it fires, so a stopped gate dials, restarts and updates nothing more.
+    local stopped = false
+    local function timer(interval, fn, times)
+        return event.timer(interval, function(...)
+            if stopped then return false end
+            return fn(...)
+        end, times)
+    end
 
     local history, historyDirty = {}, false
     local historyPath = state.path .. ".log"
     do
-        local file = io.open(historyPath, "rb")
+        local file = io.open(historyPath, "rb") or io.open(historyPath .. ".new", "rb") -- .new: cut off mid-replace
         local saved = file and serialization.unserialize(file:read("*a"))
         if file then file:close() end
         if type(saved) == "table" then history = saved end
@@ -124,13 +154,9 @@ function gate.start(state, stargate, settings, dhd)
     local function flushHistory()
         if not historyDirty then return end
         historyDirty = false
-        local file = io.open(historyPath, "wb")
-        if file then
-            file:write(serialization.serialize(history))
-            file:close()
-        end
+        replace(historyPath, serialization.serialize(history)) -- a full disk keeps the old log
     end
-    local historyTimer = event.timer(LOG_FLUSH, flushHistory, math.huge)
+    local historyTimer = timer(LOG_FLUSH, flushHistory, math.huge)
     -- The newest count entries (all when nil), newest first.
     local function newest(count)
         count = math.max(1, math.min(math.tointeger(tonumber(count)) or LOG_KEEP, LOG_KEEP))
@@ -207,11 +233,27 @@ function gate.start(state, stargate, settings, dhd)
         save()
     end
     dialer.adopt()
+    -- Shut for the sleep (below): open again unless a wormhole is coming in, which waits for its IDC.
+    -- While a wormhole forms JSG says only "unstable", not which way it goes, so that waits (at
+    -- most 30 s) until it says; an incoming one keeps the iris shut (dialing.lua admits it).
+    if state.irisAsleep then
+        state.irisAsleep = nil
+        save()
+        local deadline = computer.uptime() + 30
+        local function wake()
+            local gateState, outgoing = stargate.getGateStatus()
+            if gateState == "unstable" then return computer.uptime() < deadline end
+            if gateState ~= "incoming" and not (gateState == "open" and not outgoing) then pcall(dialer.iris, "OPENED") end
+            return false
+        end
+        if wake() then timer(0.25, wake, math.huge) end
+    end
 
     local function status()
         local s = dialer.status()
         s.name, s.registered, s.public, s.alarm = settings.name, state.owner ~= nil, settings.public == true, alarm
         s.handDialed = state.handDialed
+        s.seq = state.entry and state.entry.seq -- clients take a newer signed entry (a rename) when it changes
         return s
     end
 
@@ -221,8 +263,11 @@ function gate.start(state, stargate, settings, dhd)
         if state.owner and key == state.owner then return "owner", state.ownerName end
         local reason = "private gate"
         if state.owner and type(list) == "table" then
+            -- A real list passes at its first good grant (one or two signatures; a cut-off grant
+            -- costs none), so three signature checks a call bound what forged grants cost.
+            local budget = {n = 3}
             for i = 1, math.min(#list, grants.MAX) do
-                local role, why = grants.check(list[i], state.owner, identity.public, key, state.cut)
+                local role, why = grants.check(list[i], state.owner, identity.public, key, state.cut, budget)
                 if role then return role, list[i].name, list[i] end
                 reason = why
             end
@@ -231,21 +276,28 @@ function gate.start(state, stargate, settings, dhd)
         return nil, reason
     end
 
-    -- An admin is made an OC user of the gate computer, so they can use it directly.
+    -- The owner and each admin are OC users of the gate computer, so only they type at it. OC adds
+    -- only a player who is online, so it is tried again each time they open the gate.
+    local function isUser(name)
+        for _, u in ipairs({computer.users()}) do if u == name then return true end end
+        return false
+    end
     local function addAdmin(name, serial)
         if state.admins[name] == serial or name == state.ownerName then return end
         pcall(computer.addUser, name)
+        if not isUser(name) then return end
         state.admins[name] = serial
         save()
     end
 
     -- Wraps fn so it runs only for an opened connection whose role is at least minRole (nil:
     -- any opened connection). A grant cut off after the connection opened ends its role; the
-    -- connection stays, as a guest refused for that reason.
-    local function opened(minRole, fn)
+    -- connection stays, as a guest refused for that reason. Each call counts as use for sleep,
+    -- except a passive one (status, cost): a client in range polls those for every gate it lists.
+    local function opened(minRole, fn, passive)
         return function(...)
-            local conn = api.caller()
-            local session = sessions[conn]
+            if stopped then error("the gate is stopped", 0) end
+            local session = sessionOf()
             if not session then error("call open first", 0) end
             if session.grant and session.cutSeq ~= state.cutSeq then
                 local role, why = grants.check(session.grant, state.owner, identity.public, session.key, state.cut)
@@ -263,25 +315,26 @@ function gate.start(state, stargate, settings, dhd)
                 if not session.role then error(session.refused or "private gate", 0) end
                 if RANK[session.role] < RANK[minRole] then error("needs the " .. minRole .. " role", 0) end
             end
-            lastUse = computer.uptime()
+            if not passive then lastUse = computer.uptime() end
             return fn(session, ...)
         end
     end
 
     ------------------------------------------------------------------------ routes
-    local recent = {} -- route ids taken here (a relaying gate may deliver one twice)
-    local pins = {}
+    local recent = {} -- route id .. hop → when it was taken here (a relaying gate may deliver one twice)
+    local pins, ownProofs = {}, {} -- the gate keys seen, and this gate's proofs, by far gate modem
 
+    -- Free: idle, no dial of GNS's own, and no player dialing at the DHD (dialer.handBusy).
     local function gateFree()
-        local s = stargate.getGateStatus()
-        return s == "idle" and not dialer.status().dialing
+        if stargate.getGateStatus() ~= "idle" then return false end
+        return not dialer.status().dialing and not dialer.handBusy()
     end
 
     -- Waits (on timers) until test() holds or seconds pass; then calls done(held).
     local function waitFor(test, seconds, done)
         local deadline = computer.uptime() + seconds
         local id
-        id = event.timer(0.5, function()
+        id = timer(0.5, function()
             local ok, held = pcall(test)
             held = ok and held
             if held or computer.uptime() >= deadline then
@@ -291,39 +344,50 @@ function gate.start(state, stargate, settings, dhd)
         end, math.huge)
     end
 
-    -- Hands route r, from hop at, to the gate at the far end of this gate's open wormhole: every
-    -- GNS gate disco finds is offered it, and only the one the previous hop named takes it.
+    -- Hands route r, from hop at, to the gate at the far end of this gate's open wormhole. A hop
+    -- that names its gate's key (the client knew it) goes only to the gate proving that key, so no
+    -- other device sees the route and its IDCs; a hop without one is offered to each GNS gate in
+    -- range, and only the gate the previous hop dialed takes it (its queue checks the address).
+    -- Over link.lua: each message is sent again until answered, so the relay's losses across the
+    -- wormhole cost time, not the route. Gates are tried one at a time: a first open's signature
+    -- checks hold this computer for seconds.
     local function relay(r, at)
-        disco.findAsync("gns", 2, function(found)
-            local own, passed = modem.address, false
-            for _, host in ipairs(found) do
-                if host.address ~= own then
-                    api.connectAsync(handshake.ENDPOINT, (host.services or {}).gns or port, host.address, function(proxy)
-                        if not proxy then return end
-                        handshake.openAsync(proxy, identity, pins, nil, function(reply)
-                            if not reply then proxy:close() return end
-                            proxy:async(function(ok, result)
-                                proxy:close()
-                                if ok == true and not passed then
-                                    passed = true
-                                    note("route passed on to " .. tostring(reply.status and reply.status.name or host.name))
-                                end
-                            end).queue(r, at)
-                        end)
-                    end, nil, 3)
+        local want = r.hops[at].gate
+        local found = {}
+        link.hello({[port] = true, [handshake.PORT] = true}, 2, function(address, p, _, hello)
+            if not component.list("modem")[address] then found[#found + 1] = {address = address, port = p, name = hello.name} end
+        end, function()
+            local i = 0
+            local function try()
+                i = i + 1
+                local host = found[i]
+                if not host then
+                    note(("route: no gate past the wormhole took hop %d"):format(at))
+                    return
                 end
+                local proxy = link.proxy(host.address, host.port)
+                handshake.openAsync(proxy, identity, pins, nil, function(reply)
+                    if not reply or (want and reply.key ~= want) then return try() end
+                    proxy:async(function(ok)
+                        if ok ~= true then return try() end
+                        note("route passed on to " .. tostring(reply.status and reply.status.name or host.name))
+                    end).queue(r, at)
+                end, ownProofs)
             end
+            try()
         end)
     end
 
     -- Carries out hop at of route r: after its delay (and once the gate is free), dials it with
     -- its IDC; with hops left, passes the route on once the wormhole is open.
-    local function run(r, at)
+    local function run(r, at, public)
         local hop = r.hops[at]
         pending = pending + 1
-        event.timer(math.max(hop.delay, 0.05), function()
+        if public then publicQueued = publicQueued + 1 end
+        timer(math.max(hop.delay, 0.05), function()
             waitFor(gateFree, ROUTE_WAIT, function(free)
                 pending = pending - 1
+                if public then publicQueued = publicQueued - 1 end
                 if not free then note("route: the gate stayed busy") return end
                 local ok, result = pcall(dialer.dial, hop.address, {fast = true, idc = hop.idc})
                 if not ok then note("route: " .. tostring(result)) return end
@@ -345,11 +409,35 @@ function gate.start(state, stargate, settings, dhd)
     -- Scheduled routes repeat every r.every seconds while the gate is up.
     local nextRun = {}
     for _, s in ipairs(state.schedules) do nextRun[s] = computer.uptime() + s.every end
-    local scheduleTimer = event.timer(1, function()
+    -- A schedule whose signer is no longer an admin here (its grant was cut off) is dropped: by
+    -- the cut, and checked again each time one comes due. due(s): only those due now.
+    local function dropStale(due)
+        local dropped = 0
+        for i = #state.schedules, 1, -1 do
+            local s = state.schedules[i]
+            if not due or due(s) then
+                local role = roleFor(s.route.key, s.route.grants)
+                if not role or RANK[role] < RANK.admin then
+                    table.remove(state.schedules, i)
+                    nextRun[s] = nil
+                    dropped = dropped + 1
+                end
+            end
+        end
+        if dropped > 0 then
+            save()
+            record(("%d scheduled dial%s dropped: the signer is no longer an admin here"):format(dropped, dropped == 1 and "" or "s"))
+        end
+    end
+    local scheduleTimer = timer(1, function()
         local now = computer.uptime()
-        for _, s in ipairs(state.schedules) do
+        local function due(s)
             nextRun[s] = nextRun[s] or now + s.every
-            if now >= nextRun[s] then
+            return now >= nextRun[s]
+        end
+        dropStale(due)
+        for _, s in ipairs(state.schedules) do
+            if due(s) then
                 nextRun[s] = now + s.every
                 run(s.route, 1)
             end
@@ -359,12 +447,16 @@ function gate.start(state, stargate, settings, dhd)
     ------------------------------------------------------------------------ sleeping
     -- A gate with a wake key shuts down after settings.sleep idle minutes; a wake message or the
     -- DHD's redstone starts it again. Scheduled dials keep it up.
-    local sleepTimer = event.timer(10, function()
+    local sleepTimer = timer(10, function()
         local minutes = tonumber(settings.sleep) or 0
         if minutes <= 0 or not state.wake or #state.schedules > 0 or settings.room then return end
-        if pending > 0 or stargate.getGateStatus() ~= "idle" or alarm then lastUse = computer.uptime() return end
+        if pending > 0 or not gateFree() or alarm then lastUse = computer.uptime() return end
         if computer.uptime() - lastUse >= minutes * 60 then
             note("sleeping")
+            -- Asleep the gate cannot check an IDC, so with IDCs set its iris stays shut until it wakes.
+            -- An iris already shut (by hand) stays shut on waking: irisAsleep is only for one shut here.
+            if next(settings.idcs or {}) and select(2, pcall(stargate.getIrisState)) == "OPENED"
+                and pcall(dialer.iris, "CLOSED") then state.irisAsleep = true end
             save()
             flushHistory()
             computer.shutdown()
@@ -386,6 +478,25 @@ function gate.start(state, stargate, settings, dhd)
         return on
     end
 
+    -- A restart for new GNS files waits until the gate is idle: a restart mid-wormhole would shut
+    -- the iris on travellers already let through and drop the dial's timers.
+    -- The push in progress: {session, paths (written as .new), seen, part (the last taken)}.
+    local staged
+    local function dropStaged()
+        if staged then for _, path in ipairs(staged.paths) do fs.remove(path .. ".new") end end
+        staged = nil
+    end
+    local restarting = false
+    local function restartWhenIdle()
+        if restarting then return end
+        restarting = true
+        timer(2, function()
+            if pending > 0 or not gateFree() then return end
+            flushHistory()
+            computer.shutdown(true)
+        end, math.huge)
+    end
+
     -- A gate with an internet card updates itself from GitHub, as GDS gates did: on start and
     -- every SELF_UPDATE seconds it runs GNS's installer (which downloads only what changed and
     -- replaces nothing until all of it has arrived) in a thread of its own, and restarts when
@@ -398,9 +509,19 @@ function gate.start(state, stargate, settings, dhd)
         file:close()
         return text
     end
+    -- Real time in milliseconds: the modification time of a file just written (OC has no clock).
+    local function realNow()
+        local file = io.open("/tmp/gns-now", "w")
+        if not file then return nil end
+        file:write("t")
+        file:close()
+        return fs.lastModified("/tmp/gns-now")
+    end
     local function selfUpdate()
         if updating or not component.isAvailable("internet") then return end
         updating = true
+        state.updateChecked = realNow()
+        pcall(save)
         require("thread").create(function()
             local shell, temp, before = require("shell"), "/tmp/gns-install.lua", installed()
             if fs.exists(temp) then fs.remove(temp) end
@@ -410,37 +531,69 @@ function gate.start(state, stargate, settings, dhd)
                 fs.remove(temp)
             end
             updating = false
-            if installed() == before then return end
+            if stopped or installed() == before then return end
             local restart = autorun()
-            note("updated GNS from GitHub" .. (restart and "" or "; restart gns to run it"))
+            note("updated GNS from GitHub" .. (restart and "; it restarts once idle" or "; restart gns to run it"))
             record("updated GNS from GitHub")
-            if restart then
-                flushHistory()
-                computer.shutdown(true)
-            end
+            if restart then restartWhenIdle() end
         end):detach()
     end
-    local updateTimer = event.timer(SELF_UPDATE, selfUpdate, math.huge)
-    event.timer(5, selfUpdate)
+    local updateTimer = timer(SELF_UPDATE, selfUpdate, math.huge)
+    timer(5, function()
+        local now, last = realNow(), tonumber(state.updateChecked)
+        if now and last and now >= last and now - last < SELF_UPDATE * 1000 then return end
+        selfUpdate()
+    end)
 
     ------------------------------------------------------------------------ the endpoint
+    -- The caller's own dial, still live: GNS dialing it, or its outgoing wormhole open.
+    local timedDial -- the dial whose close timer runs (dial's closeAfter); a later dial replaces it
+    local function ownDial(session)
+        if dialer.by ~= session.key then return false end
+        local s = dialer.status()
+        return s.dialing or (s.state == "open" and s.outgoing == true)
+    end
+
     local lib = {
         open = {function(request)
-            local conn = api.caller()
-            local reply, reason = handshake.accept(identity, conn, request)
-            if not reply then error(reason, 0) end
+            if stopped then error("the gate is stopped", 0) end
+            local conn = caller or api.caller()
+            -- A device opening again with the proof it sent before (link.lua keeps it): the same
+            -- answer, with no signature check or signing.
+            local kept = caller and proofs[conn.address]
+            local reply, reason
+            if kept and type(request) == "table" and kept.key == request.key and kept.nonce == request.nonce
+                and kept.sig == request.sig and kept.modem == conn.modem.address then
+                reply = {key = identity.public, sig = kept.reply}
+            else
+                reply, reason = handshake.accept(identity, conn, request)
+                if not reply then error(reason, 0) end
+                if caller then
+                    if full(proofs, conn.address) then proofs = {} end -- each signs once more
+                    proofs[conn.address] = {key = request.key, nonce = request.nonce, sig = request.sig,
+                        modem = conn.modem.address, reply = reply.sig}
+                end
+            end
             local role, name, g = roleFor(request.key, request.grants)
-            sessions[conn] = {key = request.key, role = role, name = name, grant = g, cutSeq = state.cutSeq,
+            local session = {key = request.key, role = role, name = name, grant = g, cutSeq = state.cutSeq,
                 refused = not role and name or nil}
+            if caller then
+                if full(devices, conn.address) then devices = {} end -- each opens again on "call open first"
+                devices[conn.address] = session
+            else
+                sessions[conn] = session
+            end
             reply.role, reply.owner, reply.registered = role, state.owner, state.owner ~= nil
             if role then
                 reply.status, reply.entry = status(), state.entry
                 if name then reply.wake = state.wake end
                 if role == "admin" then addAdmin(name, g.serial) end
+                if role == "owner" and not isUser(name) then pcall(computer.addUser, name) end
             else
                 reply.refused = name
             end
-            lastUse = computer.uptime()
+            -- A refused device's client opens again at each rescan: only an opened one is use.
+            if role then lastUse = computer.uptime() end
             return reply
         end, "Proves both sides' keys; returns the caller's role (from ownership, a grant or a public gate), the gate's status and entry"},
 
@@ -457,33 +610,65 @@ function gate.start(state, stargate, settings, dhd)
             return true
         end), "Makes the caller the owner of an unregistered gate: player becomes its OC user, wake its wake key"},
 
-        status = {opened("user", function() return status() end), "The gate's name, type, state, iris, energy, TPS and last dial"},
+        status = {opened("user", function() return status() end, true), "The gate's name, type, state, iris, energy, TPS and last dial"},
 
         dial = {opened("user", function(session, address, opts)
             opts = type(opts) == "table" and opts or {}
             -- Dialing over an open outgoing wormhole closes it: the same rule as closeWormhole.
             local gateState, outgoing = stargate.getGateStatus()
+            -- A dial that waited for the gate goes out from idle only, never over a new wormhole.
+            if opts.wait and gateState ~= "idle" then error("already dialing", 0) end
             if gateState == "open" and outgoing and RANK[session.role] < RANK.admin and dialer.by ~= session.key then
                 error("the gate is open to another player's dial: only who dialed, or an admin, can close it", 0)
             end
             local ok, result = pcall(dialer.dial, address, {fast = opts.fast == true, idc = math.tointeger(opts.idc), speed = tonumber(opts.speed)})
             if not ok then
-                -- The client stops its own dial and dials again; another player's it waits out.
-                if result == "already dialing" and dialer.by == session.key then error("your dial is in progress", 0) end
-                record(("%s was refused a dial to %s: %s"):format(who(session), addressText(address), tostring(result)))
+                -- The client stops its own dial and dials again, unless it is to the same gate;
+                -- another player's it waits out.
+                local busy = result == "already dialing" or result == "already dialing it"
+                if busy and ownDial(session) then
+                    error(result == "already dialing it" and "your dial is in progress to it" or "your dial is in progress", 0)
+                end
+                if busy then result = "already dialing" end
+                -- D2: a client waiting for the gate asks again each second; only other refusals are history.
+                if result ~= "already dialing" and result ~= "already open to it" then
+                    record(("%s was refused a dial to %s: %s"):format(who(session), addressText(address), tostring(result)))
+                end
                 error(result, 0)
             end
             dialer.by = session.key
             record(("%s dialed %s"):format(who(session), addressText(address)))
+            -- closeAfter: the wormhole closes that many seconds after it opens, unless closed or
+            -- dialed over meanwhile (GDS's close timer).
+            local after = math.tointeger(tonumber(opts.closeAfter))
+            if after and after > 0 then
+                local mine = {}
+                timedDial = mine
+                waitFor(function()
+                    local s, out = stargate.getGateStatus()
+                    return timedDial ~= mine or (s == "open" and out)
+                end, 120 + (tonumber(opts.speed) or 0) + 10, function(open)
+                    if not open or timedDial ~= mine then return end
+                    timer(after, function()
+                        local s, out = stargate.getGateStatus()
+                        if timedDial ~= mine or s ~= "open" or not out then return end
+                        timedDial = nil
+                        record(("the wormhole closed after %d s, as %s asked"):format(after, who(session)))
+                        pcall(dialer.close)
+                    end)
+                end)
+            else
+                timedDial = nil
+            end
             return result
-        end), "Dials an address {MW = {...}, PG = {...}, UN = {...}}; opts {fast, idc, speed}. Returns the glyph count, cost and duration"},
+        end), "Dials an address {MW = {...}, PG = {...}, UN = {...}}; opts {fast, idc, speed, wait (from idle only), closeAfter (seconds open)}. Returns the glyph count, cost and duration"},
 
         energy = {opened("user", function(_, address)
             return dialer.cost(address)
-        end), "What dialing an address would cost and how long the wormhole could stay open"},
+        end, true), "What dialing an address would cost and how long the wormhole could stay open"},
 
         closeWormhole = {opened("user", function(session)
-            if RANK[session.role] < RANK.admin and dialer.by ~= session.key then
+            if RANK[session.role] < RANK.admin and not ownDial(session) then
                 error("only who dialed, or an admin, can close it", 0)
             end
             record(who(session) .. " closed the wormhole")
@@ -506,6 +691,11 @@ function gate.start(state, stargate, settings, dhd)
             if not session.name then error("passes are for the owner and grant holders", 0) end
             local challenge = session.challenge
             session.challenge = nil
+            -- Over link the device's open already proved its key from its own modem: no signature.
+            if caller and sig == nil then
+                record(session.name .. " sent a pass")
+                return dialer.admit(session.name)
+            end
             if not handshake.checkPass(session.key, challenge, identity.public, sig) then
                 record(session.name .. " sent a bad pass")
                 error("bad pass", 0)
@@ -514,19 +704,18 @@ function gate.start(state, stargate, settings, dhd)
             return dialer.admit(session.name)
         end), "A signed pass for the incoming wormhole: opens the iris for the owner or a grant holder"},
 
-        -- Anyone who may dial here may work the iris, as with GDS's tablets.
+        -- The iris: anyone who may dial an unregistered gate; on a registered one the owner and
+        -- grant holders, not the public a public gate lets dial (they send an IDC instead).
         iris = {opened("user", function(session, want)
-            local typed, kind = pcall(stargate.getIrisType)
-            if typed and kind == "NULL" then error("this gate has no iris", 0) end
-            local now = stargate.getIrisState()
+            if state.owner and not session.name then error("the iris needs a grant here", 0) end
             local target = ({open = "OPENED", close = "CLOSED"})[want]
             if want ~= nil and not target then error("open or close", 0) end
-            target = target or (now == "CLOSED" and "OPENED" or "CLOSED")
-            if now == target then return now end
-            if now ~= "OPENED" and now ~= "CLOSED" then error("the iris is moving: " .. tostring(now), 0) end
-            stargate.toggleIris()
-            record(("%s %s the iris"):format(who(session), target == "OPENED" and "opened" or "closed"))
-            return stargate.getIrisState()
+            local before = stargate.getIrisState()
+            local now = dialer.iris(target)
+            if now ~= before then
+                record(("%s %s the iris"):format(who(session), before == "CLOSED" and "opened" or "closed"))
+            end
+            return now
         end), "Opens or closes the iris: want \"open\" or \"close\", alone the other way (users)"},
 
         queue = {opened(nil, function(_, r, at)
@@ -535,21 +724,27 @@ function gate.start(state, stargate, settings, dhd)
             if not ok then error(why, 0) end
             if at < 1 or at > #r.hops then error("bad route", 0) end
             if at > 1 and not route.names(r.hops[at - 1].address, addressOf(stargate)) then error("not the next gate", 0) end
-            local role = roleFor(r.key, r.grants)
+            if r.hops[at].gate and r.hops[at].gate ~= identity.public then error("not the next gate", 0) end
+            local role, name = roleFor(r.key, r.grants)
             if not role then error("the route's signer has no access here", 0) end
             if recent[r.id .. at] then return "already queued" end
+            -- Anyone may sign a route for a public gate, with up to an hour's delay: the public
+            -- shares 8 places, so it never crowds out the owner's and grant holders' routes.
+            if pending >= 24 or (not name and publicQueued >= 8) then error("too many queued dials", 0) end
+            local now = computer.uptime()
+            for id, at0 in pairs(recent) do if now - at0 > 7200 then recent[id] = nil end end
             if r.every > 0 then
                 if RANK[role] < RANK.admin then error("scheduled dials need the admin role", 0) end
                 if #state.schedules >= 16 then error("too many scheduled dials", 0) end
                 state.schedules[#state.schedules + 1] = {route = r, every = r.every}
-                recent[r.id .. at] = true
+                recent[r.id .. at] = now
                 save()
                 record(("a dial every %d s was scheduled"):format(r.every))
                 return "scheduled"
             end
-            recent[r.id .. at] = true
+            recent[r.id .. at] = now
             record(("a route was queued (hop %d of %d)"):format(at, #r.hops))
-            run(r, at)
+            run(r, at, not name)
             return "queued"
         end), "Takes a signed route: dials its hop after its delay and passes the rest on; every > 0 schedules it (admin)"},
 
@@ -570,6 +765,7 @@ function gate.start(state, stargate, settings, dhd)
             end
             if count > 0 then
                 state.cutSeq = state.cutSeq + 1
+                dropStale()
                 save()
                 record(("%s cut off %d grant%s"):format(who(session), count, count == 1 and "" or "s"))
             end
@@ -585,35 +781,126 @@ function gate.start(state, stargate, settings, dhd)
             return lines
         end), "Runs a gate console command (admin); returns its output lines"},
 
-        update = {opened("admin", function(session, files)
-            if type(files) ~= "table" or #files == 0 or #files > 64 then error("bad file list", 0) end
+        update = {opened("admin", function(session, files, part, parts)
+            -- A push comes in parts (part n of parts; one when absent), each an RPC well inside
+            -- TNET's 10 s: each part is written as .new files, and the last swaps them all in.
+            part, parts = tonumber(part) or 1, tonumber(parts) or 1
+            if part == 1 or (staged and (staged.session ~= session or staged.part ~= part - 1)) then dropStaged() end
+            if part > 1 and not staged then error("the push's earlier parts are missing; push again", 0) end
+            staged = staged or {session = session, paths = {}, seen = {}}
+            staged.part = part
+            local written, seen = staged.paths, staged.seen
+            if type(files) ~= "table" or #files == 0 or #written + #files > 64 then dropStaged() error("bad file list", 0) end
             for _, f in ipairs(files) do
                 if type(f) ~= "table" or not updatable(f[1]) or type(f[2]) ~= "string" then
+                    dropStaged()
                     error("not a GNS file: " .. tostring(type(f) == "table" and f[1]), 0)
                 end
+                if seen[f[1]] then dropStaged() error(f[1] .. " is listed twice", 0) end
+                seen[f[1]] = true
             end
+            local drop = dropStaged
             for _, f in ipairs(files) do
                 local path = "/usr/" .. f[1]
                 fs.makeDirectory(fs.path(path))
-                local file = assert(io.open(path, "wb"))
-                file:write(f[2])
-                file:close()
+                local file = io.open(path .. ".new", "wb")
+                local wrote = file and file:write(f[2])
+                if file then file:close() end
+                written[#written + 1] = path
+                -- OpenOS drops the last flush's error on close: a full disk shows only in the size.
+                if not wrote or fs.size(path .. ".new") ~= #f[2] then
+                    drop()
+                    error("could not write " .. path .. ": the disk is full; nothing was changed", 0)
+                end
             end
-            note(("updated %d files (%s)"):format(#files, tostring(session.name)))
+            if part < parts then return #files end
+            staged = nil
+            local failed = {}
+            for _, path in ipairs(written) do
+                if fs.exists(path) then fs.remove(path) end
+                if not fs.rename(path .. ".new", path) then failed[#failed + 1] = path end
+            end
+            if #failed > 0 then error("could not replace " .. table.concat(failed, ", "), 0) end
+            note(("updated %d files (%s)"):format(#written, tostring(session.name)))
             local restart = autorun()
-            if restart then event.timer(2, function() flushHistory() computer.shutdown(true) end) end
-            return #files, restart
-        end), "Writes new GNS files {{path under /usr, contents}, ...} (admin); restarts the gate when gns autoruns"},
+            if restart then restartWhenIdle() end
+            return #written, restart
+        end), "Writes new GNS files {{path under /usr, contents}, ...} (admin), as part n of parts; restarts the gate once idle when gns autoruns"},
 
         gatelog = {opened("admin", function(_, count) return newest(count) end),
             "The gate log, newest first: {time, text} entries, count at most 500 (admin)"},
     }
     node = {state = state, dialer = dialer, applyWake = applyWake, save = save, status = status, record = record,
         history = newest, endpoint = api.expose(handshake.ENDPOINT, lib, port)}
+
+    ------------------------------------------------------------------------ link
+    -- Calls as single modem messages (link.lua). Each answer is kept link.KEEP seconds, so a call
+    -- heard again is answered again, never run twice. hello needs no open: it says who the gate is.
+    local LINKED = {open = true, register = true, status = true, dial = true, energy = true, closeWormhole = true,
+        sendIdc = true, challenge = true, pass = true, iris = true, queue = true, cut = true}
+    local answered = {} -- modem .. call id → {at, ok, text}
+    -- Devices watching the gate's status: modem → {untilAt, port, via (the card that heard it)}. A call from a device with a role
+    -- watches for 60 s; on each change of state the gate sends its whole status to each watcher.
+    local watchers, WATCH = {}, 60
+    local function onCall(_, to, from, p, _, kind, id, method, payload)
+        if kind ~= link.CALL or p ~= port or stopped or type(id) ~= "string" or #id > 32 then return end
+        if component.type(to) ~= "modem" then return end
+        local now, key = computer.uptime(), from .. id
+        local done = answered[key]
+        if not done then
+            local args, result = link.unpack(payload), nil
+            if method == "hello" then
+                result = table.pack(true, {name = settings.name, key = identity.public})
+            elseif not args then
+                result = table.pack(false, "bad call")
+            elseif not LINKED[method] then
+                result = table.pack(false, "not a call over link: " .. tostring(method))
+            else
+                caller = {address = from, modem = {address = to}}
+                -- api.expose (above) left each lib entry its bare function.
+                result = table.pack(pcall(lib[method], table.unpack(args, 1, args.n)))
+                caller = nil
+            end
+            done = {at = now, ok = result[1], text = link.pack(table.unpack(result, 2, result.n))}
+            for k, d in pairs(answered) do if now - d.at > link.KEEP then answered[k] = nil end end
+            if method ~= "hello" then answered[key] = done end
+            local s = devices[from]
+            if s and s.role then watchers[from] = {untilAt = now + WATCH, port = p, via = to} end
+        end
+        if not pcall(component.invoke, to, "send", from, p, link.REPLY, id, done.ok, done.text) then
+            pcall(component.invoke, to, "send", from, p, link.REPLY, id, false, link.pack("the answer is too big for a modem message"))
+        end
+    end
+    event.listen("modem_message", onCall)
+    -- What a watcher sees change: not energy, TPS or the seconds open, which move all the time.
+    local function shape(s)
+        return table.concat({tostring(s.state), tostring(s.outgoing), tostring(s.iris), tostring(s.irisProblem),
+            tostring(s.dialing), tostring(s.lastDial), #(s.glyphs or {}), tostring(s.name), tostring(s.alarm),
+            tostring(s.seq), tostring(s.handDialed and s.handDialed.time)}, "|")
+    end
+    local shown, pushes = nil, 0
+    local watchTimer = timer(0.5, function()
+        if not next(watchers) then shown = nil return end
+        local s = status()
+        local now, current = computer.uptime(), shape(s)
+        if current == shown then return end
+        shown, pushes = current, pushes + 1
+        local text = link.pack(s)
+        for address, w in pairs(watchers) do
+            if now > w.untilAt then watchers[address] = nil
+            else pcall(component.invoke, w.via, "send", address, w.port, link.STATUS, pushes, text) end
+        end
+    end, math.huge)
     record("gate started")
 
     function node.stop()
+        stopped = true
+        event.ignore("modem_message", onCall)
+        event.cancel(watchTimer)
+        link.stop()
         node.endpoint:shutdown()
+        -- Every connection that opened, even one the endpoint no longer lists.
+        for conn in pairs(sessions) do pcall(conn.close, conn) end
         event.cancel(scheduleTimer)
         event.cancel(sleepTimer)
         event.cancel(historyTimer)

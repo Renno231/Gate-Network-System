@@ -16,14 +16,20 @@ end
 local clientEnv = {onClose = {}}
 
 local event = require"event"
-event.listen("interrupted", function()
+-- One listener across client runs (package.loaded is the OS's, not this run's): the last run's
+-- is replaced.
+local INTERRUPTED = "gns.interrupted"
+if package.loaded[INTERRUPTED] then event.ignore("interrupted", package.loaded[INTERRUPTED]) end
+package.loaded[INTERRUPTED] = function()
     gns.isRepeating = false
     gns.clientActive = false
     if package.loaded.loom then package.loaded.loom.stop() end
     for i,_ in pairs (package.loaded) do if i:match("^loom") then package.loaded[i] = nil end end
     package.loaded.ecc = nil
+    package.loaded[INTERRUPTED] = nil
     return false
-end)
+end
+event.listen("interrupted", package.loaded[INTERRUPTED])
 
 -- Unlock the vault (identity key and address book) before the GUI takes the screen.
 -- The password is typed in the terminal, before the GUI takes the screen.
@@ -91,17 +97,19 @@ local unicode = require("unicode")
 local component = require("component")
 require("ecc") -- loaded once here for the screens' network work (about 105 KB at most)
 clientEnv.ui = ui
-clientEnv.gateconnections = {} -- open gate connections, nearest first once scanned
+clientEnv.gateconnections = {} -- the gates in range this device opened, nearest first
+clientEnv.link = dofile(gns.path.gns .. "link.lua") -- gate commands as single messages
 
 local modem = component.modem
 local readFile = gns.utility.readFile
 local writeFile = gns.utility.writeFile
 
 -- The vault also holds pinned gate keys, the gates' own signed entries (book), the grants this
--- device holds and has issued, and what it knows of the gates it may use (access[gate key] =
+-- device holds and has issued, its proofs, and what it knows of the gates it may use (access[gate key] =
 -- {name, modem, port, wake, owner, role}: how to reach and wake them).
 local vaultState = clientVault.state
 vaultState.pins, vaultState.book = vaultState.pins or {}, vaultState.book or {}
+vaultState.proofs = vaultState.proofs or {} -- this device's gate.open proof per gate modem (handshake.lua)
 vaultState.grants, vaultState.issued, vaultState.access = vaultState.grants or {}, vaultState.issued or {}, vaultState.access or {}
 vaultState.networks = nil -- founder networks are gone: grants replaced them
 local database = vaultState.database
@@ -140,7 +148,9 @@ local function applySettings()
 end
 function clientEnv.saveSettings()
     applySettings()
-    writeFile(settingsPath, "return " .. serialization.serialize(settings, math.huge))
+    local ok, why = writeFile(settingsPath, "return " .. serialization.serialize(settings, math.huge))
+    if not ok and clientEnv.log then clientEnv.log("Settings not saved: " .. tostring(why)) end
+    return ok, why
 end
 readFile(settingsPath, function(saved)
     if type(saved) ~= "table" then return end
@@ -247,6 +257,8 @@ end
 -- screen is showing. Entries: {time, text, who, mine}; notes have no who.
 local peer = dofile(gns.path.gns .. "peer.lua")
 local entries = dofile(gns.path.gns .. "entries.lua")
+-- One copy each of the stateless modules, for the screens too.
+clientEnv.vaultModule, clientEnv.entries = vault, entries
 vaultState.peerPins = vaultState.peerPins or {}
 local chat = {lines = {}, pending = {}, devices = {}, unread = 0} -- pending: shares waiting for an answer
 clientEnv.chat = chat
@@ -268,10 +280,25 @@ function chat.hasIDCs(share)
 end
 -- Adds a share's rows to the address book and keeps the signed gate entries that verify. A gate
 -- already there gains any shared IDCs it lacks. Returns the rows added and the IDCs added.
+local function first6(list) list = list or {} return table.concat(list, ",", 1, math.min(6, #list)) end
 function chat.accept(share)
-    pcall(entries.mergeAll, vaultState.book, share.signed, nil)
+    -- Only the signed entries of the shared rows' gates: the rest would cost a verify each.
+    local wanted, signed = {}, {}
+    for _, row in ipairs(share.rows) do if row.key then wanted[row.key] = true end end
+    for _, e in ipairs(type(share.signed) == "table" and share.signed or {}) do
+        if type(e) == "table" and wanted[e.key] then signed[#signed + 1] = e end
+    end
+    pcall(entries.mergeAll, vaultState.book, signed, nil)
     local added, codes = 0, 0
     for _, row in ipairs(share.rows) do
+        -- The sender names the gate's key; a row is "signed by its gate" only if the gate's own
+        -- signed entry for that key holds the same address in every galaxy the row gives.
+        local entry = row.key and vaultState.book[row.key]
+        local same = entry ~= nil
+        for kind, glyphs in pairs(same and row.Address or {}) do
+            same = same and first6(glyphs) == first6((entry.address or {})[kind])
+        end
+        if not same then row.key = nil end
         local mw, existing = table.concat(row.Address.MW, ","), nil
         for _, known in ipairs(database) do
             if known.Name == row.Name and table.concat((known.Address or {}).MW or {}, ",") == mw then existing = known break end
@@ -284,6 +311,8 @@ function chat.accept(share)
                 if not have then existing.IDCs[#existing.IDCs + 1] = code codes = codes + 1 end
             end
         else
+            local p = clientEnv.profile and clientEnv.profile()
+            row.Profiles = p and {[p.name] = true} or nil
             database[#database + 1] = row
             added, codes = added + 1, codes + #row.IDCs
         end
@@ -302,12 +331,24 @@ clientEnv.peer = peer.start(vaultState.identity, vaultState.peerPins, deviceName
     end,
     share = function(from, rows, signed)
         if settings.chatBlacklist[from.fingerprint] or #rows == 0 then return end
-        local share = {from = from, rows = rows, signed = signed}
+        -- Only well-formed entries, copied: a share is kept until it is answered.
+        -- Only one entry per shared row's gate: the rest would never be used.
+        local kept, wanted = {}, {}
+        for _, row in ipairs(rows) do if row.key then wanted[row.key] = true end end
+        for _, e in ipairs(signed) do
+            e = entries.clean(e)
+            if e and wanted[e.key] then wanted[e.key] = nil kept[#kept + 1] = e end
+        end
+        local share = {from = from, rows = rows, signed = kept}
         if settings.autoAcceptShared then
             chat.show(("%s shared %d gates%s; %d added to the address book."):format(chat.label(from), #rows,
                 chat.hasIDCs(share) and " with IDCs" or "", (chat.accept(share))))
         else
+            -- At most 20 shares and 100 gates wait, the newest kept: memory is small.
             chat.pending[#chat.pending + 1] = share
+            local waiting = 0
+            for _, s in ipairs(chat.pending) do waiting = waiting + #s.rows end
+            while #chat.pending > 20 or waiting > 100 do waiting = waiting - #table.remove(chat.pending, 1).rows end
             if clientEnv.screen ~= "chat" then chat.unread = chat.unread + 1 end
             chat.show(("%s shared %d gates%s. Accept or refuse them under Shared With You."):format(chat.label(from), #rows,
                 chat.hasIDCs(share) and " with their IDCs" or ""))
@@ -338,6 +379,7 @@ local lastInput = computer.uptime()
 local onTablet = component.isAvailable("tablet")
 local sleepTimer = event.timer(15, function()
     local minutes = settings.tabletSleep
+    if clientEnv.inviting and clientEnv.inviting() then lastInput = computer.uptime() end
     if not onTablet or minutes <= 0 or computer.uptime() - lastInput < minutes * 60 then return end
     local saved, err = clientVault:save()
     if not saved then clientEnv.log("Not shutting down: the vault was not saved: " .. tostring(err)) lastInput = computer.uptime() return end
@@ -404,6 +446,22 @@ clientEnv.command({"help", "cmds", "?"}, "help [command]: the commands, or how t
     for _, s in ipairs(commandOrder) do names[#names + 1] = s.names[1] end
     return "Commands: " .. table.concat(names, ", ") .. ". help <command> shows one. Gates are numbers in the address book or names (_ for spaces)."
 end)
+-- Keys that changed since they were pinned: name (lower case) -> {name, pins, address}. A gate
+-- or device that was reinstalled has a new key; trust drops the old pin so the next SCAN or FIND
+-- pins the new one.
+local changedKeys = {}
+function clientEnv.keyChanged(name, pins, address)
+    changedKeys[(tostring(name):gsub("_", " "):lower())] = {name = name, pins = pins, address = address}
+end
+clientEnv.command({"trust"}, "trust <name>: accept the new key of a reinstalled gate or device (SCAN or FIND named it)", function(args)
+    local word = table.concat(args, " "):gsub("_", " "):lower()
+    local k = changedKeys[word]
+    if not k then return "No changed key for " .. (args[1] and word or "that") .. ": SCAN or FIND names the gate or device first." end
+    changedKeys[word] = nil
+    k.pins[k.address] = nil
+    clientEnv.changed()
+    return ("Dropped the old key of %s; the next SCAN or FIND accepts its new one."):format(k.name)
+end)
 clientEnv.command({"clear", "c", "cls"}, "clear: empty the activity log", function()
     for i = #activity, 1, -1 do activity[i] = nil end
 end)
@@ -428,19 +486,24 @@ function clientEnv.ask(message, opts, confirm, deny)
     ui.Paint(frame, 1, 3, w, #lines, function(self)
         for i, line in ipairs(lines) do self:text(3, i, line, C.text, C.card) end
     end)
-    local field, choice
+    local field, choice, done
     local function finish(fn)
+        if done then return end
+        done = true
         local result
         if field then result = field:text() elseif choice then result = opts.options.list[choice] end
         close()
         if fn then
-            local ok, err = pcall(fn, result)
+            local ok, err = pcall(fn, result, choice) -- choice: which option, as labels may repeat
             if not ok then clientEnv.log("Error: " .. tostring(err)) end
         end
     end
     local y = 4 + #lines
     if opts.text then
-        field = ui.Field(frame, 3, y, w - 4, {text = tostring(opts.text), mask = opts.mask, submit = function() finish(confirm) end})
+        field = ui.Field(frame, 3, y, w - 4, {text = tostring(opts.text), mask = opts.mask, submit = function()
+            -- After loom's submit returns: closing destroys the field, which submit still uses.
+            event.timer(0, function() finish(confirm) end)
+        end})
     elseif opts.options then
         choice = opts.options.index or 1
         local n = #opts.options.list
@@ -520,15 +583,19 @@ clientEnv.command({"go", "screen"}, "go <dial|gates|chat|access|settings|guide o
     return "No screen " .. tostring(args[1]) .. "."
 end)
 
--- The gate to dial from: the one chosen, else the nearest open one.
+-- The gate to dial from: the one chosen, else the nearest one that is not the destination (the
+-- nearest of all when the destination is the only gate in range).
 function clientEnv.fromGate()
-    local list = clientEnv.gateconnections
+    local list, dest = clientEnv.gateconnections, clientEnv.dest
     for _, c in ipairs(list) do if c == clientEnv.from then return c end end
-    local best
+    local best, other
     for _, c in ipairs(list) do
-        if not best or (c.distance or math.huge) < (best.distance or math.huge) then best = c end
+        local d = c.distance or math.huge
+        if not best or d < (best.distance or math.huge) then best = c end
+        local isDest = dest and ((dest.key and c.key == dest.key) or c.name == dest.Name)
+        if not isDest and (not other or d < (other.distance or math.huge)) then other = c end
     end
-    return best
+    return other or best
 end
 
 local interfacePath = gns.path.clientDirectory .. "interface/"
@@ -742,7 +809,7 @@ event.ignore("key_down", onKey)
 event.ignore("touch", onTouch)
 event.ignore("modem_message", onAlarm)
 pcall(clientEnv.peer.stop)
-for _, connection in ipairs(clientEnv.gateconnections) do pcall(connection.proxy.close, connection.proxy) end
+clientEnv.link.stop()
 local saved, saveError = clientVault:save()
 clientVault:lock()
 component.gpu.freeAllBuffers()

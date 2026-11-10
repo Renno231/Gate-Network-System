@@ -19,39 +19,52 @@ end
 
 local function isKey(k) return type(k) == "string" and #k == 22 end
 
-local function signedBy(key, data, sig)
+-- budget, when given: {n = signature checks left}; none left counts as a bad signature.
+local function signedBy(key, data, sig, budget)
     if not isKey(key) or type(sig) ~= "string" then return false end
+    if budget then
+        if budget.n <= 0 then return false end
+        budget.n = budget.n - 1
+    end
     local ok, good = pcall(ecc.verify, key, data, sig)
     return ok and good == true
 end
 
 -- The grant's own fields and signature. Returns true, or nil and the reason.
-function grants.valid(g)
+function grants.valid(g, budget)
     if type(g) ~= "table" or not isKey(g.owner) or not isKey(g.holder) or not isKey(g.signer)
         or not (g.gate == "" or isKey(g.gate)) or (g.role ~= "user" and g.role ~= "admin")
         or type(g.name) ~= "string" or #g.name == 0 or #g.name > 32
         or type(g.serial) ~= "string" or #g.serial ~= 8 then
         return nil, "bad grant"
     end
-    if not signedBy(g.signer, bytes(g), g.sig) then return nil, "bad grant signature" end
+    if not signedBy(g.signer, bytes(g), g.sig, budget) then return nil, "bad grant signature" end
     return true
 end
 
 -- The role grant g gives key at the gate gateKey of owner, or nil and the reason. cut holds the
--- serials that gate has cut off.
-function grants.check(g, owner, gateKey, key, cut)
+-- serials that gate has cut off. Every check that needs no signature comes first; budget (see
+-- signedBy) bounds the signatures.
+function grants.check(g, owner, gateKey, key, cut, budget)
     if type(g) ~= "table" then return nil, "no grant" end
     if g.owner ~= owner then return nil, "grant from another owner" end
     if g.holder ~= key then return nil, "grant belongs to another key" end
     if g.gate ~= "" and g.gate ~= gateKey then return nil, "grant for another gate" end
-    local ok, why = grants.valid(g)
-    if not ok then return nil, why end
     if cut[g.serial] then return nil, "grant cut off" end
+    local by = g.by
     if g.signer ~= owner then
         if g.role ~= "user" then return nil, "only the owner grants admin" end
-        local by = g.by
-        if type(by) ~= "table" or by.holder ~= g.signer then return nil, "grant not signed by an admin" end
-        local role, reason = grants.check(by, owner, gateKey, g.signer, cut)
+        -- Only the owner grants admin, so the signer's own grant is the owner's: one level, which
+        -- bounds the signatures a chain of grants can make the gate check.
+        if type(by) ~= "table" or by.holder ~= g.signer or by.role ~= "admin" or by.signer ~= owner then
+            return nil, "grant not signed by an admin"
+        end
+        if cut[by.serial] then return nil, "admin's grant cut off" end
+    end
+    local ok, why = grants.valid(g, budget)
+    if not ok then return nil, why end
+    if g.signer ~= owner then
+        local role, reason = grants.check(by, owner, gateKey, g.signer, cut, budget)
         if role ~= "admin" then return nil, reason == "grant cut off" and "admin's grant cut off" or "grant not signed by an admin" end
     end
     return g.role

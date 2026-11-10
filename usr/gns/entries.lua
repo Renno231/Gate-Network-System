@@ -39,6 +39,20 @@ local function valid(e)
     return true
 end
 
+-- A copy of e with only an entry's fields, or nil when e is not a well-formed entry: what a
+-- device keeps of entries another sent it, before it verifies them.
+function entries.clean(e)
+    if type(e) ~= "table" or type(e.sig) ~= "string" or #e.sig > 256 or type(e.address) ~= "table" then return nil end
+    local address = {}
+    for _, kind in ipairs({"MW", "PG", "UN"}) do
+        local list = e.address[kind]
+        address[kind] = type(list) == "table" and {table.unpack(list, 1, math.min(#list, 10))} or list
+    end
+    local copy = {key = e.key, seq = e.seq, name = e.name, type = e.type, dim = e.dim,
+        retired = e.retired and true or nil, address = address, sig = e.sig}
+    return valid(copy) and copy or nil
+end
+
 -- The exact bytes a gate signs. Every field except sig is covered.
 function entries.signedBytes(e)
     local a = e.address

@@ -16,15 +16,21 @@ local invite = {ENDPOINT = "gns-invite", PORT = 161, MAX_PENDING = 16}
 -- with gates = {[gate key] = {name, modem, port, wake}}: what the holder needs to reach and
 -- wake the gates the grant covers.
 function invite.host(onRequest)
-    local requests, count = {}, 0
+    local requests = {}
     local lib = {
         request = function(key, name)
             local address = api.caller().address
             if type(key) ~= "string" or #key ~= 22 then error("bad key", 0) end
             if type(name) ~= "string" or #name == 0 or #name > 32 then error("bad name", 0) end
-            if not requests[address] then
-                if count >= invite.MAX_PENDING then error("too many requests", 0) end
-                count = count + 1
+            local before = requests[address]
+            -- Asked again while still waiting: the same request, not a second dialog. A grant
+            -- answered after the device stopped polling is collected by its next JOIN, not issued twice.
+            if before and before.state == "pending" and before.key == key then return "pending" end
+            if before and before.state == "accepted" and not before.delivered and before.key == key then return "pending" end
+            if not (before and before.state == "pending") then
+                local pending = 0
+                for _, r in pairs(requests) do if r.state == "pending" then pending = pending + 1 end end
+                if pending >= invite.MAX_PENDING then error("too many requests", 0) end
             end
             local request = {address = address, key = key, name = name, state = "pending"}
             requests[address] = request
@@ -34,6 +40,7 @@ function invite.host(onRequest)
         result = function()
             local request = requests[api.caller().address]
             if not request then error("no request", 0) end
+            if request.state ~= "pending" then request.delivered = true end
             return request.state, request.offer
         end,
     }
@@ -58,7 +65,8 @@ local function accepted(identity, state, offer)
     if not grants.valid(g) or g.holder ~= identity.public then return nil, "not a grant for this device" end
     if g.signer ~= g.owner then
         local by = g.by
-        if g.role ~= "user" or not grants.valid(by) or by.holder ~= g.signer or by.role ~= "admin" or by.owner ~= g.owner then
+        if g.role ~= "user" or not grants.valid(by) or by.holder ~= g.signer or by.role ~= "admin" or by.owner ~= g.owner
+            or by.signer ~= g.owner then
             return nil, "grant not signed by the owner or an admin"
         end
     end
@@ -66,31 +74,47 @@ local function accepted(identity, state, offer)
     return offer, g.role
 end
 
--- Player side, without waiting: asks the first invitation found nearby and gives the issuer up
--- to timeout seconds. Calls callback(offer, role), or callback(nil, why).
-function invite.join(identity, name, timeout, callback)
+-- Player side, without waiting: asks the nearest invitation (the next when one refuses the
+-- request) and gives the issuer up to timeout seconds. Calls callback(offer, role), or
+-- callback(nil, why). alive(), when given, false stops asking (the client closed).
+function invite.join(identity, name, timeout, callback, alive)
     disco.findAsync(invite.ENDPOINT, 2, function(hosts)
         if #hosts == 0 then return callback(nil, "no invitation nearby") end
-        api.connectAsync(invite.ENDPOINT, invite.PORT, hosts[1].address, function(proxy, err)
-            if not proxy then return callback(nil, err) end
-            local deadline = computer.uptime() + (timeout or 120)
-            local function poll()
-                proxy:async(function(got, state, offer)
-                    if got == true and state ~= "pending" or computer.uptime() >= deadline then
+        table.sort(hosts, function(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end)
+        local at = 0
+        local ask
+        local function refused(why)
+            if at < #hosts then return ask() end
+            callback(nil, tostring(why))
+        end
+        ask = function()
+            at = at + 1
+            api.connectAsync(invite.ENDPOINT, invite.PORT, hosts[at].address, function(proxy, err)
+                if not proxy then return refused(err) end
+                local deadline = computer.uptime() + (timeout or 120)
+                local function poll()
+                    if alive and not alive() then proxy:close() return end
+                    proxy:async(function(got, state, offer)
+                        if got == true and state ~= "pending" or computer.uptime() >= deadline then
+                            proxy:close()
+                            local kept, role = accepted(identity, got == true and state or "pending", offer)
+                            -- Refused or no good grant here: the next invitation may be the right one.
+                            if not kept and at < #hosts and not (alive and not alive()) then return ask() end
+                            return callback(kept, role)
+                        end
+                        event.timer(1, poll)
+                    end).result()
+                end
+                proxy:async(function(sent, reason)
+                    if sent ~= true then
                         proxy:close()
-                        return callback(accepted(identity, got == true and state or "pending", offer))
+                        return refused(reason)
                     end
                     event.timer(1, poll)
-                end).result()
-            end
-            proxy:async(function(sent, reason)
-                if sent ~= true then
-                    proxy:close()
-                    return callback(nil, tostring(reason))
-                end
-                event.timer(1, poll)
-            end).request(identity.public, name)
-        end, nil, 3)
+                end).request(identity.public, name)
+            end, nil, 3)
+        end
+        ask()
     end)
 end
 

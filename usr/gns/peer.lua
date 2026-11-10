@@ -43,8 +43,9 @@ function peer.cleanRow(row)
         if dim and x and y and z then location.x, location.y, location.z = x, y, z end
     end
     local kind = (row.Type == "PG" or row.Type == "UN") and row.Type or "MW"
-    return {Name = text(row.Name, 32), Type = kind, Address = address, IDCs = idcs, key = text(row.key, 512),
-        Location = location}
+    -- A gate key is 22 characters (entries.lua): anything else is not one.
+    local key = type(row.key) == "string" and #row.key == 22 and row.key or nil
+    return {Name = text(row.Name, 32), Type = kind, Address = address, IDCs = idcs, key = key, Location = location}
 end
 
 -- Starts the service. identity = {private, public}; pins maps a peer modem to the device key seen
@@ -109,8 +110,8 @@ function peer.start(identity, pins, name, on)
         if device then pcall(device.proxy.close, device.proxy) end
     end
 
-    -- Finds GNS devices on disco and opens them. callback(devices, failures): devices are
-    -- {address, fingerprint, name}; failures are {name, reason}.
+    -- Finds GNS devices on disco and opens each with a fresh handshake. callback(devices,
+    -- failures): devices are {address, fingerprint, name}; failures are {name, address, reason}.
     function node.find(callback)
         disco.findAsync(peer.ENDPOINT, 2, function(found)
             local devices, failures, waiting = {}, {}, 1
@@ -121,12 +122,13 @@ function peer.start(identity, pins, name, on)
             for _, host in ipairs(found) do
                 if host.address ~= own then
                     waiting = waiting + 1
+                    drop(host.address)
                     connect(host.address, function(device, reason)
                         if device then
                             device.name = host.name
                             devices[#devices + 1] = device
                         else
-                            failures[#failures + 1] = {name = host.name, reason = tostring(reason)}
+                            failures[#failures + 1] = {name = host.name, address = host.address, reason = tostring(reason)}
                         end
                         done()
                     end)
@@ -138,6 +140,11 @@ function peer.start(identity, pins, name, on)
 
     -- Calls fn on the device's proxy; a device that stopped answering is dropped.
     local function call(device, fn, callback, ...)
+        if not device.proxy.connected then
+            drop(device.address)
+            if callback then callback(false, "no longer connected: FIND again") end
+            return
+        end
         open[device.address] = open[device.address] or device
         device.proxy:async(function(ok, result)
             if ok ~= true then drop(device.address) end
@@ -145,6 +152,7 @@ function peer.start(identity, pins, name, on)
         end)[fn](...)
     end
 
+    node.MAX_TEXT = peer.MAX_TEXT
     function node.chat(device, line, callback) call(device, "chat", callback, line, name) end
     function node.share(device, rows, signed, callback) call(device, "share", callback, rows, signed, name) end
 

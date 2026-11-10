@@ -33,7 +33,15 @@ local function find()
             for _, d in ipairs(devices) do if d.fingerprint == chat.to.fingerprint then chat.to, still = d, true end end
             if not still then chat.to = nil end
         end
-        for _, f in ipairs(failures) do chat.show(("%s: %s"):format(f.name, f.reason)) end
+        for _, f in ipairs(failures) do
+            if f.reason == "device key changed" then
+                clientEnv.keyChanged(f.name, vaultState.peerPins, f.address)
+                chat.show(("%s: device key changed. If it was reinstalled, trust %s accepts its new key."):format(f.name, f.name))
+            else
+                chat.show(("%s: %s"):format(f.name, f.reason))
+            end
+        end
+        clientEnv.changed()
         show(("Found %d devices."):format(#devices))
     end)
 end
@@ -63,6 +71,7 @@ end
 -- Sends a line to the chosen device, or to every device found.
 local function say(line)
     if not line:match("%S") then return end
+    line = line:sub(1, node.MAX_TEXT)
     local to = chat.to and {chat.to} or chat.devices
     if #to == 0 then return "No devices to send to: FIND looks for them." end
     chat.say("you" .. (chat.to and (" → " .. chat.to.name) or ""), line, true)
@@ -103,8 +112,11 @@ end
 
 ---------------------------------------------------------------------------- share dialog
 -- Choose the device, the gates and whether their IDCs go too. selected: rows chosen already.
+-- Where addresses are hidden (a kiosk), nothing is shared, as the GATES screen's SHARE.
+local HIDDEN = "Addresses and IDCs are hidden on this device (Settings)."
 function clientEnv.openShare(selected)
     if ui.modalOpen() then return end
+    if not settings.showCodes then log(HIDDEN) return end
     if #chat.devices == 0 then
         log("No devices to share with yet: looking for them now; share again when they are found.")
         find()
@@ -265,6 +277,7 @@ clientEnv.command({"say"}, "say <text>: chat with the chosen device, or every de
     return say(line:match("^%s*%S+%s*(.*)$") or "")
 end)
 clientEnv.command({"share"}, "share <gate> [gate ...] [idc] [@device]: share gates; idc sends their IDCs too", function(args)
+    if not settings.showCodes then return HIDDEN end
     local rows, withIDCs, device = {}, false, chat.to or (#chat.devices == 1 and chat.devices[1]) or nil
     for _, a in ipairs(args) do
         if a:lower() == "idc" or a:lower() == "idcs" then withIDCs = true

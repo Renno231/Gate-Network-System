@@ -6,7 +6,7 @@ local gns, clientEnv, _, frame, R = ...
 local ui = clientEnv.ui
 local C = ui.C
 local computer = require("computer")
-local vaultModule = dofile(gns.path.gns .. "vault.lua")
+local vaultModule = clientEnv.vaultModule
 local settings = clientEnv.settings
 local log = clientEnv.log
 local wide = R.wide
@@ -53,11 +53,17 @@ local function blocked()
     table.sort(list)
     return list
 end
--- A new gate port: the client hears that port's off-world alarms and opens its gates.
+-- A new gate port: the client hears that port's off-world alarms and opens its gates. The old
+-- port closes, so its network's alarms stop, unless a profile, invitations (invite.PORT, 161),
+-- chat (peer.PORT, 162) or disco still use it.
 local function setPort(port)
+    local old, modem = settings.port, require("component").modem
     settings.port = port
     save()
-    pcall(require("component").modem.open, settings.port)
+    if old ~= port and not clientEnv.ports()[old] and old ~= 161 and old ~= 162 and old ~= require("disco").port then
+        pcall(modem.close, old)
+    end
+    pcall(modem.open, settings.port)
 end
 
 ---------------------------------------------------------------------------- the screen
@@ -127,7 +133,8 @@ end)
 -- Dated copies of the address book in backups/, sealed under the vault password like the vault
 -- itself. Only the newest KEEP are kept, so they never fill the disk. A copy is named
 -- book-<yyyymmdd>-<hhmmss>-<nn>-<gates> (nn tells apart copies made in the same second), so
--- listing them reads no file.
+-- listing them reads no file. That date is the world's, which /time set moves back: the copies are
+-- ordered by when the disk wrote them.
 local fs = require("filesystem")
 local BACKUPS, KEEP = gns.path.clientDirectory .. "backups/", 10
 local copies -- the list, newest first; read again after a backup
@@ -137,11 +144,11 @@ local function backups()
     for name in (fs.exists(BACKUPS) and fs.list(BACKUPS) or function() end) do
         local d, t, n = name:match("^book%-(%d%d%d%d%d%d%d%d)%-(%d%d%d%d%d%d)%-%d%d%-(%d+)$")
         if d then
-            copies[#copies + 1] = {name = name, gates = tonumber(n),
+            copies[#copies + 1] = {name = name, gates = tonumber(n), at = fs.lastModified(BACKUPS .. name),
                 when = ("%s-%s-%s %s:%s"):format(d:sub(1, 4), d:sub(5, 6), d:sub(7, 8), t:sub(1, 2), t:sub(3, 4))}
         end
     end
-    table.sort(copies, function(a, b) return a.name > b.name end)
+    table.sort(copies, function(a, b) if a.at ~= b.at then return a.at > b.at end return a.name > b.name end)
     return copies
 end
 local function backup()
@@ -393,7 +400,14 @@ clientEnv.command({"get", "g"}, "get range|speed|sleep|scan|port|layout|energy|m
     elseif what == "port" then return tostring(settings.port)
     elseif what == "fingerprint" then return clientEnv.vault:fingerprint()
     elseif what == "memory" then
-        return ("%d KiB free of %d KiB"):format(computer.freeMemory() // 1024, computer.totalMemory() // 1024)
+        -- OC collects the garbage before every 10th resume, so one reading has up to nine
+        -- resumes' garbage in it: the best of a reading a tick for 2 s is what is free after one.
+        local best, n = 0, 0
+        require("event").timer(0.05, function()
+            n, best = n + 1, math.max(best, computer.freeMemory())
+            if n == 40 then log(("  %d KiB free of %d KiB"):format(best // 1024, computer.totalMemory() // 1024)) end
+        end, 40)
+        return "Measuring free memory (2 s)..."
     elseif what == "energy" then
         local c = clientEnv.fromGate()
         local s = c and c.status
@@ -408,7 +422,7 @@ clientEnv.command({"get", "g"}, "get range|speed|sleep|scan|port|layout|energy|m
         return ("%d %s [%s] %s · IDCs %s · %s"):format(i, r.Name, tostring(r.Type), clientEnv.place(r) or "location unknown",
             #(r.IDCs or {}) > 0 and table.concat(r.IDCs, ", ") or "none", #a > 0 and table.concat(a, ", ") or "no address")
     end
-    return "Usage: get range|scan|layout|energy|memory|fingerprint|entries|entry <gate>"
+    return "Usage: get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>"
 end)
 
 return {first = first}

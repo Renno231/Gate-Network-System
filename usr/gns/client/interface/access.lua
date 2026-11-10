@@ -16,7 +16,7 @@ local loom = require("loom")
 local event = require("event")
 local grants = dofile(gns.path.gns .. "grants.lua")
 local invite = dofile(gns.path.gns .. "invite.lua")
-local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
+local fingerprint = clientEnv.vaultModule.fingerprint
 
 local vaultState = clientEnv.vault.state
 local identity = vaultState.identity
@@ -81,10 +81,11 @@ local function setUp()
 end
 
 -- An invitation stays open until STOP; each request is answered in dialogs (the role, then the
--- gates), or refused with CANCEL. A timer offers the next queued request whenever no dialog is
--- open.
-local host, as, queue, timer = nil, nil, {}, nil
+-- gates), or refused with CANCEL. A timer offers the next queued request once the last one is
+-- answered and no dialog is open: between a request's two dialogs none is.
+local host, as, queue, timer, answering = nil, nil, {}, nil, nil
 local function accept(as, request, role, scope)
+    answering = nil
     local gateKey = scope ~= "all" and scope or ""
     local g = grants.issue(identity, as.owner, gateKey, request.key, request.name, role, as.by)
     local gates = {}
@@ -99,14 +100,17 @@ local function accept(as, request, role, scope)
     save()
     log(("Granted %s the %s role at %s."):format(request.name, role, scopeOf(g)))
 end
+local function invitation() return host end
 local function nextRequest()
     local request = queue[1]
-    if not host or not request or ui.modalOpen() then return end
+    if not host or not request or answering or ui.modalOpen() then return end
     table.remove(queue, 1)
+    answering = request
     local as, host = as, host -- this invitation, even if it stops before the answer
     local who = short(request.key)
     log(("%s (%s) asks for access."):format(request.name, who))
     local function deny()
+        answering = nil
         host.deny(request)
         log("Refused " .. request.name .. ".")
     end
@@ -119,23 +123,36 @@ local function nextRequest()
                 names[#names + 1], keys[#keys + 1] = gateName(key), key
             end
             event.timer(0, guard(function()
-                clientEnv.ask("Which gates?", {options = {list = names, index = 1}, title = "ACCESS REQUEST"}, guard(function(name)
-                    for i, n in ipairs(names) do if n == name then return accept(as, request, role, keys[i]) end end
+                local open = clientEnv.ask("Which gates?", {options = {list = names, index = 1}, title = "ACCESS REQUEST"}, guard(function(_, i)
+                    if keys[i] then return accept(as, request, role, keys[i]) end
+                    deny()
                 end), deny)
+                -- Another dialog opened first: offer this request again once it closes.
+                if open == false then
+                    answering = nil
+                    if invitation() == host then table.insert(queue, 1, request) end
+                end
             end))
         end), deny)
 end
 local function stopInvite()
     if timer then event.cancel(timer) end
     if host then host.stop() end
-    host, as, queue, timer = nil, nil, {}, nil
+    host, as, queue, timer, answering = nil, nil, {}, nil, nil
 end
 clientEnv.onClose[#clientEnv.onClose + 1] = stopInvite
+-- A tablet stays on while it invites: players may still be on their way to JOIN.
+function clientEnv.inviting() return host ~= nil end
 local function startInvite(issuer)
     queue, as = {}, issuer
     local this
     this = invite.host(function(request)
         request.host = this
+        -- A device asking again (with another key) replaces its waiting request: invite.lua caps
+        -- distinct devices, so the queue stays as short.
+        for i, waiting in ipairs(queue) do
+            if waiting.address == request.address then table.remove(queue, i) break end
+        end
         queue[#queue + 1] = request
         loom.invalidate()
     end)
@@ -154,8 +171,8 @@ local function toggleInvite()
     if #list == 1 then return startInvite(list[1]) end
     local labels = {}
     for i, x in ipairs(list) do labels[i] = x.label end
-    clientEnv.ask("Invite as", {options = {list = labels, index = 1}, title = "INVITE"}, guard(function(label)
-        for _, x in ipairs(list) do if x.label == label then return startInvite(x) end end
+    clientEnv.ask("Invite as", {options = {list = labels, index = 1}, title = "INVITE"}, guard(function(_, i)
+        if list[i] then return startInvite(list[i]) end
     end))
 end
 
@@ -168,8 +185,11 @@ local function keep(offer, role)
     end
     if not have then vaultState.grants[#vaultState.grants + 1] = g end
     for key, info in pairs(offer.gates) do
-        if type(key) == "string" and #key == 22 and type(info) == "table" then
-            local a = vaultState.access[key] or {}
+        -- Only gates the grant covers, and never one this device already reaches under another
+        -- owner: an invitation cannot repoint them.
+        local a = type(key) == "string" and vaultState.access[key] or {}
+        if type(key) == "string" and #key == 22 and type(info) == "table" and (g.gate == "" or g.gate == key)
+            and (a.owner == nil or a.owner == g.owner) then
             a.name, a.modem, a.owner, a.role = tostring(info.name or a.name), info.modem or a.modem, g.owner, role
             a.port = math.tointeger(info.port) or a.port
             a.wake = type(info.wake) == "string" and info.wake or a.wake
@@ -178,7 +198,8 @@ local function keep(offer, role)
     end
     save()
 end
-local joining = false
+local joining, closed = false, false
+clientEnv.onClose[#clientEnv.onClose + 1] = function() closed = true end
 local function join()
     if joining then log("Still waiting for an answer.") return end
     local function ask(name)
@@ -191,7 +212,7 @@ local function join()
             keep(offer, role)
             log(("Granted the %s role at %s, signed by %s."):format(role, scopeOf(offer.grant), short(offer.grant.signer)))
             clientEnv.reconnect()
-        end))
+        end), function() return not closed end)
     end
     if clientEnv.player then return ask(clientEnv.player) end
     clientEnv.ask("Your player name", {text = "", title = "JOIN"}, guard(ask))

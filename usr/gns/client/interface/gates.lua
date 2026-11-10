@@ -8,7 +8,7 @@ local gns, clientEnv, _, frame, R = ...
 local ui = clientEnv.ui
 local C = ui.C
 local unicode = require("unicode")
-local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
+local fingerprint = clientEnv.vaultModule.fingerprint
 local generator = dofile(gns.path.gns .. "address.lua")
 
 local database = clientEnv.database
@@ -129,8 +129,10 @@ end
 local function selectRow(r)
     search = ""
     if clientEnv.gatesSearch then clientEnv.gatesSearch:text("") end
-    local i = indexOf(r)
-    if i then list:setCursor(i) end
+    -- The list shows only the profile's rows: the cursor is r's place among them.
+    for at, item in ipairs(items()) do
+        if item.r == r then list:setCursor(at) return end
+    end
 end
 clientEnv.selectGate = selectRow
 
@@ -174,10 +176,14 @@ local function deleteGate()
     end)
 end
 local function shift(step)
-    local r = current()
-    local i = r and indexOf(r)
-    if not i or not database[i + step] then return end
-    database[i], database[i + step] = database[i + step], database[i]
+    -- Swaps with the next row shown (another profile's rows stay where they are).
+    local r, shown = current(), items()
+    local at
+    for n, item in ipairs(shown) do if item.r == r then at = n end end
+    local other = at and shown[at + step]
+    if not other then return end
+    local i, j = shown[at].i, other.i
+    database[i], database[j] = database[j], database[i]
     changed()
     selectRow(r)
 end
@@ -448,6 +454,7 @@ end)
 clientEnv.command({"add", "address"}, "add <gate> <MW|PG|UN> <glyph> ...: set an address (glyph names with _ for spaces, or their first letters); a new name adds the gate", function(args)
     local galaxy = galaxyNamed(args[2])
     if not args[1] or not galaxy then return "Usage: add <gate> <MW|PG|UN> <glyph> <glyph> ..." end
+    if not shown() then return HIDDEN end
     local r = clientEnv.findEntry(args[1])
     local made = false
     if not r then
@@ -472,6 +479,7 @@ clientEnv.command({"add", "address"}, "add <gate> <MW|PG|UN> <glyph> ...: set an
 end)
 clientEnv.command({"idc"}, "idc <gate> <code>[,<code>...] | none: the IDCs sent when it is dialed (the first one); idc <gate> mine <code>|none, idc <gate> for <player> <code>|none: a player's own", function(args)
     if not args[2] then return "Usage: idc <gate> <codes> | none" end
+    if not shown() then return HIDDEN end
     local word = args[2]:lower()
     if word == "mine" then return setPlayerIDC(entry(args[1]), clientEnv.player, args[3]) end
     if word == "for" and args[3] then return setPlayerIDC(entry(args[1]), args[3], args[4]) end
@@ -537,6 +545,12 @@ clientEnv.command({"loc", "location"}, "loc <gate> <dim> [x y z]: where the gate
 end)
 clientEnv.command({"gen", "generate"}, "gen <gate> [dim x y z]: work out its addresses from its location", function(args)
     local r = entry(args[1])
+    -- As GENERATE: where addresses are hidden, only an empty address is filled.
+    if not shown() then
+        for _, g in ipairs(GALAXIES) do
+            if #((r.Address or {})[g] or {}) > 0 then return HIDDEN end
+        end
+    end
     if #args > 1 then
         local l = parseLocation(table.concat(args, " ", 2))
         if not l or not l.x then return "Usage: gen <gate> [dim x y z]" end

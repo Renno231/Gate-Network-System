@@ -10,6 +10,7 @@ local computer = require("computer")
 local disco = require("disco")
 local serialization = require("serialization")
 local term = require("term")
+local unicode = require("unicode")
 local gate = dofile(gns.path.gns .. "gate.lua")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
@@ -28,11 +29,15 @@ if type(settings) ~= "table" then
     settings = {name = file and file:read("*l") or "Gate", dim = 0}
     if file then file:close() end
 end
+-- A signed entry's name has 1 to 32 bytes: a longer hostname is cut at a whole character.
+if type(settings.name) ~= "string" or #settings.name == 0 then settings.name = "Gate" end
+while #settings.name > 32 do settings.name = unicode.sub(settings.name, 1, -2) end
 settings.idcs = type(settings.idcs) == "table" and settings.idcs or {}
 if settings.kawoosh == nil then settings.kawoosh = true end
 if settings.sleep == nil then settings.sleep = 5 end
+-- Returns true, or nil and why (a full disk keeps the old file).
 local function saveSettings()
-    gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
+    return gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
 end
 
 -- owner.lua, from a floppy made with gns floppy --own: {owner, ownerName}. An unregistered gate
@@ -83,21 +88,27 @@ commands.room = function(argument)
 end
 for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
 
-if settings.room then room.run(node, settings) end
-while true do
-    io.write("gate> ")
-    local line = io.read()
-    if not line or line == "quit" then break end
-    local name, argument = line:match("^%s*(%S+)%s*(.-)%s*$")
-    local command = name and commands[name]
-    if command then
-        local ok, err = pcall(command, argument)
-        if not ok then print("Error: " .. tostring(err)) end
-    else
-        run(line, print)
+local function console()
+    if settings.room then room.run(node, settings) end
+    while true do
+        io.write("gate> ")
+        local line = io.read()
+        if not line or line == "quit" then return end
+        local name, argument = line:match("^%s*(%S+)%s*(.-)%s*$")
+        local command = name and commands[name]
+        if command then
+            local ok, err = pcall(command, argument)
+            if not ok then print("Error: " .. tostring(err)) end
+        else
+            run(line, print)
+        end
     end
 end
 
+-- Ctrl+Alt+C raises "interrupted" in here: the gate stops the same way as on quit, or its
+-- timers and endpoint would go on serving behind the shell.
+local ok, err = pcall(console)
 disco.withdraw("gns")
 node.stop()
 print("GNS gate stopped.")
+if not ok and err ~= "interrupted" then error(err, 0) end

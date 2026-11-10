@@ -411,7 +411,8 @@ ui.List = List
 
 ---------------------------------------------------------------------------- the stargate
 -- Pixels are half-block cells, two per character, so the rings are round. The geometry is
--- worked out once per size; a picture is worked out once per state and replayed after.
+-- worked out once per size; a picture is worked out once per state and replayed after. Both are
+-- strings (a byte per pixel; packed runs): as tables they took over 400 KB of a client's 2 MB.
 local GLYPH_BITS = {}
 do
     local seed = 20231
@@ -420,6 +421,9 @@ do
         GLYPH_BITS[s] = ((seed >> 9) & (seed >> 17) & 0x1FF) | 0x10
     end
 end
+local SHADES = {0x3C3C3C, 0x4B4B4B, 0x5A5A5A, 0x696969}
+local SHADE_OF = {}
+for i, v in ipairs(SHADES) do SHADE_OF[v] = i end
 local geometries = {}
 local function geometry(Rh)
     if geometries[Rh] then return geometries[Rh] end
@@ -428,16 +432,17 @@ local function geometry(Rh)
     local w = 2 * R + 3
     local h = w + (w % 2)
     local cx, cy, TWO_PI = (w + 1) / 2, (h + 1) / 2, 2 * math.pi
-    local G = {Rh = Rh, k = k, w = w, h = h, kind = {}, val = {}, hd = {}, ha = {}}
+    -- A pixel's byte: 0 the background, 1-4 a ring shade (SHADES), 5 the inside, 6-44 glyph
+    -- s + 6, 46-54 chevron p's housing (p + 45), 56-64 its light (p + 55).
+    local G, rows, cells = {Rh = Rh, k = k, w = w, h = h}, {}, {}
     for y = 1, h do
         for x = 1, w do
-            local i = (y - 1) * w + x
             local dx, dy = x - cx, y - cy
             local d = math.sqrt(dx * dx + dy * dy)
             local a = math.atan(dy, dx)
             local kind, v = 0, false
             if d <= Rh then
-                kind, G.hd[i], G.ha[i] = 1, d, a
+                kind = 1
             elseif d <= Rh + 1.5 * k then
                 v = 0x3C3C3C
             elseif d <= Rh + 6 * k then
@@ -465,9 +470,11 @@ local function geometry(Rh)
                     end
                 end
             end
-            G.kind[i], G.val[i] = kind, v
+            cells[x] = kind == 0 and (SHADE_OF[v] or 0) or kind == 1 and 5 or kind == 2 and v + 6 or kind == 3 and v + 45 or v + 55
         end
+        rows[y] = string.char(table.unpack(cells, 1, w))
     end
+    G.px = table.concat(rows)
     geometries[Rh] = G
     return G
 end
@@ -493,43 +500,38 @@ function ui.litChevrons(engaged, total)
     return lit
 end
 
-local function paint(G, state, lit, theme, bg)
+-- Each pixel byte's colour in this state.
+local function colours(state, lit, theme, bg)
     theme = THEMES[theme] or THEMES.MW
-    local ring = theme.ring
-    local px, kind, val, hd, ha, Rh, k = {}, G.kind, G.val, G.hd, G.ha, G.Rh, G.k
-    for i = 1, G.w * G.h do
-        local kd, v = kind[i], val[i]
-        if kd == 0 then
-            px[i] = v and (ring[v] or v) or bg
-        elseif kd == 1 then
-            px[i] = bg -- the inside: the horizon and iris Shader draws over it
-        elseif kd == 2 then
-            px[i] = (state == "dial" and v == 0) and theme.light[2] or theme.glyph
-        elseif kd == 3 then
-            px[i] = theme.housing[lit[v] and 2 or 1]
-        else
-            px[i] = theme.light[lit[v] and 2 or 1]
-        end
+    local c = {[0] = bg, [5] = bg} -- the inside: the horizon and iris Shader draws over it
+    for i, v in ipairs(SHADES) do c[i] = theme.ring[v] or v end
+    for s = 0, 38 do c[s + 6] = (state == "dial" and s == 0) and theme.light[2] or theme.glyph end
+    for p = 1, 9 do
+        c[p + 45] = theme.housing[lit[p] and 2 or 1]
+        c[p + 55] = theme.light[lit[p] and 2 or 1]
     end
-    return px
+    return c
 end
 
--- Runs of equal cells as {fg, bg, column, row, length, ...}, grouped by colour.
-local function runs(G, px)
-    local list, w = {}, G.w
+-- The picture: runs of equal cells (fg, bg, column, row, length) grouped by colour, packed.
+local RUN = "<I3I3BBB"
+local function picture(G, state, lit, theme, bg)
+    local c, px, w, list, keys = colours(state, lit, theme, bg), G.px, G.w, {}, {}
     for r = 1, G.h // 2 do
         local top, bottom = (2 * r - 2) * w, (2 * r - 1) * w
         local x = 1
         while x <= w do
-            local t, b = px[top + x], px[bottom + x]
+            local t, b = c[px:byte(top + x)], c[px:byte(bottom + x)]
             local n = 1
-            while x + n <= w and px[top + x + n] == t and px[bottom + x + n] == b do n = n + 1 end
-            list[#list + 1] = {t, b, x, r, n}
+            while x + n <= w and c[px:byte(top + x + n)] == t and c[px:byte(bottom + x + n)] == b do n = n + 1 end
+            list[#list + 1] = string.pack(RUN, t, b, x, r, n)
+            keys[#list] = b << 37 | t << 13 | #list -- by background, then foreground (under 8192 runs)
             x = x + n
         end
     end
-    table.sort(list, function(a, b) if a[2] ~= b[2] then return a[2] < b[2] end return a[1] < b[1] end)
-    return list
+    table.sort(keys)
+    for i, k in ipairs(keys) do keys[i] = list[k & 0x1FFF] end
+    return table.concat(keys)
 end
 
 -- The inside of the ring: a loom Shader over the still ring picture, drawing the event horizon
@@ -717,18 +719,21 @@ function Gate:draw()
     for p = 1, 9 do key[#key + 1] = lit[p] and "1" or "0" end
     key = table.concat(key, ":")
     if key ~= self._picture then
-        self._runs = runs(self._G, paint(self._G, state, lit, theme, self._bg))
+        self._runs = picture(self._G, state, lit, theme, self._bg)
         self._picture = key
     end
     local x0, y0 = self:absX() - 1, self:absY() - 1
     local fg, bg
-    for _, run in ipairs(self._runs) do
-        if run[2] ~= bg then bg = run[2] gpu.setBackground(bg) end
-        if run[1] == run[2] then
-            gpu.fill(x0 + run[3], y0 + run[4], run[5], 1, " ")
+    local runs, at = self._runs, 1
+    while at <= #runs do
+        local t, b, x, y, n
+        t, b, x, y, n, at = string.unpack(RUN, runs, at)
+        if b ~= bg then bg = b gpu.setBackground(bg) end
+        if t == b then
+            gpu.fill(x0 + x, y0 + y, n, 1, " ")
         else
-            if run[1] ~= fg then fg = run[1] gpu.setForeground(fg) end
-            gpu.fill(x0 + run[3], y0 + run[4], run[5], 1, "▀")
+            if t ~= fg then fg = t gpu.setForeground(fg) end
+            gpu.fill(x0 + x, y0 + y, n, 1, "▀")
         end
     end
     return true

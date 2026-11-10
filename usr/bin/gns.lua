@@ -23,9 +23,11 @@ local command = args[1]
 
 local gnsPath = "/usr/gns/"
 local serverPath, clientPath = gnsPath .. "server/server.lua", gnsPath .. "client/client.lua"
--- What GNS writes at run time, under /usr: this computer's keys, gates and state. A floppy
+-- What GNS writes at run time, under /usr: this computer's keys, gates, address book backups,
+-- state and history. A floppy
 -- never carries it and gns uninstall keeps it, unless --all.
-local DATA = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/server/settings.lua", "gns/server/state"}
+local DATA = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/client/backups",
+    "gns/server/settings.lua", "gns/server/state", "gns/server/state.log"}
 local COMMANDS = {client = true, passwd = true, autorun = true, update = true, uninstall = true, floppy = true}
 
 if command == "help" or (command and not COMMANDS[command]) then
@@ -41,6 +43,7 @@ if command == "help" or (command and not COMMANDS[command]) then
     print("                    --os, --skip, --name, --first, --auto and --label pass through)")
     print("gns floppy ... --gate  only the gate server: no client or loom")
     print("gns floppy ... --own   gates installed from it are this device's")
+    print("gns help            this list")
     return
 end
 
@@ -111,8 +114,13 @@ if command == "floppy" then
         file:close()
         print(("Gates installed from it will belong to %s (%s)."):format(player, vault.fingerprint(key)))
     end
+    -- An installer floppy also turns gns autorun on at the computer's first boot (usr/gns/autorun-rc.lua).
+    local enable
+    if options.os then
+        paths[#paths + 1], enable = {"gns/autorun-rc.lua", "etc/rc.d/gns-autorun.lua"}, {"gns-autorun"}
+    end
     local file = assert(io.open(cfgPath, "w"))
-    file:write(require("serialization").serialize({name = "gns", hostname = true, paths = paths, exclude = exclude}))
+    file:write(require("serialization").serialize({name = "gns", hostname = true, paths = paths, exclude = exclude, enable = enable}))
     file:close()
     if options.os then
         local argv, done = {dest, "/usr"}, fs.concat(dest, "install.cfg")
@@ -155,8 +163,16 @@ if command == "update" then
         io.stderr:write("Could not download the GNS installer.\n")
         return
     end
-    shell.execute(installer .. (fs.exists(clientPath) and "" or " gate")) -- a gate server's install stays one
+    -- Run here, not through the shell, so a failed install (install.lua says why, then exits 1)
+    -- is not followed by the restart hint.
+    local run, reason = loadfile(installer)
+    local ok, why = false, reason
+    if run then ok, why = pcall(run, not fs.exists(clientPath) and "gate" or nil) end -- a gate server's install stays one
     fs.remove(installer)
+    if not ok then
+        if type(why) ~= "table" then io.stderr:write(tostring(why) .. "\n") end
+        return
+    end
     print("Restart gns to run the new version.")
     return
 end
@@ -265,21 +281,20 @@ local function strsplit(inputstr, sep)
 end
 local function readFile(path, onReadCallback)
     local file = io.open(path, "r")
-    if file == nil then return end
-    file:close()
+    if file == nil then
+        -- Cut off mid-replace: the new file was whole (vault.replace checks its size).
+        if not fs.exists(path .. ".new") then return end
+        fs.rename(path .. ".new", path)
+    else
+        file:close()
+    end
     local fileContents = {dofile(path)}
     return onReadCallback and onReadCallback(table.unpack(fileContents)) or table.unpack(fileContents)
 end
+-- Settings hold a gate's IDCs and name: a full disk keeps the old file (vault.replace) rather
+-- than leave a short one. Returns true, or nil and why.
 local function writeFile(path, contents)
-    local file = io.open(path, "w")
-    if contents then
-        if type(contents) == "function" then
-            contents(file)
-        else
-            file:write(contents)
-        end
-    end
-    file:close()
+    return dofile(gnsPath .. "vault.lua").replace(path, contents or "")
 end
 
 local environment = {

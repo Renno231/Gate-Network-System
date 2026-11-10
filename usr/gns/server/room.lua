@@ -93,8 +93,10 @@ function room.run(node, settings)
     local function frame()
         local s = node.status()
         local engaged = s.state == "open" and 0 or #(s.glyphs or {})
+        -- One beep per chevron: JSG hides the glyphs while the wormhole forms and shows them again
+        -- once it is stable, so the count only starts over once the gate is idle and clear.
         if engaged > before then computer.beep(500 + engaged * 60, 0.1) end
-        before = engaged
+        if engaged > before or (s.state == "idle" and engaged == 0) then before = engaged end
         flash = not flash
         local key = table.concat({s.state, engaged, tostring(s.iris), tostring(s.alarm and flash), tostring(s.open), #node.dialer.travellers})
         if key ~= last then
@@ -104,11 +106,12 @@ function room.run(node, settings)
     end
     frame()
     local timer = event.timer(0.25, function() pcall(frame) end, math.huge)
-    event.pull("key_down")
+    local ok, err = pcall(event.pull, "key_down") -- Ctrl+Alt+C: the room stops drawing too
     event.cancel(timer)
     gpu.setBackground(BLACK)
     gpu.setForeground(0xFFFFFF)
     term.clear()
+    if not ok then error(err, 0) end
 end
 
 return room

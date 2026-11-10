@@ -11,8 +11,13 @@ local console = {}
 -- node: from gate.start; settings and save(): the gate's settings and how to keep them; dhd:
 -- the DHD or nil; stargate: the gate. Returns run(line, out): runs one command line, writing
 -- each line of its output with out(text).
-function console.new(node, settings, save, dhd, stargate)
+function console.new(node, settings, saveSettings, dhd, stargate)
     local state = node.state
+    local unsaved -- why the last settings save in this command failed
+    local function save()
+        local ok, why = saveSettings()
+        if not ok then unsaved = why or "the disk is full" end
+    end
     local function ownerLine()
         if not state.owner then return "Not registered: the first client to set it up becomes its owner." end
         return ("Owner %s (%s), %s"):format(tostring(state.ownerName), fingerprint(state.owner),
@@ -32,7 +37,7 @@ function console.new(node, settings, save, dhd, stargate)
         {"idc", "list the IDCs that open the iris for incoming travellers"},
         {"idc add <code> <name>", "let an IDC open the iris; idc remove <code>"},
         {"kawoosh on|off", "close the iris while the wormhole forms"},
-        {"public on|off", "let anyone dial (a registered gate is private otherwise)"},
+        {"public on|off", "let anyone dial; the iris stays the owner's and grant holders' (a registered gate is private otherwise)"},
         {"port <number>", "the modem port of this gate's network (restart gns after)"},
         {"sleep <minutes>|off", "shut down when idle; the wake key or the DHD wakes it"},
         {"wake new", "a new wake key: grant holders get it when they next open the gate"},
@@ -48,6 +53,7 @@ function console.new(node, settings, save, dhd, stargate)
     function commands.status(_, out)
         local s = node.dialer.status()
         out(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
+        if s.irisProblem then out(s.irisProblem) end
         out(("Server %.1f TPS, DHD %s, kawoosh avoidance %s"):format(s.tps, dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
         out(ownerLine())
         out(("Port %d, wake key %s, sleep %s"):format(settings.port or 160, state.wake and "set" or "none",
@@ -63,6 +69,8 @@ function console.new(node, settings, save, dhd, stargate)
     end
     function commands.name(name, out)
         if name == "" then out("Name: " .. settings.name) return end
+        -- The signed entry holds 1 to 32 bytes; a longer name saved would stop gns at every start.
+        if #name > 32 then out("A gate name is at most 32 bytes.") return end
         settings.name = name
         save()
         node.publish()
@@ -71,7 +79,7 @@ function console.new(node, settings, save, dhd, stargate)
     function commands.dim(argument, out)
         local dim = math.tointeger(tonumber(argument))
         if argument == "" then out("Dimension " .. tostring(settings.dim)) return end
-        if not dim then out("Usage: dim <number>") return end
+        if not dim or dim < -0x80000000 or dim > 0x7FFFFFFF then out("Usage: dim <number>") return end
         settings.dim = dim
         save()
         node.publish()
@@ -106,16 +114,13 @@ function console.new(node, settings, save, dhd, stargate)
         out(count .. " IDCs")
     end
     function commands.iris(argument, out)
-        local typed, kind = pcall(stargate.getIrisType)
-        if typed and kind == "NULL" then out("This gate has no iris.") return end
-        local now = stargate.getIrisState()
         local want = ({open = "OPENED", close = "CLOSED"})[argument]
-        if argument == "" then want = now == "CLOSED" and "OPENED" or "CLOSED" end
-        if not want then out("Usage: iris [open|close] (now " .. tostring(now) .. ")") return end
-        if now == want then out("Iris " .. now) return end
-        if now ~= "OPENED" and now ~= "CLOSED" then out("The iris is moving: " .. tostring(now)) return end
-        stargate.toggleIris()
-        out("Iris " .. tostring(stargate.getIrisState()))
+        if argument ~= "" and not want then
+            out("Usage: iris [open|close] (now " .. tostring(stargate.getIrisState()) .. ")")
+            return
+        end
+        local ok, now = pcall(node.dialer.iris, want)
+        out(ok and ("Iris " .. tostring(now)) or tostring(now))
     end
     function commands.kawoosh(argument, out)
         local on = onOff(argument)
@@ -161,7 +166,8 @@ function console.new(node, settings, save, dhd, stargate)
     end
     function commands.alarm(argument, out)
         if argument == "off" then settings.alarm = nil
-        elseif argument == "all" or math.tointeger(sides[argument]) or math.tointeger(tonumber(argument)) then
+        elseif argument == "all" or math.tointeger(sides[argument])
+            or (math.tointeger(tonumber(argument)) and tonumber(argument) >= 0 and tonumber(argument) <= 5) then
             settings.alarm = math.tointeger(tonumber(argument)) or argument
         else
             out("Usage: alarm bottom|top|back|front|right|left|0-5|all|off (now " .. tostring(settings.alarm or "off") .. ")")
@@ -203,8 +209,10 @@ function console.new(node, settings, save, dhd, stargate)
             out("Unknown command " .. name .. "; type help.")
             return
         end
+        unsaved = nil
         local ok, err = pcall(command, argument, out)
         if not ok then out("Error: " .. tostring(err)) end
+        if unsaved then out("Not saved: " .. tostring(unsaved) .. "; the change is lost on restart.") end
     end
 end
 

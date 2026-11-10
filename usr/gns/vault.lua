@@ -19,7 +19,7 @@ function vault.fingerprint(publicKey)
 end
 
 function vault.exists(path)
-    return fs.exists(path)
+    return fs.exists(path) or fs.exists(path .. ".new")
 end
 
 local Vault = {}
@@ -42,22 +42,34 @@ local function readAll(path)
     return data
 end
 -- Writes next to the old file, then replaces it, so a failed write keeps the old file.
+-- Returns true, or nil and why. The gate's state is saved the same way (gate.save).
 local function replace(path, data)
     local temp = path .. ".new"
+    -- Cut off mid-replace last time: the new file was whole (its size checked), so it goes in place.
+    if not fs.exists(path) and fs.exists(temp) then fs.rename(temp, path) end
     local file, reason = io.open(temp, "wb")
     if not file then return nil, reason end
-    file:write(data)
+    local wrote, why = file:write(data)
     file:close()
+    -- OpenOS drops the last flush's error on close: a full disk shows only in the size.
+    if not wrote or fs.size(temp) ~= #data then
+        fs.remove(temp)
+        return nil, "could not write " .. path .. ": " .. tostring(why or "the disk is full")
+    end
     if fs.exists(path) then fs.remove(path) end
     return fs.rename(temp, path)
 end
 
+-- A locked vault (the client quit) is never written: a callback answering late would seal
+-- nothing over it.
 function Vault:save()
+    if not self.key or not self.state then return nil, "the vault is locked" end
     return replace(self.path, seal(self, MAGIC, self.state))
 end
 
 -- Writes data (a table) to path, sealed under the vault's password.
 function Vault:writeCopy(path, data)
+    if not self.key then return nil, "the vault is locked" end
     return replace(path, seal(self, COPY, data))
 end
 -- Reads a copy written by writeCopy. One sealed under an older password returns nil and
@@ -80,9 +92,12 @@ function Vault:readCopy(path, password)
 end
 
 function Vault:changePassword(password)
+    local old = {self.key, self.salt, self.iterations}
     local key, salt = ecc.keyFromPassword(password, nil, vault.ITERATIONS)
     self.key, self.salt, self.iterations = tostring(key), salt, vault.ITERATIONS
-    return self:save()
+    local ok, why = self:save()
+    if not ok then self.key, self.salt, self.iterations = old[1], old[2], old[3] end
+    return ok, why
 end
 
 function Vault:publicKey()
@@ -115,6 +130,7 @@ end
 
 -- Opens the vault at path. Returns the vault, or nil and "wrong password" / another reason.
 function vault.open(path, password)
+    if not fs.exists(path) and fs.exists(path .. ".new") then fs.rename(path .. ".new", path) end
     local data, reason = readAll(path)
     if not data then return nil, reason end
     local salt, iterations, sealed = split(MAGIC, data)
@@ -127,4 +143,5 @@ function vault.open(path, password)
     return setmetatable({path = path, salt = salt, iterations = iterations, key = key, state = state}, Vault)
 end
 
+vault.replace = replace
 return vault

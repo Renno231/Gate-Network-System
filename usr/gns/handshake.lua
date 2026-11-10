@@ -38,19 +38,31 @@ end
 -- grants). The signed gate.open request, and the function that checks the gate's answer
 -- (ok, reply): it returns the reply and whether this was the first contact, or nil, the reason
 -- and (when the key changed) the new key. Saving pins is the caller's job.
-local function request(proxy, identity, pins, extra)
+local function request(proxy, identity, pins, extra, proofs)
     local conn = proxy:getConnection()
     local clientModem, gateModem = conn.modem.address, conn.address
-    local nonce = tostring(ecc.random.random()):sub(1, 16)
-    local req = {key = identity.public, nonce = nonce,
-        sig = tostring(ecc.sign(identity.private, message("client", nonce, clientModem, gateModem)))}
+    -- proofs (opens over link.lua): the proof made for this gate before is sent again. It holds
+    -- only from this modem to that gate (OC sets the sender address), so a new nonce adds nothing
+    -- and this device signs once per gate, not at every open.
+    local kept = proofs and proofs[gateModem]
+    if not (type(kept) == "table" and kept.key == identity.public and kept.modem == clientModem) then
+        local nonce = tostring(ecc.random.random()):sub(1, 16)
+        kept = {key = identity.public, modem = clientModem, nonce = nonce,
+            sig = tostring(ecc.sign(identity.private, message("client", nonce, clientModem, gateModem)))}
+        if proofs then proofs[gateModem] = kept end
+    end
+    local req = {key = kept.key, nonce = kept.nonce, sig = kept.sig}
     for k, v in pairs(extra or {}) do req[k] = v end
     return req, function(ok, reply)
         if ok ~= true then return nil, tostring(reply) end
-        if type(reply) ~= "table" or not verify(reply.key, message("gate", nonce, clientModem, gateModem), reply.sig) then
+        if type(reply) ~= "table" then return nil, "gate proof rejected" end
+        local pinned = pins[gateModem]
+        -- Over link.lua the answer came from the gate's own modem: once that modem proved this key,
+        -- the same key from it needs no new check.
+        local known = proofs ~= nil and pinned ~= nil and pinned == reply.key
+        if not known and not verify(reply.key, message("gate", kept.nonce, clientModem, gateModem), reply.sig) then
             return nil, "gate proof rejected"
         end
-        local pinned = pins[gateModem]
         if pinned and pinned ~= reply.key then return nil, "gate key changed", reply.key end
         pins[gateModem] = reply.key
         return reply, pinned == nil
@@ -62,9 +74,10 @@ function handshake.open(proxy, identity, pins, extra)
     return check(proxy.open(req))
 end
 
--- handshake.open without waiting: callback gets what handshake.open would return.
-function handshake.openAsync(proxy, identity, pins, extra, callback)
-    local req, check = request(proxy, identity, pins, extra)
+-- handshake.open without waiting: callback gets what handshake.open would return. proofs: a
+-- table of this device's proofs by gate modem, kept between opens (link.lua opens).
+function handshake.openAsync(proxy, identity, pins, extra, callback, proofs)
+    local req, check = request(proxy, identity, pins, extra, proofs)
     proxy:async(function(...) callback(check(...)) end).open(req)
 end
 
