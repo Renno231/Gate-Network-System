@@ -30,6 +30,24 @@ local function newId()
     return ("%s%x"):format(computer.address():sub(1, 4), nextId)
 end
 
+-- Sends from card (an address) as the card would, checking for a local peer first: OC never
+-- hands a card a message sent to its own address, so one to this card, on a port open on it,
+-- is pushed as the modem_message signal the card would raise (as tnet does). So a gate and a
+-- client on one computer reach each other; each knows the other is local by its own card's
+-- address. A broadcast reaches the card itself the same way.
+local function here(card, port, ...)
+    if component.invoke(card, "isOpen", port) then computer.pushSignal("modem_message", card, card, port, 0, ...) end
+end
+function link.send(card, to, port, ...)
+    if to ~= card then return component.invoke(card, "send", to, port, ...) end
+    here(card, port, ...)
+    return true
+end
+function link.broadcast(card, port, ...)
+    here(card, port, ...)
+    return component.invoke(card, "broadcast", port, ...)
+end
+
 -- onStatus(gateModem, status): the gates' status messages (the client sets it).
 link.onStatus = nil
 local function onMessage(_, _, from, port, distance, kind, id, ok, payload)
@@ -60,8 +78,8 @@ end
 -- calling remote function: method") when none came within WAIT seconds.
 function link.call(address, port, method, callback, ...)
     local id, text = newId(), link.pack(...)
-    local modem = component.modem
-    local function send() return pcall(modem.send, address, port, link.CALL, id, method, text) end
+    local card = component.modem.address
+    local function send() return pcall(link.send, card, address, port, link.CALL, id, method, text) end
     local sent, err = send()
     if not sent then return callback(false, tostring(err)) end
     local w, deadline = {address = address, callback = callback}, computer.uptime() + link.WAIT
@@ -87,7 +105,7 @@ function link.hello(ports, seconds, answer, done)
     local function ask()
         if waiting[id] ~= w then return end
         for address in component.list("modem") do
-            for port in pairs(ports) do pcall(component.invoke, address, "broadcast", port, link.CALL, id, "hello", text) end
+            for port in pairs(ports) do pcall(link.broadcast, address, port, link.CALL, id, "hello", text) end
         end
     end
     w.timer = event.timer(seconds, function()

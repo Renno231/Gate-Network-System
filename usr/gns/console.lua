@@ -38,6 +38,7 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         {"idc add <code> <name>", "let an IDC open the iris; idc remove <code>"},
         {"kawoosh on|off", "close the iris while the wormhole forms"},
         {"public on|off", "let anyone dial; the iris stays the owner's and grant holders' (a registered gate is private otherwise)"},
+        {"local on|off", "take commands only from the client on this computer; travellers still pass"},
         {"port <number>", "the modem port of this gate's network (restart gns after)"},
         {"sleep <minutes>|off", "shut down when idle; the wake key or the DHD wakes it"},
         {"wake new", "a new wake key: grant holders get it when they next open the gate"},
@@ -55,7 +56,7 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         out(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
         if s.irisProblem then out(s.irisProblem) end
         out(("Server %.1f TPS, DHD %s, kawoosh avoidance %s"):format(s.tps, dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
-        out(ownerLine())
+        out(ownerLine() .. (settings.localOnly and "; commands only from this computer" or ""))
         out(("Port %d, wake key %s, sleep %s"):format(settings.port or 160, state.wake and "set" or "none",
             (tonumber(settings.sleep) or 0) > 0 and (settings.sleep .. " min") or "off"))
         local line = "Off-world alarm " .. (node.status().alarm and "ON" or "off")
@@ -135,6 +136,14 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         settings.public = on
         save()
         out(on and "Public: anyone in range may dial." or "Private: only the owner and grant holders.")
+    end
+    commands["local"] = function(argument, out)
+        local on = onOff(argument)
+        if on == nil then out("Usage: local on|off (now " .. (settings.localOnly and "on" or "off") .. ")") return end
+        settings.localOnly = on or nil
+        save()
+        out(on and "Only the client on this computer controls the gate; travellers still pass."
+            or "Every device the gate's access allows controls it.")
     end
     function commands.port(argument, out)
         local port = math.tointeger(tonumber(argument))

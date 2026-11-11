@@ -1,6 +1,8 @@
 -- GNS gate server: serves this computer's stargate to GNS clients, announces it on disco, and
 -- gives the gate's owner and admins a console (or the gate room display). Started by
--- /usr/bin/gns.
+-- /usr/bin/gns. The gate itself runs on timers and listeners; only the console holds the
+-- terminal. With gns.background it starts the gate and returns, so the client can run on the
+-- same computer; run again, it opens the console on the running gate instead of starting another.
 local gns = ...
 if type(gns) ~= "table" or type(gns.path) ~= "table" or type(gns.utility) ~= "table" then
     error("Gate Network System environment not loaded")
@@ -11,6 +13,16 @@ local disco = require("disco")
 local serialization = require("serialization")
 local term = require("term")
 local unicode = require("unicode")
+
+-- package.loaded is the computer's, shared by every program on it: here.gate is the running
+-- gate, here.client is set while the client runs (gns.lua).
+local here = package.loaded["gns.here"] or {}
+package.loaded["gns.here"] = here
+if here.gate then
+    if not gns.background then here.gate.console(false) end
+    return
+end
+
 local gate = dofile(gns.path.gns .. "gate.lua")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
@@ -21,7 +33,8 @@ local dhd = gns.dhd or (component.isAvailable("dhd") and component.dhd or nil)
 
 -- settings.lua: the gate's published name and dimension, kawoosh avoidance (on unless false),
 -- the IDCs that open the iris ({[code] = name}), port, public, sleep (idle minutes before it
--- shuts down; 0 never), alarm, redstoneWake and room (start in gate room mode).
+-- shuts down; 0 never), alarm, redstoneWake, room (start in gate room mode) and localOnly (only
+-- the client on this computer controls the gate).
 local settingsPath = gns.path.serverDirectory .. "settings.lua"
 local settings = gns.utility.readFile(settingsPath)
 if type(settings) ~= "table" then
@@ -58,23 +71,26 @@ saveSettings()
 local node = gate.start(state, stargate, settings, dhd)
 disco.offer("gns", settings.port or handshake.PORT)
 
-print(("GNS gate %s"):format(settings.name))
-print(state.owner and ("Owner %s (%s)%s"):format(tostring(state.ownerName), fingerprint(state.owner), settings.public and ", public" or "")
-    or "Not registered: the first client to set it up becomes its owner.")
-print("Modem " .. component.modem.address .. ", port " .. (settings.port or handshake.PORT))
-print("Device " .. fingerprint(state.identity.public))
-print("Type help for commands.")
-
 -- The console commands (console.lua); admins run the same ones remotely.
 local run = dofile(gns.path.gns .. "console.lua").new(node, settings, saveSettings, dhd, stargate)
 node.console = run
 local room = dofile(gns.path.serverDirectory .. "room.lua")
+local entry = {}
+local function stop()
+    if here.gate ~= entry then return end
+    here.gate = nil
+    disco.withdraw("gns")
+    node.stop()
+    print("GNS gate stopped.")
+end
+local owned -- the console was opened by the gns that started the gate: quit stops the gate
 local commands = {} -- only at the gate computer itself
 commands.help = function()
     run("help", print)
     print(("%-22s %s"):format("room [on|off]", "the gate room display; on: start in it"))
     print(("%-22s %s"):format("clear", "clear the screen"))
-    print(("%-22s %s"):format("quit", "stop the gate"))
+    print(("%-22s %s"):format("quit", owned and "stop the gate" or "leave the console; the gate runs on"))
+    print(("%-22s %s"):format("stop", "stop the gate"))
 end
 commands.clear = function() term.clear() end
 commands.room = function(argument)
@@ -88,15 +104,20 @@ commands.room = function(argument)
 end
 for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
 
-local function console()
+local function loop()
     if settings.room then room.run(node, settings) end
-    while true do
+    while here.gate == entry do
         io.write("gate> ")
         local line = io.read()
-        if not line or line == "quit" then return end
+        if not line or line == "quit" then
+            if owned then stop() end
+            return
+        end
         local name, argument = line:match("^%s*(%S+)%s*(.-)%s*$")
         local command = name and commands[name]
-        if command then
+        if name == "stop" then
+            stop()
+        elseif command then
             local ok, err = pcall(command, argument)
             if not ok then print("Error: " .. tostring(err)) end
         else
@@ -105,10 +126,24 @@ local function console()
     end
 end
 
--- Ctrl+Alt+C raises "interrupted" in here: the gate stops the same way as on quit, or its
--- timers and endpoint would go on serving behind the shell.
-local ok, err = pcall(console)
-disco.withdraw("gns")
-node.stop()
-print("GNS gate stopped.")
-if not ok and err ~= "interrupted" then error(err, 0) end
+-- own: quit and Ctrl+Alt+C stop the gate (it was started with this console), or its timers and
+-- endpoint would go on serving behind the shell. Otherwise they leave the console.
+function entry.console(own)
+    owned = own
+    print(("GNS gate %s"):format(settings.name))
+    print(state.owner and ("Owner %s (%s)%s"):format(tostring(state.ownerName), fingerprint(state.owner), settings.public and ", public" or "")
+        or "Not registered: the first client to set it up becomes its owner.")
+    print("Modem " .. component.modem.address .. ", port " .. (settings.port or handshake.PORT))
+    print("Device " .. fingerprint(state.identity.public))
+    print("Type help for commands.")
+    local ok, err = pcall(loop)
+    if own then stop() end
+    if not ok and err ~= "interrupted" then error(err, 0) end
+end
+here.gate = entry
+
+if gns.background then
+    print(("GNS gate %s runs in the background; gns gate opens its console."):format(settings.name))
+    return
+end
+entry.console(true)

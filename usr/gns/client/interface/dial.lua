@@ -65,6 +65,12 @@ local function findConnection(address)
         if connection.address == address then return connection, i end
     end
 end
+-- How far a gate is: "this computer" for the gate whose modem is one of this computer's own
+-- cards (it answered by local delivery, link.lua), else its distance with unit, else nil.
+local function away(c, unit)
+    if component.list("modem")[c.address] then return "this computer" end
+    return c.distance and (math.floor(c.distance) .. unit) or nil
+end
 local function byDistance(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end
 local function isAdmin(c) return c and (c.role == "admin" or c.role == "owner") end
 
@@ -927,7 +933,7 @@ clientEnv.command({"from", "f"}, "from [gate]: choose the gate to dial from; alo
         if #connections == 0 then return "No gates in range." end
         local list = {}
         for _, c in ipairs(connections) do
-            list[#list + 1] = c.name .. (c.distance and (" " .. math.floor(c.distance) .. " m") or "")
+            list[#list + 1] = c.name .. (away(c, " m") and (" " .. away(c, " m")) or "")
         end
         return "In range: " .. table.concat(list, ", ")
     end
@@ -1173,7 +1179,7 @@ if wide then
             return
         end
         local galaxy = GALAXY[galaxyOf(c)]
-        self:text(3, 3, ui.pad(("%s · %s%s"):format(galaxy, tostring(s.state), c.distance and (" · " .. math.floor(c.distance) .. " blocks away") or ""), rw - 4), C.dim, C.card)
+        self:text(3, 3, ui.pad(("%s · %s%s"):format(galaxy, tostring(s.state), away(c, " blocks away") and (" · " .. away(c, " blocks away")) or ""), rw - 4), C.dim, C.card)
         local text, fraction = energy(s)
         self:text(3, 4, "Energy", C.faint, C.card)
         if fraction then self:bar(11, 4, 32, fraction, C.amber, C.card) end

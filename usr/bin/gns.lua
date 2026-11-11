@@ -1,5 +1,8 @@
--- gns                 run the gate server on a computer with a stargate, otherwise the client
--- gns client          run the client even where there is a stargate
+-- gns                 on a computer with a stargate and the client installed, start the gate
+--                     server in the background (unless it runs already), then the client; with
+--                     a stargate only the gate server, with its console; otherwise the client
+-- gns gate            the gate server's console: on the running gate, else it starts the gate
+-- gns client          run only the client, even where there is a stargate
 -- gns passwd          change the client vault's password
 -- gns autorun on|off  start gns when the computer boots (a line in /home/.shrc)
 -- gns update          install the newest GNS from GitHub (needs an internet card)
@@ -28,11 +31,12 @@ local serverPath, clientPath = gnsPath .. "server/server.lua", gnsPath .. "clien
 -- never carries it and gns uninstall keeps it, unless --all.
 local DATA = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/client/backups",
     "gns/server/settings.lua", "gns/server/state", "gns/server/state.log"}
-local COMMANDS = {client = true, passwd = true, autorun = true, update = true, uninstall = true, floppy = true}
+local COMMANDS = {gate = true, client = true, passwd = true, autorun = true, update = true, uninstall = true, floppy = true}
 
 if command == "help" or (command and not COMMANDS[command]) then
-    print("gns                 run the gate server (with a stargate) or the client")
-    print("gns client          run the client")
+    print("gns                 the gate (with a stargate) in the background, then the client")
+    print("gns gate            the gate server's console")
+    print("gns client          run only the client")
     print("gns passwd          change the client vault's password")
     print("gns autorun on|off  start gns when the computer boots")
     print("gns update          install the newest GNS from GitHub")
@@ -266,8 +270,18 @@ if command == "passwd" then
     return
 end
 
-local runServer = component.isAvailable("stargate") and not options.client and command ~= "client" and fs.exists(serverPath)
-if not runServer and not fs.exists(clientPath) then
+local hasServer = component.isAvailable("stargate") and fs.exists(serverPath)
+local hasClient = fs.exists(clientPath)
+local runServer, runClient
+if command == "gate" then
+    runServer = hasServer
+    if not runServer then error("gns gate runs the gate server: it needs a stargate and the gate server's files.") end
+elseif command == "client" or options.client then
+    runClient = hasClient
+else
+    runServer, runClient = hasServer, hasClient
+end
+if not runServer and not runClient then
     error(fs.exists(serverPath) and "This is a gate server's install (no client): it runs gns where there is a stargate."
         or "Gate Network System client not found at " .. clientPath)
 end
@@ -302,17 +316,29 @@ local environment = {
         clientDirectory = fs.path(clientPath), gns = gnsPath},
     utility = {readFile = readFile, writeFile = writeFile, strsplit = strsplit},
     isRepeating = options.repeating,
-    clientActive = not runServer,
+    clientActive = runClient,
+    -- The gate starts in the background when the client runs after it (server.lua).
+    background = runServer and runClient,
 }
+-- server.lua's registry of what GNS runs on this computer (package.loaded is the computer's):
+-- here.client tells the gate a player is using the client here, so it does not sleep.
+local here = package.loaded["gns.here"] or {}
+package.loaded["gns.here"] = here
 
 local runs = 1
 while (environment.isRepeating == nil and runs == 1) or environment.isRepeating == true do
-    loadfile(runServer and serverPath or clientPath)(environment)
+    if runServer then assert(loadfile(serverPath))(environment) end
+    if runClient then
+        here.client = true
+        local ok, err = pcall(assert(loadfile(clientPath)), environment)
+        here.client = nil
+        if not ok then error(err, 0) end
+    end
     runs = runs + 1
     if environment.isRepeating then
         os.sleep(1)
         print("Re-running GNS... (" .. tostring(runs) .. ")")
-        environment.clientActive = not runServer
+        environment.clientActive = runClient
         for i in pairs(package.loaded) do if i:match("^loom") then package.loaded[i] = nil end end
         package.loaded.ecc = nil
     end

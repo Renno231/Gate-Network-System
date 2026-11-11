@@ -135,8 +135,10 @@ mkinstaller. GNS runs the same on computers that boot through `qboot`.
 ## Use
 
 ```
-gns                 run the gate server (with a stargate) or the client
-gns client          run the client
+gns                 with a stargate: the gate server in the background, then the client (the
+                    gate's console instead where the client is not installed); else the client
+gns gate            the gate server's console (on the running gate, or it starts the gate)
+gns client          run only the client
 gns passwd          change the client vault's password
 gns autorun on|off  start gns when the computer boots
 gns update          install the newest GNS from GitHub
@@ -149,10 +151,16 @@ gns floppy ... --own   gates installed from it belong to this device
 
 The first client run asks for a password and creates the vault. The client's Guide screen
 explains every screen and command. The gate server's console takes `help`, `status`, `close`,
-`iris`, `log`, `history`, `idc`, `kawoosh`, `name`, `dim`, `public`, `port`, `sleep`, `wake`, `redstone`,
-`alarm`, `schedule`, `users`, `cut`, `room`, `clear` and `quit`; all but `room`, `clear` and
-`quit` also run remotely for the owner and admins. Only the gate computer's OC users (the owner
-and admins) can type at it.
+`iris`, `log`, `history`, `idc`, `kawoosh`, `name`, `dim`, `public`, `local`, `port`, `sleep`, `wake`, `redstone`,
+`alarm`, `schedule`, `users`, `cut`, `room`, `clear`, `quit` and `stop`; all but `room`, `clear`,
+`quit` and `stop` also run remotely for the owner and admins. Only the gate computer's OC users (the owner
+and admins) can type at it. On a console opened on a gate running in the background, `quit`
+leaves the console and the gate runs on; `stop` stops it.
+
+A client on the gate's own computer reaches its gate like any other (the gate shows as "this
+computer"). `local on` makes that client the only device that controls the gate; travellers
+still get through the iris with an IDC or a GDO pass. While a client runs there, the gate does
+not sleep.
 
 ## Design
 

@@ -294,11 +294,20 @@ function gate.start(state, stargate, settings, dhd)
     -- any opened connection). A grant cut off after the connection opened ends its role; the
     -- connection stays, as a guest refused for that reason. Each call counts as use for sleep,
     -- except a passive one (status, cost): a client in range polls those for every gate it lists.
-    local function opened(minRole, fn, passive)
+    -- With settings.localOnly only a device on this computer (a client calling from one of its own
+    -- cards, link.lua's local delivery) may use the gate; others keep only the calls marked
+    -- travel: status, cost and the GDO pass, so travellers still get through the iris.
+    local function opened(minRole, fn, passive, travel)
         return function(...)
             if stopped then error("the gate is stopped", 0) end
             local session = sessionOf()
             if not session then error("call open first", 0) end
+            if settings.localOnly and not travel then
+                local conn = caller or api.caller()
+                if not (conn and component.list("modem")[conn.address]) then
+                    error("this gate takes commands only from its own computer", 0)
+                end
+            end
             if session.grant and session.cutSeq ~= state.cutSeq then
                 local role, why = grants.check(session.grant, state.owner, identity.public, session.key, state.cut)
                 if not role then
@@ -351,12 +360,18 @@ function gate.start(state, stargate, settings, dhd)
     -- Over link.lua: each message is sent again until answered, so the relay's losses across the
     -- wormhole cost time, not the route. Gates are tried one at a time: a first open's signature
     -- checks hold this computer for seconds.
-    local function relay(r, at)
+    -- The far iris may still be shut, waiting for the hop's IDC, and no message crosses it: ask
+    -- again every 2 s while the wormhole stays open, up to RELAY_TRIES times.
+    local RELAY_TRIES = 10
+    local function relay(r, at, tries)
+        tries = tries or 1
         local want = r.hops[at].gate
         local found = {}
         link.hello({[port] = true, [handshake.PORT] = true}, 2, function(address, p, _, hello)
             if not component.list("modem")[address] then found[#found + 1] = {address = address, port = p, name = hello.name} end
         end, function()
+            local s, outgoing = stargate.getGateStatus()
+            if #found == 0 and tries < RELAY_TRIES and s == "open" and outgoing then return relay(r, at, tries + 1) end
             local i = 0
             local function try()
                 i = i + 1
@@ -366,10 +381,14 @@ function gate.start(state, stargate, settings, dhd)
                     return
                 end
                 local proxy = link.proxy(host.address, host.port)
-                handshake.openAsync(proxy, identity, pins, nil, function(reply)
-                    if not reply or (want and reply.key ~= want) then return try() end
-                    proxy:async(function(ok)
-                        if ok ~= true then return try() end
+                handshake.openAsync(proxy, identity, pins, nil, function(reply, why)
+                    if not reply then note(("route: %s: %s"):format(tostring(host.name), tostring(why))) return try() end
+                    if want and reply.key ~= want then
+                        note(("route: %s is not the gate hop %d names"):format(tostring(host.name), at))
+                        return try()
+                    end
+                    proxy:async(function(ok, err)
+                        if ok ~= true then note(("route: %s refused hop %d: %s"):format(tostring(host.name), at, tostring(err))) return try() end
                         note("route passed on to " .. tostring(reply.status and reply.status.name or host.name))
                     end).queue(r, at)
                 end, ownProofs)
@@ -447,10 +466,16 @@ function gate.start(state, stargate, settings, dhd)
     ------------------------------------------------------------------------ sleeping
     -- A gate with a wake key shuts down after settings.sleep idle minutes; a wake message or the
     -- DHD's redstone starts it again. Scheduled dials keep it up.
+    -- A client running on this computer (gns.lua marks it): the gate neither sleeps nor restarts
+    -- under the player using it.
+    local function clientHere()
+        local here = package.loaded["gns.here"]
+        return here and here.client
+    end
     local sleepTimer = timer(10, function()
         local minutes = tonumber(settings.sleep) or 0
         if minutes <= 0 or not state.wake or #state.schedules > 0 or settings.room then return end
-        if pending > 0 or not gateFree() or alarm then lastUse = computer.uptime() return end
+        if pending > 0 or not gateFree() or alarm or clientHere() then lastUse = computer.uptime() return end
         if computer.uptime() - lastUse >= minutes * 60 then
             note("sleeping")
             -- Asleep the gate cannot check an IDC, so with IDCs set its iris stays shut until it wakes.
@@ -491,7 +516,7 @@ function gate.start(state, stargate, settings, dhd)
         if restarting then return end
         restarting = true
         timer(2, function()
-            if pending > 0 or not gateFree() then return end
+            if pending > 0 or not gateFree() or clientHere() then return end
             flushHistory()
             computer.shutdown(true)
         end, math.huge)
@@ -610,7 +635,7 @@ function gate.start(state, stargate, settings, dhd)
             return true
         end), "Makes the caller the owner of an unregistered gate: player becomes its OC user, wake its wake key"},
 
-        status = {opened("user", function() return status() end, true), "The gate's name, type, state, iris, energy, TPS and last dial"},
+        status = {opened("user", function() return status() end, true, true), "The gate's name, type, state, iris, energy, TPS and last dial"},
 
         dial = {opened("user", function(session, address, opts)
             opts = type(opts) == "table" and opts or {}
@@ -665,7 +690,7 @@ function gate.start(state, stargate, settings, dhd)
 
         energy = {opened("user", function(_, address)
             return dialer.cost(address)
-        end, true), "What dialing an address would cost and how long the wormhole could stay open"},
+        end, true, true), "What dialing an address would cost and how long the wormhole could stay open"},
 
         closeWormhole = {opened("user", function(session)
             if RANK[session.role] < RANK.admin and not ownDial(session) then
@@ -685,7 +710,7 @@ function gate.start(state, stargate, settings, dhd)
         challenge = {opened("user", function(session)
             session.challenge = tostring(ecc.random.random()):sub(1, 16)
             return session.challenge
-        end), "A fresh challenge for a signed pass"},
+        end, false, true), "A fresh challenge for a signed pass"},
 
         pass = {opened("user", function(session, sig)
             if not session.name then error("passes are for the owner and grant holders", 0) end
@@ -702,7 +727,7 @@ function gate.start(state, stargate, settings, dhd)
             end
             record(session.name .. " sent a signed pass")
             return dialer.admit(session.name)
-        end), "A signed pass for the incoming wormhole: opens the iris for the owner or a grant holder"},
+        end, false, true), "A signed pass for the incoming wormhole: opens the iris for the owner or a grant holder"},
 
         -- The iris: anyone who may dial an unregistered gate; on a registered one the owner and
         -- grant holders, not the public a public gate lets dial (they send an IDC instead).
@@ -867,8 +892,8 @@ function gate.start(state, stargate, settings, dhd)
             local s = devices[from]
             if s and s.role then watchers[from] = {untilAt = now + WATCH, port = p, via = to} end
         end
-        if not pcall(component.invoke, to, "send", from, p, link.REPLY, id, done.ok, done.text) then
-            pcall(component.invoke, to, "send", from, p, link.REPLY, id, false, link.pack("the answer is too big for a modem message"))
+        if not pcall(link.send, to, from, p, link.REPLY, id, done.ok, done.text) then
+            pcall(link.send, to, from, p, link.REPLY, id, false, link.pack("the answer is too big for a modem message"))
         end
     end
     event.listen("modem_message", onCall)
@@ -878,9 +903,24 @@ function gate.start(state, stargate, settings, dhd)
             tostring(s.dialing), tostring(s.lastDial), #(s.glyphs or {}), tostring(s.name), tostring(s.alarm),
             tostring(s.seq), tostring(s.handDialed and s.handDialed.time)}, "|")
     end
-    local shown, pushes = nil, 0
+    -- status() costs a tick per stargate call, about half a second in all: built every half
+    -- second it would leave the computer no time for its signals. So it is built only when
+    -- something it shows may have changed: a signal other than a modem message (JSG's gate,
+    -- chevron and iris events), the gate's state (one call: JSG ends a failed dial without a
+    -- signal), or the dialer's or this gate's own state.
+    local signals = 0
+    local counter = event.register(nil, function(name)
+        if name and name ~= "modem_message" then signals = signals + 1 end
+    end, math.huge, math.huge)
+    local shown, pushes, checked = nil, 0, nil
     local watchTimer = timer(0.5, function()
-        if not next(watchers) then shown = nil return end
+        if not next(watchers) then shown, checked = nil, nil return end
+        local hand = state.handDialed
+        local gateState, outgoing = stargate.getGateStatus()
+        local key = table.concat({signals, tostring(gateState), tostring(outgoing), tostring(dialer.state), tostring(dialer.irisProblem), tostring(settings.name),
+            tostring(alarm), tostring(state.entry and state.entry.seq), tostring(hand and hand.time)}, "|")
+        if key == checked then return end
+        checked = key
         local s = status()
         local now, current = computer.uptime(), shape(s)
         if current == shown then return end
@@ -888,7 +928,7 @@ function gate.start(state, stargate, settings, dhd)
         local text = link.pack(s)
         for address, w in pairs(watchers) do
             if now > w.untilAt then watchers[address] = nil
-            else pcall(component.invoke, w.via, "send", address, w.port, link.STATUS, pushes, text) end
+            else pcall(link.send, w.via, address, w.port, link.STATUS, pushes, text) end
         end
     end, math.huge)
     record("gate started")
@@ -897,6 +937,7 @@ function gate.start(state, stargate, settings, dhd)
         stopped = true
         event.ignore("modem_message", onCall)
         event.cancel(watchTimer)
+        event.cancel(counter)
         link.stop()
         node.endpoint:shutdown()
         -- Every connection that opened, even one the endpoint no longer lists.
