@@ -515,16 +515,15 @@ function gate.start(state, stargate, settings, dhd)
         if staged then for _, path in ipairs(staged.paths) do fs.remove(path .. ".new") end end
         staged = nil
     end
+    -- The check runs from the gate's start: QuickOS keeps a thread's timers with the thread, so one
+    -- the self-update's thread made would end with it, before the gate was ever idle.
     local restarting = false
-    local function restartWhenIdle()
-        if restarting then return end
-        restarting = true
-        timer(2, function()
-            if pending > 0 or not gateFree() or clientHere() then return end
-            flushHistory()
-            computer.shutdown(true)
-        end, math.huge)
-    end
+    local function restartWhenIdle() restarting = true end
+    timer(2, function()
+        if not restarting or pending > 0 or not gateFree() or clientHere() then return end
+        flushHistory()
+        computer.shutdown(true)
+    end, math.huge)
 
     -- A gate with an internet card updates itself from GitHub, as GDS gates did: on start and
     -- every SELF_UPDATE seconds it runs GNS's installer (which downloads only what changed and
