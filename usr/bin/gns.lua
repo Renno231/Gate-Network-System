@@ -30,7 +30,7 @@ local serverPath, clientPath = gnsPath .. "server/server.lua", gnsPath .. "clien
 -- state and history. A floppy
 -- never carries it and gns uninstall keeps it, unless --all.
 local DATA = {"gns/client/vault", "gns/client/database", "gns/client/settings.lua", "gns/client/backups",
-    "gns/server/settings.lua", "gns/server/state", "gns/server/state.log"}
+    "gns/server/settings.lua", "gns/server/state", "gns/server/state.log", "gns/server/update.log"}
 local COMMANDS = {gate = true, client = true, passwd = true, autorun = true, update = true, uninstall = true, floppy = true}
 
 if command == "help" or (command and not COMMANDS[command]) then
@@ -321,7 +321,7 @@ local environment = {
     background = runServer and runClient,
 }
 -- server.lua's registry of what GNS runs on this computer (package.loaded is the computer's):
--- here.client tells the gate a player is using the client here, so it does not sleep.
+-- here.client, set by the client once unlocked, tells the gate a player is using it here.
 local here = package.loaded["gns.here"] or {}
 package.loaded["gns.here"] = here
 
@@ -329,7 +329,6 @@ local runs = 1
 while (environment.isRepeating == nil and runs == 1) or environment.isRepeating == true do
     if runServer then assert(loadfile(serverPath))(environment) end
     if runClient then
-        here.client = true
         local ok, err = pcall(assert(loadfile(clientPath)), environment)
         here.client = nil
         if not ok then error(err, 0) end

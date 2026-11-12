@@ -119,8 +119,8 @@ end
 
 -- A stand-in for an api proxy: proxy:async(callback).method(...) makes the call; close does
 -- nothing. reopen(done) opens the gate again (done(true) once it is open), for a gate that
--- answers "call open first".
-function link.proxy(address, port, reopen)
+-- answers "call open first". bucket (tnet.bucket): the caller's, for calls that go over tnet.
+function link.proxy(address, port, reopen, bucket)
     local proxy = {address = address, port = port, connected = true}
     local function call(method, callback, args, again)
         local function answered(ok, ...)
@@ -141,7 +141,7 @@ function link.proxy(address, port, reopen)
                 tnet:close()
                 answered(...)
             end)[method](table.unpack(args, 1, args.n))
-        end, nil, 3)
+        end, nil, 3, nil, nil, bucket)
     end
     function proxy:async(callback)
         return setmetatable({}, {__index = function(_, method)

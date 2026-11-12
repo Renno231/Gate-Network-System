@@ -148,7 +148,7 @@ local function openGate(address, port, callback, c)
     -- A gate that restarted answers "call open first": the proxy opens it again, then calls again.
     c.proxy = c.proxy or link.proxy(address, port, function(done)
         openGate(address, port, guard(function(x) done(x ~= nil) end), c)
-    end)
+    end, clientEnv.bucket)
     local known, gateKey = accessByModem(address)
     handshake.openAsync(c.proxy, identity, vaultState.pins, {grants = grantsFor(known and known.owner, gateKey)}, guard(function(reply, reason, newKey)
         if not reply then return callback(nil, reason, newKey) end

@@ -86,6 +86,10 @@ if not clientVault then
     print("GNS client locked.")
     return
 end
+-- Unlocked: a player is using the client, so a gate on this computer neither sleeps nor restarts
+-- under them (gate.lua). A client left at its password prompt (gns autorun at boot) holds nothing
+-- to lose, and an unattended gate still sleeps. gns.lua clears it when the client ends.
+if package.loaded["gns.here"] then package.loaded["gns.here"].client = true end
 
 local loom = require("loom")
 local ui = dofile(gns.path.clientDirectory .. "ui.lua")
@@ -99,6 +103,9 @@ require("ecc") -- loaded once here for the screens' network work (about 105 KB a
 clientEnv.ui = ui
 clientEnv.gateconnections = {} -- the gates in range this device opened, nearest first
 clientEnv.link = dofile(gns.path.gns .. "link.lua") -- gate commands as single messages
+-- The client's tnet endpoints and connections. Closed when the client quits, or by QuickOS when
+-- it crashes; a gate running on this computer has its own.
+clientEnv.bucket = require("tnet").bucket("gns.client")
 
 local modem = component.modem
 local readFile = gns.utility.readFile
@@ -354,7 +361,7 @@ clientEnv.peer = peer.start(vaultState.identity, vaultState.peerPins, deviceName
                 chat.hasIDCs(share) and " with their IDCs" or ""))
         end
     end,
-})
+}, clientEnv.bucket)
 
 ---------------------------------------------------------------------------- player and alarms
 -- The player using the device: OC names them in every key and touch event. A gate registered
@@ -790,32 +797,48 @@ function clientEnv.relayout()
     loom.stop()
 end
 
+-- Undoes what this client run set up on the computer. In the client's bucket, so it runs when
+-- the client quits and, through QuickOS, when it crashes: a crashed client's listeners and timers
+-- would otherwise stay, and the next client on this computer would run beside them.
+local built = false -- root is up: its onClose hooks and listeners are still to undo
+local function closeClient()
+    if built then
+        built = false
+        for _, fn in ipairs(clientEnv.onClose) do pcall(fn) end
+        pcall(root.Destroy, root, true) -- a root frame's Destroy also unregisters its screen event listeners
+    end
+    loom.onKey(nil)
+    event.cancel(saveTimer)
+    event.cancel(sleepTimer)
+    event.ignore("key_down", onKey)
+    event.ignore("touch", onTouch)
+    event.ignore("modem_message", onAlarm)
+    pcall(clientEnv.peer.stop)
+    clientEnv.link.stop()
+    local saved, saveError = clientVault:save()
+    clientVault:lock()
+    component.gpu.freeAllBuffers()
+    component.gpu.setBackground(0x000000)
+    component.gpu.setForeground(0xFFFFFF)
+    local maxW, maxH = component.gpu.maxResolution()
+    component.gpu.setResolution(maxW, maxH)
+    term.clear()
+    print(saved and "Closed GNS client" or ("Closed GNS client, but the vault was not saved: " .. tostring(saveError)))
+end
+clientEnv.bucket:add({close = closeClient})
+
 clientEnv.log("GNS client ready. Press ; for commands; SCAN finds the gates in range.")
 while gns.clientActive do
     rebuild = false
     component.gpu.freeAllBuffers()
     ui.setLayout(settings.layout)
     build()
+    built = true
     loom.run(root, 0.5)
+    built = false
     for _, fn in ipairs(clientEnv.onClose) do pcall(fn) end
-    root:Destroy(true) -- a root frame's Destroy also unregisters its screen event listeners
+    root:Destroy(true)
     if not rebuild then break end
 end
 
-loom.onKey(nil)
-event.cancel(saveTimer)
-event.cancel(sleepTimer)
-event.ignore("key_down", onKey)
-event.ignore("touch", onTouch)
-event.ignore("modem_message", onAlarm)
-pcall(clientEnv.peer.stop)
-clientEnv.link.stop()
-local saved, saveError = clientVault:save()
-clientVault:lock()
-component.gpu.freeAllBuffers()
-component.gpu.setBackground(0x000000)
-component.gpu.setForeground(0xFFFFFF)
-local maxW, maxH = component.gpu.maxResolution()
-component.gpu.setResolution(maxW, maxH)
-term.clear()
-print(saved and "Closed GNS client" or ("Closed GNS client, but the vault was not saved: " .. tostring(saveError)))
+clientEnv.bucket:close()

@@ -155,7 +155,7 @@ local function startInvite(issuer)
         end
         queue[#queue + 1] = request
         loom.invalidate()
-    end)
+    end, clientEnv.bucket)
     host = this
     timer = event.timer(0.5, guard(nextRequest), math.huge)
     log(("Inviting as %s. Players choose JOIN on their device."):format(issuer.label))
@@ -212,7 +212,7 @@ local function join()
             keep(offer, role)
             log(("Granted the %s role at %s, signed by %s."):format(role, scopeOf(offer.grant), short(offer.grant.signer)))
             clientEnv.reconnect()
-        end), function() return not closed end)
+        end), function() return not closed end, clientEnv.bucket)
     end
     if clientEnv.player then return ask(clientEnv.player) end
     clientEnv.ask("Your player name", {text = "", title = "JOIN"}, guard(ask))

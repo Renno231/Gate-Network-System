@@ -103,6 +103,9 @@ end
 -- the dialer, applyWake() and stop(). node.console(line, out), when set (server.lua), runs a
 -- console command for an admin's console call.
 function gate.start(state, stargate, settings, dhd)
+    -- The gate's endpoint, the connections it accepts and those it makes. Detached: the gate runs
+    -- on after the gns command that started it ends; node.stop closes it.
+    local bucket = require("tnet").bucket("gns.gate"):detach()
     local sessions = setmetatable({}, {__mode = "k"}) -- tnet connection → {key, role, name, grant, cutSeq}
     -- Over link: modem address → its session, and → the proofs it last sent and was sent
     -- (handshake.lua), so opening again costs no signature check. At most MAX_DEVICES each.
@@ -380,7 +383,7 @@ function gate.start(state, stargate, settings, dhd)
                     note(("route: no gate past the wormhole took hop %d"):format(at))
                     return
                 end
-                local proxy = link.proxy(host.address, host.port)
+                local proxy = link.proxy(host.address, host.port, nil, bucket)
                 handshake.openAsync(proxy, identity, pins, nil, function(reply, why)
                     if not reply then note(("route: %s: %s"):format(tostring(host.name), tostring(why))) return try() end
                     if want and reply.key ~= want then
@@ -498,7 +501,8 @@ function gate.start(state, stargate, settings, dhd)
         local file = io.open("/home/.shrc")
         if not file then return false end
         local on = false
-        for line in file:lines() do on = on or line == "gns" end
+        -- gns autorun on writes gns; an owner may have written gns gate, for the console at boot.
+        for line in file:lines() do on = on or line == "gns" or line == "gns gate" end
         file:close()
         return on
     end
@@ -527,6 +531,7 @@ function gate.start(state, stargate, settings, dhd)
     -- replaces nothing until all of it has arrived) in a thread of its own, and restarts when
     -- that installed anything. A gate without one is updated by an admin's push (update).
     local updating = false
+    local UPDATE_LOG = "/usr/gns/server/update.log" -- the last self-update's output
     local function installed()
         local file = io.open("/usr/gns/installed.lua", "rb")
         if not file then return nil end
@@ -548,11 +553,13 @@ function gate.start(state, stargate, settings, dhd)
         state.updateChecked = realNow()
         pcall(save)
         require("thread").create(function()
+            -- What the download and the installer print goes to UPDATE_LOG, not the screen: a
+            -- client or the console may be using it.
             local shell, temp, before = require("shell"), "/tmp/gns-install.lua", installed()
             if fs.exists(temp) then fs.remove(temp) end
-            shell.execute("wget -fq " .. INSTALLER .. " " .. temp)
+            shell.execute("wget -fq " .. INSTALLER .. " " .. temp .. " > " .. UPDATE_LOG .. " 2>&1")
             if fs.exists(temp) then
-                shell.execute(temp .. (fs.exists("/usr/gns/client/client.lua") and "" or " gate"))
+                shell.execute(temp .. (fs.exists("/usr/gns/client/client.lua") and "" or " gate") .. " >> " .. UPDATE_LOG .. " 2>&1")
                 fs.remove(temp)
             end
             updating = false
@@ -856,7 +863,7 @@ function gate.start(state, stargate, settings, dhd)
             "The gate log, newest first: {time, text} entries, count at most 500 (admin)"},
     }
     node = {state = state, dialer = dialer, applyWake = applyWake, save = save, status = status, record = record,
-        history = newest, endpoint = api.expose(handshake.ENDPOINT, lib, port)}
+        history = newest, endpoint = api.expose(handshake.ENDPOINT, lib, port, nil, nil, bucket)}
 
     ------------------------------------------------------------------------ link
     -- Calls as single modem messages (link.lua). Each answer is kept link.KEEP seconds, so a call
@@ -939,9 +946,8 @@ function gate.start(state, stargate, settings, dhd)
         event.cancel(watchTimer)
         event.cancel(counter)
         link.stop()
-        node.endpoint:shutdown()
-        -- Every connection that opened, even one the endpoint no longer lists.
-        for conn in pairs(sessions) do pcall(conn.close, conn) end
+        -- The endpoint and every connection the gate accepted or made.
+        bucket:close()
         event.cancel(scheduleTimer)
         event.cancel(sleepTimer)
         event.cancel(historyTimer)

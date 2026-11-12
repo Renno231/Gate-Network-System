@@ -50,8 +50,9 @@ end
 
 -- Starts the service. identity = {private, public}; pins maps a peer modem to the device key seen
 -- there first; name is what this device calls itself; on = {chat(from, line), share(from, rows,
--- signed)}, where from = {fingerprint, name}. Returns a node: find, chat, share, stop.
-function peer.start(identity, pins, name, on)
+-- signed)}, where from = {fingerprint, name}. bucket (tnet.bucket) holds its endpoint and
+-- connections. Returns a node: find, chat, share, stop.
+function peer.start(identity, pins, name, on, bucket)
     local sessions = setmetatable({}, {__mode = "k"}) -- connection → true once opened
     local function from(senderName)
         local conn = api.caller()
@@ -83,7 +84,7 @@ function peer.start(identity, pins, name, on)
             return #clean
         end, "Offers database rows, with the signed gate entries behind them"},
     }
-    local endpoint = api.expose(peer.ENDPOINT, lib, peer.PORT)
+    local endpoint = api.expose(peer.ENDPOINT, lib, peer.PORT, nil, nil, bucket)
     disco.offer(peer.ENDPOINT, peer.PORT)
 
     local node, open = {}, {} -- open: modem → {proxy, address, fingerprint}
@@ -101,7 +102,7 @@ function peer.start(identity, pins, name, on)
                 open[address] = {proxy = proxy, address = address, fingerprint = fingerprint(reply.key)}
                 callback(open[address])
             end)
-        end, nil, 3)
+        end, nil, 3, nil, nil, bucket)
     end
 
     local function drop(address)

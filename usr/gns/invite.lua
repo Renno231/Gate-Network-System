@@ -12,10 +12,11 @@ local grants = dofile("/usr/gns/grants.lua")
 local invite = {ENDPOINT = "gns-invite", PORT = 161, MAX_PENDING = 16}
 
 -- Issuer side. onRequest(request) is called for each new request {address, key, name}.
--- Returns a host with accept(request, offer), deny(request) and stop(). offer = {grant, gates}
+-- bucket (tnet.bucket) holds its endpoint. Returns a host with accept(request, offer),
+-- deny(request) and stop(). offer = {grant, gates}
 -- with gates = {[gate key] = {name, modem, port, wake}}: what the holder needs to reach and
 -- wake the gates the grant covers.
-function invite.host(onRequest)
+function invite.host(onRequest, bucket)
     local requests = {}
     local lib = {
         request = function(key, name)
@@ -44,7 +45,7 @@ function invite.host(onRequest)
             return request.state, request.offer
         end,
     }
-    local endpoint = api.expose(invite.ENDPOINT, lib, invite.PORT)
+    local endpoint = api.expose(invite.ENDPOINT, lib, invite.PORT, nil, nil, bucket)
     disco.offer(invite.ENDPOINT, invite.PORT)
     local host = {}
     function host.accept(request, offer) request.offer, request.state = offer, "accepted" end
@@ -76,8 +77,9 @@ end
 
 -- Player side, without waiting: asks the nearest invitation (the next when one refuses the
 -- request) and gives the issuer up to timeout seconds. Calls callback(offer, role), or
--- callback(nil, why). alive(), when given, false stops asking (the client closed).
-function invite.join(identity, name, timeout, callback, alive)
+-- callback(nil, why). alive(), when given, false stops asking (the client closed). bucket
+-- (tnet.bucket) holds the connections it makes.
+function invite.join(identity, name, timeout, callback, alive, bucket)
     disco.findAsync(invite.ENDPOINT, 2, function(hosts)
         if #hosts == 0 then return callback(nil, "no invitation nearby") end
         table.sort(hosts, function(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end)
@@ -112,7 +114,7 @@ function invite.join(identity, name, timeout, callback, alive)
                     end
                     event.timer(1, poll)
                 end).request(identity.public, name)
-            end, nil, 3)
+            end, nil, 3, nil, nil, bucket)
         end
         ask()
     end)
