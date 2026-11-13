@@ -55,12 +55,14 @@ local function blocked()
 end
 -- A new gate port: the client hears that port's off-world alarms and opens its gates. The old
 -- port closes, so its network's alarms stop, unless a profile, invitations (invite.PORT, 161),
--- chat (peer.PORT, 162) or disco still use it.
+-- chat (peer.PORT, 162), disco or the gate on this computer still use it.
 local function setPort(port)
     local old, modem = settings.port, require("component").modem
     settings.port = port
     save()
-    if old ~= port and not clientEnv.ports()[old] and old ~= 161 and old ~= 162 and old ~= require("disco").port then
+    local gate = (package.loaded["gns.here"] or {}).gate
+    if old ~= port and not clientEnv.ports()[old] and old ~= 161 and old ~= 162 and old ~= require("disco").port
+        and not (gate and gate.port and gate.port() == old) then
         pcall(modem.close, old)
     end
     pcall(modem.open, settings.port)

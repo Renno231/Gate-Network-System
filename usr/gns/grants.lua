@@ -30,6 +30,10 @@ local function signedBy(key, data, sig, budget)
     return ok and good == true
 end
 
+-- Signatures already checked, by signature, with the bytes they sign: a grant shown at every open
+-- costs one check. Up to 256, then it starts again.
+local verified, nVerified = {}, 0
+
 -- The grant's own fields and signature. Returns true, or nil and the reason.
 function grants.valid(g, budget)
     if type(g) ~= "table" or not isKey(g.owner) or not isKey(g.holder) or not isKey(g.signer)
@@ -38,7 +42,12 @@ function grants.valid(g, budget)
         or type(g.serial) ~= "string" or #g.serial ~= 8 then
         return nil, "bad grant"
     end
-    if not signedBy(g.signer, bytes(g), g.sig, budget) then return nil, "bad grant signature" end
+    local data = bytes(g)
+    if verified[g.sig] ~= data then
+        if not signedBy(g.signer, data, g.sig, budget) then return nil, "bad grant signature" end
+        if nVerified >= 256 then verified, nVerified = {}, 0 end
+        verified[g.sig], nVerified = data, nVerified + 1
+    end
     return true
 end
 

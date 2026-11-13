@@ -82,10 +82,11 @@ end
 -- Adds e to book if it is valid and newer than what book holds for that gate.
 -- Returns "added" or "updated", or nil and the reason it was refused.
 function entries.merge(book, e)
+    -- An entry no newer than the one held costs no signature check: every open brings one.
+    local current = type(e) == "table" and e.key ~= nil and book[e.key]
+    if current and type(e.seq) == "number" and current.seq >= e.seq then return nil, "not newer" end
     local ok, reason = entries.verify(e)
     if not ok then return nil, reason end
-    local current = book[e.key]
-    if current and current.seq >= e.seq then return nil, "not newer" end
     if not current then
         local count = 0
         for _ in pairs(book) do count = count + 1 end

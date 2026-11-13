@@ -55,11 +55,13 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         local s = node.dialer.status()
         out(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
         if s.irisProblem then out(s.irisProblem) end
-        out(("Server %.1f TPS, DHD %s, kawoosh avoidance %s"):format(s.tps, dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
+        -- The gate measures the server's speed only when asked: an idle gate's first status starts it.
+        out(("Server %s, DHD %s, kawoosh avoidance %s"):format(s.tps and ("%.1f TPS"):format(s.tps) or "TPS measuring (status again in 5 s)",
+            dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
         out(ownerLine() .. (settings.localOnly and "; commands only from this computer" or ""))
         out(("Port %d, wake key %s, sleep %s"):format(settings.port or 160, state.wake and "set" or "none",
             (tonumber(settings.sleep) or 0) > 0 and (settings.sleep .. " min") or "off"))
-        local line = "Off-world alarm " .. (node.status().alarm and "ON" or "off")
+        local line = "Off-world alarm " .. (node.view().alarm and "ON" or "off")
         if component.isAvailable("redstone") then
             local rs, side = component.redstone, settings.alarm
             local out1 = side == "all" and 0 or (math.tointeger(sides[side]) or math.tointeger(side))

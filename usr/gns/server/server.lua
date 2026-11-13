@@ -140,6 +140,8 @@ function entry.console(own)
     if own then stop() end
     if not ok and err ~= "interrupted" then error(err, 0) end
 end
+-- The gate's port, so the client on this computer leaves it open (settings.lua, setPort).
+function entry.port() return settings.port or handshake.PORT end
 here.gate = entry
 
 if gns.background then

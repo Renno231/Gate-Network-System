@@ -100,40 +100,56 @@ end
 
 -- Keeps what opening a gate told this device: its entry, and for a gate where it holds a named
 -- role (owner or grant) how to reach and wake it. Returns true for a gate new to the book.
+-- The vault is saved only when this changed something: every open of every gate comes here.
 local function remember(c, wake)
-    local e, new = c.entry, false
+    local e, new, changed = c.entry, false, false
     if type(e) == "table" and e.key == c.key then
         new = vaultState.book[c.key] == nil
-        pcall(entries.merge, vaultState.book, e)
+        local ok, merged = pcall(entries.merge, vaultState.book, e)
+        changed = ok and merged ~= nil
         local own = vaultState.book[c.key]
         if own then
             c.name = own.name
+            local rows = #database
             local row = settings.autoLogToDatabase and record(own)
             if row then clientEnv.joinByPort(row, c.port) end
+            changed = changed or #database ~= rows
         end
     end
-    if c.tag == "public" or c.tag == "unregistered" then return new end
-    local a = vaultState.access[c.key] or {}
-    a.name, a.modem, a.port, a.owner, a.role = c.name, c.address, c.port, c.owner, c.role
-    a.wake = wake or a.wake
-    vaultState.access[c.key] = a
-    clientEnv.changed()
+    if c.tag ~= "public" and c.tag ~= "unregistered" then
+        local a = vaultState.access[c.key] or {}
+        wake = wake or a.wake
+        if not vaultState.access[c.key] or a.name ~= c.name or a.modem ~= c.address or a.port ~= c.port
+            or a.owner ~= c.owner or a.role ~= c.role or a.wake ~= wake then
+            a.name, a.modem, a.port, a.owner, a.role, a.wake = c.name, c.address, c.port, c.owner, c.role, wake
+            vaultState.access[c.key] = a
+            changed = true
+        end
+    end
+    if changed then clientEnv.changed() end
     return new
 end
 
--- Grants this device cut off reach every gate they cover that it administers: on each open.
+-- Grants this device cut off reach every gate they cover that it administers: on each open, the
+-- ones that gate has not taken yet (issued.cutAt, by gate key).
 local function pushCuts(c)
     if not isAdmin(c) then return end
-    local list = {}
+    local list, sent = {}, {}
     for _, issued in ipairs(vaultState.issued) do
         local g = issued.grant
-        if issued.cut and g.owner == c.owner and (g.gate == "" or g.gate == c.key) and (c.role == "owner" or g.role == "user") then
-            list[#list + 1] = g
+        if issued.cut and not (issued.cutAt and issued.cutAt[c.key]) and g.owner == c.owner
+            and (g.gate == "" or g.gate == c.key) and (c.role == "owner" or g.role == "user") then
+            list[#list + 1], sent[#sent + 1] = g, issued
         end
     end
     if #list == 0 then return end
     c.proxy:async(guard(function(ok, count)
         if ok ~= true then log(c.name .. ": cut-offs refused: " .. tostring(count)) return end
+        for _, issued in ipairs(sent) do
+            issued.cutAt = issued.cutAt or {}
+            issued.cutAt[c.key] = true
+        end
+        clientEnv.changed()
         if count > 0 then log(("%s: %d grant%s cut off."):format(c.name, count, count == 1 and "" or "s")) end
     end)).cut(list)
 end
@@ -150,7 +166,9 @@ local function openGate(address, port, callback, c)
         openGate(address, port, guard(function(x) done(x ~= nil) end), c)
     end, clientEnv.bucket)
     local known, gateKey = accessByModem(address)
+    local proof = vaultState.proofs[address]
     handshake.openAsync(c.proxy, identity, vaultState.pins, {grants = grantsFor(known and known.owner, gateKey)}, guard(function(reply, reason, newKey)
+        if vaultState.proofs[address] ~= proof then clientEnv.changed() end -- signed a new one
         if not reply then return callback(nil, reason, newKey) end
         if not reply.role then return callback(nil, tostring(reply.refused or "private gate")) end
         c.key, c.role, c.owner, c.registered, c.entry = reply.key, reply.role, reply.owner, reply.registered, reply.entry
@@ -189,9 +207,11 @@ local function dropQueued(connection)
 end
 local opening = {} -- modem → true while its open is under way
 
+-- Drops this connection (not a newer one to the same modem: a gate that moved port, say).
 local function forget(c)
-    local _, index = findConnection(c.address)
-    if index then table.remove(connections, index) end
+    for i, x in ipairs(connections) do
+        if x == c then table.remove(connections, i) break end
+    end
     if clientEnv.from == c then clientEnv.from = nil end
     dropQueued(c)
 end
@@ -213,16 +233,14 @@ local function scan(quiet)
         end
         if quiet and opened == 0 then return end
         log(("Found %d gates, opened %d, %d new%s."):format(found, opened, new, refused > 0 and (", " .. refused .. " private") or ""))
-        local saved, err = clientEnv.vault:save()
-        if not saved then log("Vault not saved: " .. tostring(err)) end
     end
-    link.hello(clientEnv.ports(), 2, guard(function(address, port, distance)
+    link.hello(clientEnv.ports(), 2, guard(function(address, port, distance, hello)
         if seen[address] then return end
         seen[address], found = true, found + 1
         local known = findConnection(address)
         if known then
             known.distance = distance
-            poll(known) -- a renamed gate shows its new name
+            if not quiet then poll(known) end -- a renamed gate shows its new name
             return
         end
         if opening[address] then return end
@@ -232,7 +250,7 @@ local function scan(quiet)
             if not connection then
                 refused = refused + 1
                 local a = accessByModem(address)
-                local name = a and a.name or address:sub(1, 8)
+                local name = a and a.name or hello.name or address:sub(1, 8) -- the name its hello gave
                 if reason == "gate key changed" then
                     clientEnv.keyChanged(name, vaultState.pins, address)
                     log(("%s: gate key changed. If it was reinstalled, trust %s accepts its new key."):format(name, name))
@@ -253,6 +271,12 @@ local function scan(quiet)
             done()
         end))
     end), guard(function()
+        -- A quiet scan keeps the gates that did not answer (a lost hello), with no distance known.
+        if quiet then
+            for _, c in ipairs(connections) do
+                if not seen[c.address] then c.distance = nil end
+            end
+        end
         if not quiet then
             -- A gate open here that no longer answers went to sleep or away: drop it, and wake it
             -- if this device holds its wake key.
@@ -261,6 +285,7 @@ local function scan(quiet)
                 local c = connections[i]
                 if not seen[c.address] then
                     forget(c)
+                    log(c.name .. " did not answer the scan; dropped.")
                     gone[c.address] = true
                 end
             end
@@ -279,8 +304,10 @@ clientEnv.onClose[#clientEnv.onClose + 1] = function() if wakeTimer then event.c
 -- Opens every gate again, so each holds the grants held now (after joining, say).
 function clientEnv.reconnect()
     for _, c in ipairs(connections) do
+        local before = c.tag
         openGate(c.address, c.port, guard(function(x, reason)
-            if not x then forget(c) log(c.name .. ": " .. tostring(reason)) end
+            if not x then forget(c) log(c.name .. ": " .. tostring(reason))
+            elseif x.tag ~= before then log(("Connected to %s (%s)."):format(x.name, x.tag)) end -- a new role
             loom.invalidate()
         end), c)
     end
@@ -367,6 +394,10 @@ local function took(connection, s)
         else
             f.start = nil
             if s.lastDial ~= f.last then
+                -- The far gate's IDC answer can replace "open" before this device hears it.
+                if s.state == "open" and s.outgoing and not s.dialing and f.last ~= "open" and s.lastDial ~= "open" then
+                    log(connection.name .. ": open")
+                end
                 f.last = s.lastDial
                 log(connection.name .. ": " .. tostring(f.last))
             end
@@ -380,24 +411,33 @@ link.onStatus = function(address, s)
     if c then pcall(took, c, s) end
 end
 
+-- The gate watches a device for 60 s from its last call (gate.lua WATCH): a poll 40 s after the
+-- last one renews it, however many changes came meanwhile, or the changes would stop coming.
+local RENEW = 40
 function poll(connection, maxAge)
     local now = computer.uptime()
-    if maxAge and connection.heard and now - connection.heard < maxAge then return end
+    if maxAge and connection.heard and now - connection.heard < maxAge
+        and now - (connection.polled or -math.huge) < RENEW then return end
     if connection.polling and now - connection.polling < link.WAIT + 1 then return end
-    connection.polling = now
+    connection.polling, connection.polled = now, now
     connection.proxy:async(guard(function(ok, s)
         connection.polling = false
         if ok == true and type(s) == "table" then return took(connection, s) end
-        -- Sent again for link.WAIT seconds without an answer: the gate is asleep or gone.
-        if silent(s) and findConnection(connection.address) then
-            forget(connection)
+        if findConnection(connection.address) ~= connection then return end -- dropped or replaced meanwhile
+        forget(connection)
+        if silent(s) then
+            -- Sent again for link.WAIT seconds without an answer: the gate is asleep or gone.
             log(connection.name .. " does not answer; SCAN finds it again.")
-            loom.invalidate()
+        else
+            -- It answered and refused: this device's grant was cut off or the gate went private.
+            log(("%s refuses this device: %s"):format(connection.name, tostring(s)))
         end
+        loom.invalidate()
     end)).status()
 end
--- What the chosen dial would cost (the gate's energy check), for the destination card; asked
--- again when the gate or destination changes and every ten seconds.
+-- What the chosen dial would cost (the gate's energy check, a few stargate calls), for the
+-- destination card: asked once per gate and destination, since only the gate's energy changes,
+-- and that comes with its status.
 local cost = {}
 local function checkCost(c, r)
     if not c or not r or (cost.asking and computer.uptime() - cost.asking < 10) then return end
@@ -411,24 +451,37 @@ local function checkCost(c, r)
 end
 local function costText(c, r)
     if cost.from ~= c or cost.dest ~= r then return "" end
-    if cost.error then return "Cannot dial: " .. cost.error end
+    if cost.error then return "Cannot dial: " .. cost.error, true end
     local x = cost.result
     if not x then return "" end
     local k = function(n) n = tonumber(n) or 0 return n >= 1e4 and ("%dk"):format(n // 1000) or tostring(math.floor(n)) end
-    if not x.canOpen then return ("Not enough power: %s RF to open, %s stored"):format(k(x.open), k(x.energy)) end
-    return ("%s RF to open · %s RF/t open · %d s on stored power"):format(k(x.open), k(x.keepAlive), x.seconds)
+    -- The energy now (the gate's status), against the cost asked once (as dialer.cost works it out).
+    local energy = tonumber(c.status and c.status.energy) or tonumber(x.energy) or 0
+    local open, keepAlive = tonumber(x.open) or 0, tonumber(x.keepAlive) or 0
+    if energy < open then return ("Not enough power: %s RF to open, %s stored"):format(k(open), k(energy)), true end
+    return ("%s RF to open · %s RF/t open · %d s on stored power"):format(k(open), k(keepAlive),
+        math.floor((energy - open) / math.max(keepAlive, 1) / 20))
 end
 
 local ticks = 0
 local statusTimer = event.timer(0.5, guard(function()
     ticks = ticks + 1
     local c = clientEnv.fromGate()
-    -- The gate sends its changes; a poll covers one lost (3 s while a dial goes on, 5 s while a
-    -- wormhole is open, for its time left) and renews the watch (20 s).
+    -- The gate sends its changes; a poll covers one lost (3 s while a dial goes on, else 20 s on
+    -- the Dial screen) and renews the watch (every 40 s on any screen, so a command such as gdo
+    -- acts on the gate as it is). A dial being followed logs its states from any screen.
     local s = c and c.status or {}
-    if c then poll(c, (c.follow or s.dialing) and 3 or s.state == "open" and 5 or 20) end
-    local r = row()
-    if c and r and (cost.from ~= c or cost.dest ~= r or computer.uptime() - (cost.at or 0) > 10) then checkCost(c, r) end
+    if clientEnv.idle() and not (c and (c.follow or s.dialing)) then
+        -- Nobody reading the screen (client.lua): the next key or touch finds a scan due at once.
+        if ticks % 2 == 0 then dial.sinceScan = dial.sinceScan + 1 end
+        return
+    end
+    local shown = clientEnv.screen == "dial"
+    if c and (c.follow or s.dialing) then poll(c, 3)
+    elseif c then poll(c, shown and 20 or math.huge) end -- other screens: only the watch renewed
+    local r = shown and row()
+    -- An error (a lost answer, say) is asked again after a minute.
+    if c and r and (cost.from ~= c or cost.dest ~= r or (cost.error and computer.uptime() - cost.at > 60)) then checkCost(c, r) end
     if ticks % 2 == 0 then
         local rate = tonumber(clientEnv.settings.nearbyScanRate) or 0
         dial.sinceScan = dial.sinceScan + 1
@@ -480,7 +533,7 @@ local function waitToDial(c, r, idc, deadline, stopOwn, after)
     q.timer = event.timer(1, guard(function()
         c = findConnection(c.address) or c -- reconnected meanwhile: the new connection
         q.gate = c
-        poll(c, 3)
+        poll(c, 20) -- the gate sends its change to idle; this covers one lost
         local now = c.status or {}
         if queued ~= q then return false end
         if not now.dialing and now.state == "idle" then
@@ -686,11 +739,11 @@ local function reachFar(c, r, done)
         finished = true
         if best then done(best) else done(nil, why) end
     end
-    link.hello(clientEnv.ports(), 2, guard(function(address, port)
+    link.hello(clientEnv.ports(), 2, guard(function(address, port, _, hello)
         if finished or seen[address] or address == c.address or findConnection(address) then return end
         seen[address], waiting = true, waiting + 1
         openGate(address, port, guard(function(x, reason)
-            if not x then why = address:sub(1, 8) .. ": " .. tostring(reason) return finish() end
+            if not x then why = tostring(hello.name or address:sub(1, 8)) .. ": " .. tostring(reason) return finish() end
             local s = x.status or {}
             local named = isRow(x, r)
             if named then return finish(x) end
@@ -1023,7 +1076,7 @@ clientEnv.command({"energy", "e"}, "energy [gate]: what dialing it from the dial
     c.proxy:async(guard(function(ok, x)
         if ok ~= true then log(("%s to %s: %s"):format(c.name, r.Name, tostring(x))) return end
         cost.from, cost.dest, cost.at, cost.result, cost.error = c, r, computer.uptime(), x, nil
-        log(("%s to %s: %d glyphs. %s."):format(c.name, r.Name, x.glyphs, costText(c, r)))
+        log(("%s to %s: %d glyphs. %s."):format(c.name, r.Name, x.glyphs, (costText(c, r))))
     end)).energy(r.Address)
 end)
 clientEnv.command({"schedule"}, "schedule <minutes> <gate> | schedule [remove <n>]: the dialing gate dials a gate every so often (admins)", function(args)
@@ -1057,6 +1110,8 @@ local function gateLook()
     if s.state == "open" then
         state = s.iris == "CLOSED" and "iris" or "open"
         engaged = total
+    elseif s.dialing and s.iris == "CLOSED" and engaged >= total then
+        state = "iris" -- shut as the last chevron locked, for the kawoosh
     elseif s.dialing or engaged > 0 or s.state == "dialing" then
         state = "dial"
     end
@@ -1068,6 +1123,12 @@ local function irisLook()
     local s = c and c.status
     if s then return s.iris, s.irisType end
 end
+-- A lagging server (the gate's TPS probe): every wait takes 20 / TPS times as long in real time.
+local function slow(s)
+    local tps = tonumber(s.tps)
+    if not tps or tps >= 18 then return "" end
+    return (" · server at %.0f TPS: %.0fx slower"):format(tps, 20 / math.max(tps, 0.1))
+end
 local function headline()
     local c = clientEnv.fromGate()
     local state, _, _, engaged, total = gateLook()
@@ -1078,14 +1139,14 @@ local function headline()
     if state == "iris" then
         local shield = s.irisType == "SHIELD"
         return shield and "SHIELD UP" or "IRIS CLOSED",
-            (s.outgoing and ("Wormhole to " .. name) or "Incoming wormhole") .. (shield and " · shield up" or " · iris closed"), C.red
+            ((s.outgoing or s.dialing) and ("Wormhole to " .. name) or "Incoming wormhole") .. (shield and " · shield up" or " · iris closed"), C.red
     elseif state == "open" then
         return "WORMHOLE OPEN", s.outgoing and ("Wormhole open to " .. name) or "Incoming wormhole", C.sky
     elseif state == "dial" then
         return engaged == 0 and "DIALING" or (engaged >= total and ("CHEVRON " .. total .. " LOCKED") or ("CHEVRON " .. engaged .. " ENGAGED")),
-            ("Dialing · chevron %d of %d engaged"):format(engaged, total), C.amber
+            ("Dialing · chevron %d of %d engaged"):format(engaged, total) .. slow(s), C.amber
     end
-    local price = wide and "" or costText(c, r)
+    local price = wide and "" or (costText(c, r))
     return "READY", ("Ready · %s to %s, %d glyphs%s"):format(c.name, name, #plannedGlyphs(c, r), price ~= "" and (" · " .. price) or ""), C.dim
 end
 local function chips(self, x, y, w, pitch, h)
@@ -1189,7 +1250,7 @@ if wide then
         if s.irisProblem then
             self:text(23, 5, ui.pad(s.irisProblem, rw - 24), C.red, C.card)
         else
-            self:text(23, 5, ("Server %.1f TPS"):format(tonumber(s.tps) or 0), C.dim, C.card)
+            self:text(23, 5, ui.pad(s.tps and ("Server %.1f TPS"):format(tonumber(s.tps) or 0) or "", rw - 24), C.dim, C.card)
         end
     end)
     local left = ui.chooser(frame, rx + 1, 2, 22, fromName, function() cycle(-1) end, function() cycle(1) end)
@@ -1215,7 +1276,8 @@ if wide then
         local codes = #(r.IDCs or {}) > 0 and (settings.showCodes and ("IDC " .. table.concat(r.IDCs, ", ")) or "IDC hidden") or "No IDC"
         local signed = r.key and vaultState.book[r.key] and ("signed by its gate, " .. fingerprint(r.key):sub(1, 13)) or "added by hand"
         self:text(3, 3, ui.pad(codes .. " · " .. signed .. (r.home and " · home" or ""), rw - 4), C.faint, C.card)
-        self:text(3, 4, ui.pad(costText(clientEnv.fromGate(), r), rw - 4), cost.error or (cost.result and not cost.result.canOpen) and C.red or C.dim, C.card)
+        local price, short = costText(clientEnv.fromGate(), r)
+        self:text(3, 4, ui.pad(price, rw - 4), short and C.red or C.dim, C.card)
         if not settings.showCodes then self:text(3, 5, "Address hidden on this device.", C.faint, C.card) return end
         -- Four to a row, each row's blocks sharing its width (so the last row's are wider).
         local glyphs = plannedGlyphs(clientEnv.fromGate(), r)

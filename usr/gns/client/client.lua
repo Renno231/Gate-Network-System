@@ -383,6 +383,11 @@ end
 -- Power saving, as on GDS: a tablet shuts down after settings.tabletSleep minutes without a key
 -- or touch, once the vault is saved. A computer that is not a tablet never does.
 local lastInput = computer.uptime()
+-- Nobody at the client: no key or touch for IDLE seconds. Its scans, cost checks and status polls
+-- only keep the screen current for whoever reads it, so they wait (dial.lua) for the next key or
+-- touch; a dial going on keeps its polls. A player reading the screen touches it within minutes.
+local IDLE = 5 * 60
+function clientEnv.idle() return computer.uptime() - lastInput >= IDLE end
 local onTablet = component.isAvailable("tablet")
 local sleepTimer = event.timer(15, function()
     local minutes = settings.tabletSleep

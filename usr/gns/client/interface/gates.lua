@@ -54,10 +54,20 @@ end
 -- one glyph starts that way.
 local function glyphNamed(galaxy, word)
     local want = word:gsub("_", " "):lower()
+    -- Each word of want starts the glyph's word at the same place: Can_Mi is Canis Minor.
+    local function starts(g)
+        local words, i = {}, 0
+        for w in g:lower():gmatch("%S+") do words[#words + 1] = w end
+        for w in want:gmatch("%S+") do
+            i = i + 1
+            if not words[i] or words[i]:sub(1, #w) ~= w then return false end
+        end
+        return i > 0
+    end
     local found
     for _, g in ipairs(GLYPHS[galaxy]) do
         if g:lower() == want then return g end
-        if g:lower():sub(1, #want) == want then
+        if starts(g) then
             if found then found = false elseif found == nil then found = g end
         end
     end

@@ -701,7 +701,8 @@ function Gate:_follow(state)
     local shown = phase ~= nil or closed > 0
     self._inside:visible(shown)
     self._inside:animated(moving)
-    self._inside:fps((irisType == "SHIELD" and phase == nil) and 5 or 20)
+    -- 5 fps for a still shield's shimmer, and on the gate's own computer, where the gate needs the time.
+    self._inside:fps(((irisType == "SHIELD" and phase == nil) or (package.loaded["gns.here"] or {}).gate) and 5 or 20)
     local wake = #ends > 0 and math.max(table.unpack(ends)) or nil
     if wake and wake ~= self._wake then
         event.timer(wake - now + 0.05, function() loom.invalidate() end)
