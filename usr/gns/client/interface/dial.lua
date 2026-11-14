@@ -1203,11 +1203,17 @@ local function fromName() local c = clientEnv.fromGate() return c and c.name or 
 -- The address book, searched by name, type or location, and by glyph where addresses are shown.
 local search = ""
 -- A gate's address on one line: each glyph's first three letters (a Universe glyph's number).
+-- Worked out once per glyph name: OC's string.match and unicode.sub are slow, and the book draws
+-- these on every frame.
+local SHORT = setmetatable({}, {__index = function(t, g)
+    local s = tostring(g)
+    s = s:match("^Glyph (%d+)$") or unicode.sub(s, 1, 3)
+    t[g] = s
+    return s
+end})
 local function shortAddress(r)
     local out = {}
-    for i, g in ipairs((r.Address or {})[r.Type or "MW"] or {}) do
-        out[i] = tostring(g):match("^Glyph (%d+)$") or unicode.sub(tostring(g), 1, 3)
-    end
+    for i, g in ipairs((r.Address or {})[r.Type or "MW"] or {}) do out[i] = SHORT[g] end
     return #out > 0 and table.concat(out, " ") or "no address"
 end
 local function bookItems()
