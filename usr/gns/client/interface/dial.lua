@@ -133,8 +133,9 @@ local function remember(c, wake)
         local a = vaultState.access[c.key] or {}
         wake = wake or a.wake
         if not vaultState.access[c.key] or a.name ~= c.name or a.modem ~= c.address or a.port ~= c.port
-            or a.owner ~= c.owner or a.role ~= c.role or a.wake ~= wake then
+            or a.owner ~= c.owner or a.role ~= c.role or a.wake ~= wake or a.silent ~= c.silent then
             a.name, a.modem, a.port, a.owner, a.role, a.wake = c.name, c.address, c.port, c.owner, c.role, wake
+            a.silent = c.silent
             vaultState.access[c.key] = a
             changed = true
         end
@@ -185,6 +186,8 @@ local function openGate(address, port, callback, c)
         if not reply then return callback(nil, reason, newKey) end
         if not reply.role then return callback(nil, tostring(reply.refused or "private gate")) end
         c.key, c.role, c.owner, c.registered, c.entry = reply.key, reply.role, reply.owner, reply.registered, reply.entry
+        c.public, c.silent = reply.public == true or nil, reply.silent == true or nil
+        c.allow = type(reply.allow) == "table" and reply.allow or nil -- the owner's and admins' devices get it
         c.status = reply.status
         c.name = reply.status and reply.status.name or c.name or address:sub(1, 8)
         -- What the top bar shows: the role from ownership or a grant, else how the gate is open.
@@ -286,28 +289,63 @@ local function scan(quiet)
             done()
         end))
     end), guard(function()
-        -- A quiet scan keeps the gates that did not answer (a lost hello), with no distance known.
-        if quiet then
-            for _, c in ipairs(connections) do
-                if not seen[c.address] then c.distance = nil end
+        -- A silent gate answers no scan: those this device has access to are opened directly, by
+        -- their modem (a scan asked for opens those open here again too, to see they are still there).
+        local tries = {}
+        for _, a in pairs(vaultState.access) do
+            if a.silent and a.modem and not seen[a.modem] and not opening[a.modem] and clientEnv.ports()[a.port or 160]
+                and not (quiet and findConnection(a.modem)) then
+                tries[#tries + 1] = a
             end
         end
-        if not quiet then
-            -- A gate open here that no longer answers went to sleep or away: drop it, and wake it
-            -- if this device holds its wake key.
-            local gone = {}
-            for i = #connections, 1, -1 do
-                local c = connections[i]
-                if not seen[c.address] then
-                    forget(c)
-                    log(c.name .. " did not answer the scan; dropped.")
-                    gone[c.address] = true
+        local left = #tries + 1
+        local finish
+        for _, a in ipairs(tries) do
+            local address = a.modem
+            opening[address] = true
+            openGate(address, a.port or 160, guard(function(connection)
+                opening[address] = nil
+                if connection then
+                    seen[address], found = true, found + 1
+                    if not findConnection(address) then
+                        opened = opened + 1
+                        if connection.new then new = new + 1 end
+                        connections[#connections + 1] = connection
+                        log(("Connected to %s (%s)."):format(connection.name, connection.tag))
+                    end
+                    table.sort(connections, byDistance)
+                    loom.invalidate()
+                end
+                finish()
+            end), findConnection(address))
+        end
+        finish = function()
+            left = left - 1
+            if left > 0 then return end
+            -- A quiet scan keeps the gates that did not answer (a lost hello), with no distance known.
+            if quiet then
+                for _, c in ipairs(connections) do
+                    if not seen[c.address] then c.distance = nil end
                 end
             end
-            woken = wakeKnown(seen)
-            if woken > 0 then log(("Waking %d gate%s that did not answer."):format(woken, woken == 1 and "" or "s")) end
+            if not quiet then
+                -- A gate open here that no longer answers went to sleep or away: drop it, and wake it
+                -- if this device holds its wake key.
+                local gone = {}
+                for i = #connections, 1, -1 do
+                    local c = connections[i]
+                    if not seen[c.address] then
+                        forget(c)
+                        log(c.name .. " did not answer the scan; dropped.")
+                        gone[c.address] = true
+                    end
+                end
+                woken = wakeKnown(seen)
+                if woken > 0 then log(("Waking %d gate%s that did not answer."):format(woken, woken == 1 and "" or "s")) end
+            end
+            done()
         end
-        done()
+        finish()
     end))
 end
 clientEnv.scan = scan
@@ -781,19 +819,15 @@ local function fromName() local c = clientEnv.fromGate() return c and c.name or 
 
 -- The address book, searched by name, type or location, and by glyph where addresses are shown.
 local search = ""
--- A gate's address on one line: each glyph's first three letters (a Universe glyph's number).
--- Worked out once per glyph name: OC's string.match and unicode.sub are slow, and the book draws
--- these on every frame.
+-- A glyph in three letters, its first three (a Universe glyph's number), for the tablet's address
+-- line. Worked out once per glyph name: OC's string.match and unicode.sub are slow, and the line
+-- draws on every frame.
 local SHORT = setmetatable({}, {__index = function(t, g)
     local s = tostring(g)
     s = s:match("^Glyph (%d+)$") or unicode.sub(s, 1, 3)
     t[g] = s
     return s
 end})
-local function shortAddress(r)
-    local s = r[r.Type or "MW"]
-    return s and (s:gsub("[^,]+", SHORT):gsub(",", " ")) or "no address"
-end
 local function bookItems()
     local list, want = {}, search:lower()
     for i, r in ipairs(database) do
@@ -922,58 +956,194 @@ if wide then
         end
     end)
 else
-    local gw = ui.gateSize(7)
-    ui.Gate(frame, 1 + (26 - gw) // 2, 1, 7, gateLook, C.page, irisLook)
-    ui.Paint(frame, 1, 15, R.w, 3, function(self)
-        local _, detail, colour = headline()
-        self:fill(1, 1, R.w, 3, C.page)
-        self:text(1, 1, ui.pad(detail, R.w), colour, C.page)
-        chips(self, 1, 2, R.w, 9, 2)
+    -- The tablet, laid out like GDS's: down the left the address book, one line a gate, and under
+    -- it the gates in range (touch one to dial from it); on the right the log, which moves over
+    -- for the gate, drawn in braille, while the dialing gate is doing something; along the bottom
+    -- SCAN, DIAL, DISENGAGE and IRIS.
+    local lw, rx = 25, 28
+    local rw = R.w - rx + 1
+    ui.Field(frame, 1, 1, lw, {placeholder = "⌕ search", changed = function(t) search = t end, around = C.page})
+    first = bookList(1, 2, lw, 9, function(item, _, w)
+        local r = item.r
+        return {{1, ui.pad(tostring(item.i), 3), C.faint}, {4, ui.pad(r.Name, w - 11)}, {w - 6, tostring(r.Type or ""), C.dim},
+            {w - 3, settings.showCodes and #(r.IDCs or {}) > 0 and "IDC" or (r.home and "⌂" or ""), C.amber}}
     end)
-    local rx, rw = 28, R.w - 27
-    ui.card(frame, rx, 1, rw, 4, "FROM", nil, function(self)
-        local c = clientEnv.fromGate()
-        local s = c and c.status
-        if not s then self:text(3, 3, "SCAN looks for gates.", C.faint, C.card) return end
-        self:text(3, 3, GALAXY[galaxyOf(c)] .. " · iris ", C.dim, C.card)
-        local x = 3 + unicode.len(GALAXY[galaxyOf(c)]) + 8
-        self:text(x, 3, tostring(s.iris), s.iris == "CLOSED" and C.red or C.green, C.card)
-        if s.irisProblem then
-            local after = x + unicode.len(tostring(s.iris)) + 1
-            self:text(after, 3, ui.pad(s.irisProblem, rw - after - 1), C.red, C.card)
-        end
-        local text, fraction = energy(s)
-        if fraction then self:bar(3, 4, 8, fraction, C.amber, C.card) end
-        self:text(fraction and 12 or 3, 4, ui.pad(text .. "  " .. fromNote(), rw - (fraction and 13 or 4)), C.text, C.card)
+
+    -- The gates in range; the one dialing is amber.
+    ui.Paint(frame, 1, 11, lw, 1, function(self)
+        self:fill(1, 1, lw, 1, C.head)
+        self:text(1, 1, "▌", C.amber, C.head)
+        self:text(3, 1, "IN RANGE  " .. #connections, C.dim, C.head)
     end)
-    ui.Button(frame, rx + rw - 13, 1, 6, 1, "SSH", function() return isAdmin(clientEnv.fromGate()) and C.blue or C.head end,
+    ui.Button(frame, lw - 10, 11, 5, 1, "SSH", function() return isAdmin(clientEnv.fromGate()) and C.blue or C.head end,
         function() return isAdmin(clientEnv.fromGate()) and C.black or C.faint end, function()
             local c = clientEnv.fromGate()
             if isAdmin(c) then part("admin").console(c) else log("The console needs the admin role.") end
         end, {around = C.head})
-    ui.Button(frame, rx + rw - 6, 1, 6, 1, "SCAN", C.amber, C.black, function() say(scan(false)) end, {around = C.head})
-    first = ui.chooser(frame, rx + 1, 2, rw - 7, fromName, function() cycle(-1) end, function() cycle(1) end)
-    ui.Button(frame, rx + rw - 4, 2, 3, 1, "✕", C.raised, C.red, function()
+    ui.Button(frame, lw - 3, 11, 3, 1, "✕", C.raised, C.red, function()
         local c = clientEnv.fromGate()
         if c then closeConnection(c) end
+    end, {around = C.head})
+    ui.List(frame, 1, 12, lw, 5, {items = connections, empty = "None yet: SCAN looks for gates.",
+        cells = function(c, _, w)
+            local far = away(c, " m") or ""
+            if far == "this computer" then far = "here" end
+            local tag = c.tag == "unregistered" and "unreg" or c.tag or ""
+            return {{1, ui.pad(c.name or "?", w - 14)}, {w - 12, ui.pad(far, 5), C.faint}, {w - 6, ui.pad(tag, 6), tag == "public" and C.dim or C.amber}}
+        end,
+        selected = function(c) return c == clientEnv.fromGate() end,
+        press = function(c) clientEnv.from = c poll(c) end})
+    -- The dialing gate's energy and iris.
+    ui.Paint(frame, 1, 17, lw, 1, function(self)
+        self:fill(1, 1, lw, 1, C.page)
+        local c = clientEnv.fromGate()
+        local s = c and c.status
+        if not s then return end
+        local text, fraction = energy(s)
+        local x = 1
+        if fraction then self:bar(1, 1, 3, fraction, C.amber, C.page) x = 5 end
+        self:text(x, 1, text, C.text, C.page)
+        x = x + unicode.len(text) + 2
+        local shut = s.iris == "CLOSED" or s.irisProblem
+        self:text(x, 1, ui.pad(s.irisProblem and ("iris: " .. s.irisProblem) or ("iris " .. tostring(s.iris):lower()), lw - x + 1), shut and C.red or C.dim, C.page)
     end)
-    ui.card(frame, rx, 6, rw, 8, "TO", bookNote)
-    ui.Field(frame, rx + 1, 7, rw - 11, {placeholder = "⌕ search", changed = function(t) search = t end})
-    ui.Button(frame, rx + rw - 9, 7, 8, 1, "GLYPHS", C.raised, C.text, function() clientEnv.showGlyphs() end)
-    -- With addresses shown, each gate takes two lines: its address goes under its name.
-    bookList(rx, 8, rw, 6, function(item, _, w)
-        local r = item.r
-        local cells = {{1, ui.pad(tostring(item.i), 3), C.faint, 0}, {4, ui.pad(r.Name, w - 13), C.text, 0}, {w - 8, tostring(r.Type or ""), C.dim, 0},
-            {w - 4, settings.showCodes and #(r.IDCs or {}) > 0 and "IDC" or (r.home and "⌂" or ""), C.amber, 0}}
-        if settings.showCodes then cells[#cells + 1] = {2, ui.pad(shortAddress(r), w - 3), C.faint, 1} end
-        return cells
-    end, function() return settings.showCodes and 2 or 1 end)
-    local third = R.w // 3
-    ui.Button(frame, 1, 19, third, 3, dialLabel, C.green, C.black, function()
+
+    -- One touch to claim the gate picked in range when it is unregistered and it is plain which
+    -- network it joins: the profile in use, or the only one, on the gate's port. The gate takes
+    -- that profile's settings (silent, who may use each control) and joins its gates.
+    local function mainProfile(c)
+        if not c or c.registered or c.public then return nil end
+        local p, profiles = clientEnv.profile(), clientEnv.vault.state.profiles or {}
+        if p and p.port == c.port then return p end
+        if #profiles == 1 and profiles[1].port == c.port then return profiles[1] end
+    end
+    -- A gate this device owns or administers and the profile it is in (the one in use, else its
+    -- only one): the gate console commands that give it the profile's settings, when it differs.
+    local SAID = {anyone = "anyone", user = "users", admin = "admins", owner = "owner"}
+    local function profileChanges(c)
+        if not (c and c.allow and isAdmin(c)) then return nil end
+        local entry = clientEnv.findEntry(c.name)
+        local member = entry and entry.Profiles
+        if not member then return nil end
+        local p = clientEnv.profile()
+        if not (p and member[p.name]) then
+            p = nil
+            for _, q in ipairs(clientEnv.vault.state.profiles or {}) do
+                if member[q.name] then
+                    if p then return nil end -- in more than one: which one is the player's to say
+                    p = q
+                end
+            end
+        end
+        if not p then return nil end
+        local lines = {}
+        if (c.silent == true) ~= (p.silent == true) then lines[1] = p.silent and "silent on" or "silent off" end
+        for _, k in ipairs({"dial", "close", "iris"}) do
+            local want = p.allow and p.allow[k] or "user"
+            if (c.allow[k] or "user") ~= want then lines[#lines + 1] = ("allow %s %s"):format(k, SAID[want]) end
+        end
+        if #lines > 0 then return p, lines end
+    end
+    -- One tap for the gate picked in range: SET UP an unregistered one with its profile, or give
+    -- one of this device's gates its profile's settings again. Yellow text on the page, not a
+    -- yellow bar: SCAN and the energy line are yellow right above and below it.
+    local function oneTap(c)
+        local p = mainProfile(c)
+        if p then return ("▸ SET UP %s · %s"):format(c.name, p.name), function() say(part("admin").setup(c, p)) end end
+        local q, lines = profileChanges(c)
+        if q then return ("▸ APPLY %s to %s"):format(q.name, c.name), function() say(part("admin").apply(c, q, lines)) end end
+    end
+    local tap = ui.Button(frame, 1, 18, lw, 1, function()
+        local label = oneTap(clientEnv.fromGate())
+        return ui.pad(label or "", lw - 2)
+    end, C.page, C.amber, function()
+        local _, act = oneTap(clientEnv.fromGate())
+        if act then act() end
+    end, {around = C.page})
+    tap:visible(false)
+    -- Shown and hidden from a blank cell beside it, which is drawn every frame.
+    ui.Paint(frame, lw + 1, 18, 1, 1, function()
+        local want = oneTap(clientEnv.fromGate()) ~= nil
+        if tap:visible() ~= want then tap:visible(want) loom.invalidate() end
+    end)
+
+    -- What is happening, and the destination's address (each glyph's first three letters, amber
+    -- as they engage), with GLYPHS (dial by touching glyphs) at the end of it.
+    ui.Paint(frame, rx, 1, rw, 1, function(self)
+        local _, detail, colour = headline()
+        self:text(1, 1, ui.pad(detail, rw), colour, C.page)
+    end)
+    local aw = rw - 9
+    ui.Paint(frame, rx, 2, aw, 1, function(self)
+        self:fill(1, 1, aw, 1, C.page)
+        local c = clientEnv.fromGate()
+        local s = c and c.status
+        local glyphs = (s and s.target and #s.target > 0 and (s.dialing or s.state == "open")) and s.target or plannedGlyphs(c, row())
+        local state, _, _, engaged = gateLook()
+        for i = 1, math.min(#glyphs, aw // 4) do
+            local on = i <= engaged or state == "open" or state == "iris"
+            local fg = on and C.amber or ((state == "dial" and i == engaged + 1) and C.text or C.faint)
+            self:text((i - 1) * 4 + 1, 1, ui.pad(settings.showCodes and SHORT[glyphs[i]] or "·", 3), fg, C.page)
+        end
+    end)
+    ui.Button(frame, rx + rw - 8, 2, 8, 1, "GLYPHS", C.raised, C.text, function() clientEnv.showGlyphs() end, {around = C.page})
+
+    -- The log, and beside it the gate while the dialing gate dials, has a wormhole open, or its
+    -- iris or shield moves or is shut; a moment after, the log takes the space again. No gate
+    -- shows with none in range.
+    local gateW = ui.brailleSize(15)
+    local gate
+    local lastBusy = -math.huge
+    local function gateShown()
+        local c = clientEnv.fromGate()
+        local s = c and c.status
+        if not s then return false end
+        local now = computer.uptime()
+        if gateLook() ~= "idle" or s.iris == "CLOSED" or s.iris == "CLOSING" or s.iris == "OPENING" then
+            lastBusy = now
+            return true
+        end
+        if now - lastBusy < 3 then loom.invalidate(3 - (now - lastBusy)) return true end
+        gate:idle()
+        return false
+    end
+    ui.Paint(frame, rx, 3, rw, 15, function(self)
+        local shown = gateShown()
+        gate:visible(shown)
+        self:fill(1, 1, rw, 15, C.page)
+        local x = shown and gateW + 3 or 1
+        local w = rw - x + 1
+        -- The newest lines, wrapped (keeping a command result's indent), the newest brightest;
+        -- each line's time beside it while the log has the room.
+        local timed = w >= 30
+        local width = timed and w - 6 or w
+        local a, rows = clientEnv.activity, {}
+        local i = #a
+        while i >= 1 and #rows < 15 do
+            local indent, text = a[i].text:match("^(%s*)(.*)$")
+            local lines = ui.wrap(text, width - #indent)
+            for j = #lines, 1, -1 do
+                table.insert(rows, 1, {j == 1 and a[i].time or "", indent .. lines[j], i == #a and C.text or C.dim})
+            end
+            i = i - 1
+        end
+        while #rows > 15 do table.remove(rows, 1) end
+        for r, line in ipairs(rows) do
+            self:text(x, r, (timed and ui.pad(line[1], 6) or "") .. ui.pad(line[2], width), line[3], C.page)
+        end
+    end)
+    gate = ui.BrailleGate(frame, rx, 4, 15, gateLook, C.page, irisLook)
+    gate:visible(false)
+
+    -- Four buttons the same size.
+    local bw = (R.w - 6) // 4
+    local function at(n) return 1 + (n - 1) * (bw + 2) end
+    ui.Button(frame, at(1), 19, bw, 3, "SCAN", C.amber, C.black, function() say(scan(false)) end, {around = C.page})
+    ui.Button(frame, at(2), 19, bw, 3, dialLabel, C.green, C.black, function()
         say(dialWhenFree(clientEnv.fromGate(), row()))
     end, {around = C.page})
-    ui.Button(frame, third + 2, 19, third - 1, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
-    ui.Button(frame, 2 * third + 2, 19, R.w - 2 * third - 2, 3, "IRIS", C.blue, C.black, function() say(iris(clientEnv.fromGate())) end, {around = C.page})
+    ui.Button(frame, at(3), 19, bw, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
+    ui.Button(frame, at(4), 19, R.w - at(4) + 1, 3, "IRIS", C.blue, C.black, function() say(iris(clientEnv.fromGate())) end, {around = C.page})
 end
 
 -- The first time the client opens, wake the known gates and look for gates straight away.

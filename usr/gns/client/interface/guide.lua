@@ -43,7 +43,7 @@ rn <gate> <name>, del <gate>, swap <a> <b>, mv <gate> <n>
 edit <gate> [MW|PG|UN|idc|loc]  put the command that sets it in the bar, to change
 import ags [path]              add the gates of AGS's address book
 backup, backups, restore <n>   copies of the address book (the newest 10 are kept)
-profile [new <name> <port> | use <name>|all | add|remove <name> <gate>… | delete <name>]  network profiles
+profile [new <name> <port> | use <name>|all | add|remove <name> <gate>… | silent <name> on|off | delete <name>]  network profiles
 trust <name>    accept the new key of a reinstalled gate or device
 find, say <text>, share <gate>… [idc] [@device], block <device>, accept [n], refuse [n]
 grants, invite, join, cut <name>
@@ -57,7 +57,7 @@ Your device has a key pair kept in a password-protected vault with your address 
 #DIAL
 SCAN wakes the gates you hold wake keys for, then finds the gates in range and opens each one; Settings can rescan on its own. FROM is the gate that dials: ◀ ▶ choose among the gates in range, CLOSE drops one. Choose the destination in the address book and press DIAL; energy shows what the dial costs and how long the wormhole can stay open, and the destination keeps it. A gate tells the client nothing until you use it. Over your own open wormhole DIAL closes it and dials (to the gate it is already open to, it leaves it open); while the gate has an incoming wormhole, another dial in progress or a wormhole closing, the dial waits and goes out once the gate is idle (within five minutes).
 The gate dials the shortest address that works, continues glyphs already engaged, closes its iris while the wormhole forms and sends the destination's first IDC once it is open. The stargate on screen follows the real gate: chevrons light as glyphs engage, the wormhole shimmers, a closed iris shows.
-DISENGAGE stops the dial or closes the outgoing wormhole (your own dial; admins any). IRIS opens or closes it (yours, an admin's or a user's with a grant; on a public gate not the public's); the gate's iris mode must be OC, set in the gate's screen, or FROM shows why it cannot. GDO sends your signed pass through the open wormhole to a GNS gate that knows you, or an IDC to any gate; it goes to the gate the wormhole reaches, whoever dialed it, not the gate chosen since. Fast dial (Settings) presses the gate's DHD instead of spinning the ring. Dial time (Settings, set speed) spreads a whole dial over that many seconds; from 25 s the ring spins.
+DISENGAGE stops the dial or closes the outgoing wormhole (your own dial; admins any). IRIS opens or closes it (on a gate someone owns, whoever its owner allows: by default anyone with access); the gate's iris mode must be OC, set in the gate's screen, or FROM shows why it cannot. GDO sends your signed pass through the open wormhole to a GNS gate that knows you, or an IDC to any gate; it goes to the gate the wormhole reaches, whoever dialed it, not the gate chosen since. Fast dial (Settings) presses the gate's DHD instead of spinning the ring. Dial time (Settings, set speed) spreads a whole dial over that many seconds; from 25 s the ring spins.
 Dial-back: dial a gate and type back. Once the wormhole is open, the far gate is told to dial yours, your side closes, and it dials you back, paying for the trip. A route chains this through several gates. Modem messages cross an open wormhole, so the far gate hears you however far it is; its answers reach you within about 10 blocks of your own gate.
 
 #GATES
@@ -69,7 +69,7 @@ FIND looks for GNS devices in range. Messages go to every device found, or to th
 Gates shared with you wait under Shared With You: ACCEPT adds them, REFUSE drops them and BLOCK SENDER ignores that device from then on. Settings lists blocked devices and can take shared gates without asking.
 
 #ACCESS
-A gate belongs to the device that sets it up: SET UP on an unregistered gate in range makes you its owner, your player its OC user (nobody else can type at it), and gives this device its wake key. A registered gate is private: only you and the players you grant can use it (public on, at its console, lets anyone dial it; its iris stays yours and your grant holders').
+A new gate is public: anyone may use it and nobody can claim it. A gate installed from a floppy made with --own is yours from the start; one made with --unregistered is claimed by the first SET UP: that makes you its owner, your player its OC user (nobody else can type at it), and gives this device its wake key. Set up on a silent network profile's port, the gate is silent: it answers only you and the players you grant, and to anyone else it looks like no gate at all. An owned gate is private: only you and the players you grant can use it. At its console, allow sets who may dial, close a wormhole or move the iris (anyone, users, admins or the owner), silent on|off hides it, and owner public gives it to the public.
 INVITE hands players nearby a grant: the role (user, or admin from the owner) and the gates it covers (one, or every gate you own). They choose JOIN. Admins can grant users too. A grant holder's device gets the gates' wake keys, and an admin becomes an OC user of the gate computer.
 CUT OFF ends a grant you issued: each gate it covers learns it when your device next opens that gate. Cutting off an admin also cuts off the users they granted. Grants do not expire.
 An unscheduled incoming wormhole raises the gate's off-world alarm: the iris closes, the gate computer sounds it and drives its alarm redstone. Your signed pass or a known IDC opens the iris and stands it down.
@@ -85,7 +85,9 @@ idc             list IDCs; idc add <code> <name>; idc remove <code>
 kawoosh on|off  close the iris while the wormhole forms
 name <name>     rename the gate (its entry is signed again)
 dim <number>    the dimension in the gate's entry
-public on|off   let anyone dial this gate (not move its iris)
+allow [dial|close|iris] [anyone|users|admins|owner]  who may use each control
+silent on|off   answer only the owner and players with access
+owner public    give the gate to the public (the owner only)
 port <n>        the modem port of this gate's network
 sleep <min>|off shut down when idle; the wake key or the DHD wakes it
 wake new        a new wake key (grant holders get it on their next open)

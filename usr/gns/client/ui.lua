@@ -5,6 +5,7 @@
 -- brackets beside them, and lists move their cursor before letting the focus out.
 local loom = require("loom")
 local gpu = require("loom.gpu")
+local run = require("loom.run")
 local input = require("loom.input")
 local class = require("loom.class")
 local Widget = require("loom.widget.Widget")
@@ -29,8 +30,21 @@ ui.C = C
 ---------------------------------------------------------------------------- layout
 -- compact: 80x25, for tablets and small screens. wide: 160x50, for a computer with a tier-3 GPU
 -- and screen. "auto" picks wide when the hardware allows it and the device is not a tablet.
+-- A tier-2 screen has 16 fixed colours with four greys (black, 0x333333, 0xCCCCCC, white), and
+-- OC shows any other grey as the colour nearest in brightness: blue or brown. So on such a screen
+-- the client's greys are taken to the nearest of the four (grey), the pages' (C) once here.
+local function grey(c)
+    if not ui.fourBit or not c then return c end
+    local v = c & 0xFF
+    if c ~= v * 0x10101 then return c end
+    return v < 0x1A and 0 or v < 0x60 and 0x333333 or v < 0xE6 and 0xCCCCCC or 0xFFFFFF
+end
 function ui.setLayout(choice)
     local g = component.gpu
+    if g.getDepth() == 4 and not ui.fourBit then
+        ui.fourBit = true
+        for k, v in pairs(C) do C[k] = grey(v) end
+    end
     local maxW, maxH = g.maxResolution()
     local wide
     if choice == "wide" then wide = maxW >= 160 and maxH >= 50
@@ -269,7 +283,8 @@ function Field:new(parent, x, y, w, opts)
     opts = opts or {}
     local o = TextInput.new(self, parent, x, y, opts.text or "")
     o:size(w, 1)
-    o:backgroundColor(C.raised)
+    -- On 16 colours the card and raised greys are one grey: a field there is black to show.
+    o:backgroundColor(ui.fourBit and C.page or C.raised)
     o:foregroundColor(C.text)
     if opts.placeholder then o:placeholder(opts.placeholder, C.dim) end
     o:clearOnEnter(opts.clear == true)
@@ -421,12 +436,25 @@ do
         GLYPH_BITS[s] = ((seed >> 9) & (seed >> 17) & 0x1FF) | 0x10
     end
 end
+-- The flat gate's glyph s whose mark is at angle a, distance d from the middle (e = d - Rh), or
+-- nil: one dot wide, across the middle of the glyph track.
+local function glyphMark(e, a, d, k)
+    local r = (e - 2 * k) / (3.5 * k)
+    if r < 0.15 or r >= 0.85 then return nil end
+    local sector = (((a + math.pi / 2) % (2 * math.pi)) / (2 * math.pi) * 39 + 0.5) % 39
+    local s = math.floor(sector)
+    if math.abs(sector - s - 0.5) * 2 * math.pi * d / 39 < 0.5 then return s end
+end
 local SHADES = {0x3C3C3C, 0x4B4B4B, 0x5A5A5A, 0x696969}
 local SHADE_OF = {}
 for i, v in ipairs(SHADES) do SHADE_OF[v] = i end
 local geometries = {}
-local function geometry(Rh)
-    if geometries[Rh] then return geometries[Rh] end
+-- flat: the braille gate's version. A braille cell shows two colours, so glyph symbols a few dots
+-- across, a thin rim and a chevron's housing round its light break up into specks: the ring is
+-- one shade (two on a screen with more greys), each glyph one mark, each chevron a solid wedge.
+local function geometry(Rh, flat)
+    local key = flat and -Rh or Rh
+    if geometries[key] then return geometries[key] end
     local k = Rh / 22
     local R = math.ceil(Rh + 12 * k)
     local w = 2 * R + 3
@@ -434,7 +462,7 @@ local function geometry(Rh)
     local cx, cy, TWO_PI = (w + 1) / 2, (h + 1) / 2, 2 * math.pi
     -- A pixel's byte: 0 the background, 1-4 a ring shade (SHADES), 5 the inside, 6-44 glyph
     -- s + 6, 46-54 chevron p's housing (p + 45), 56-64 its light (p + 55).
-    local G, rows, cells = {Rh = Rh, k = k, w = w, h = h}, {}, {}
+    local G, rows, cells = {Rh = Rh, k = k, w = w, h = h, cx = cx, cy = cy, flat = flat}, {}, {}
     for y = 1, h do
         for x = 1, w do
             local dx, dy = x - cx, y - cy
@@ -443,6 +471,10 @@ local function geometry(Rh)
             local kind, v = 0, false
             if d <= Rh then
                 kind = 1
+            elseif flat and d <= Rh + 10 * k then
+                v = (d > Rh + 1.5 * k and d <= Rh + 6 * k) and 0x4B4B4B or 0x3C3C3C
+                local s = glyphMark(d - Rh, a, d, k)
+                if s then kind, v = 2, s end
             elseif d <= Rh + 1.5 * k then
                 v = 0x3C3C3C
             elseif d <= Rh + 6 * k then
@@ -465,7 +497,7 @@ local function geometry(Rh)
                     local da = (a - math.rad(-90 + (p - 1) * 40) + math.pi) % TWO_PI - math.pi
                     local t = math.abs(da * d)
                     if t <= 1.2 * k + 0.45 * u then
-                        local light = k < 0.5 or (u >= k and u <= 6.8 * k and math.abs(t - 0.35 * u) <= 1.0 * k)
+                        local light = k < 0.5 or flat or (u >= k and u <= 6.8 * k and math.abs(t - 0.35 * u) <= 1.0 * k)
                         kind, v = light and 4 or 3, p
                     end
                 end
@@ -475,7 +507,17 @@ local function geometry(Rh)
         rows[y] = string.char(table.unpack(cells, 1, w))
     end
     G.px = table.concat(rows)
-    geometries[Rh] = G
+    -- The band: the cells (column, row bytes) holding glyph track or chevron light, which move
+    -- while the gate dials (Gate:_overlay).
+    local band, px = {}, G.px
+    local function moves(b) return b == 2 or (b >= 6 and b <= 44) or b >= 56 end
+    for r = 1, h // 2 do
+        for x = 1, w do
+            if moves(px:byte((2 * r - 2) * w + x)) or moves(px:byte((2 * r - 1) * w + x)) then band[#band + 1] = string.char(x, r) end
+        end
+    end
+    G.band = table.concat(band)
+    geometries[key] = G
     return G
 end
 ui.gateSize = function(Rh) local G = geometry(Rh) return G.w, G.h // 2 end
@@ -510,13 +552,14 @@ local function colours(state, lit, theme, bg)
         c[p + 45] = theme.housing[lit[p] and 2 or 1]
         c[p + 55] = theme.light[lit[p] and 2 or 1]
     end
+    for i, v in pairs(c) do c[i] = grey(v) end
     return c
 end
 
 -- The picture: runs of equal cells (fg, bg, column, row, length) grouped by colour, packed.
 local RUN = "<I3I3BBB"
-local function picture(G, state, lit, theme, bg)
-    local c, px, w, list, keys = colours(state, lit, theme, bg), G.px, G.w, {}, {}
+local function picture(G, c)
+    local px, w, list, keys = G.px, G.w, {}, {}
     for r = 1, G.h // 2 do
         local top, bottom = (2 * r - 2) * w, (2 * r - 1) * w
         local x = 1
@@ -550,7 +593,7 @@ local function mix(a, b, f)
     f = f < 0 and 0 or f > 1 and 1 or f
     return channel(a, b, f, 16) | channel(a, b, f, 8) | channel(a, b, f, 0)
 end
-local KAWOOSH, CLOSING, IRIS_TIME, SHIELD_TIME = 0.8, 0.6, 1.5, 0.6
+local KAWOOSH, CLOSING, IRIS_TIME, SHIELD_TIME = 1.0, 0.6, 1.5, 0.6
 -- Blade shades: dark, light, seam.
 -- Greys, because the palette holds those exactly; tinted metal would come out beige or lilac.
 local BLADES = {IRIS_TITANIUM = {0x5A5A5A, 0xB4B4B4, 0x1E1E1E}, IRIS_CREATIVE = {0x5A5A5A, 0xB4B4B4, 0x1E1E1E},
@@ -558,8 +601,9 @@ local BLADES = {IRIS_TITANIUM = {0x5A5A5A, 0xB4B4B4, 0x1E1E1E}, IRIS_CREATIVE = 
 local sin, cos, abs, sqrt, atan, pi = math.sin, math.cos, math.abs, math.sqrt, math.atan, math.pi
 
 -- The event horizon's colour at (x, y) from the middle, r = its distance, edge = the horizon's
--- reach now; s scales any gate size to the 22-pixel one the numbers are tuned for.
-local function water(x, y, r, edge, now, s)
+-- reach now; s scales any gate size to the 22-pixel one the numbers are tuned for. since: seconds
+-- since the wormhole opened, for the ring of water the kawoosh leaves running out and fading.
+local function water(x, y, r, edge, now, s, since)
     x, y, r = x * s, y * s, r * s
     local wx = x + 1.6 * sin(y * 0.31 + now * 0.9)
     local wy = y + 1.6 * sin(x * 0.27 - now * 0.8)
@@ -568,7 +612,78 @@ local function water(x, y, r, edge, now, s)
     local ripple = sin(r * 0.55 - now * 2.2)
     local c = mix(0x1C5FD0, 0x5FB4FF, 0.5 + 0.3 * ripple)
     c = mix(c, 0xE8F8FF, caustic * 0.9)
+    if since and since < 1.2 then c = mix(c, 0xFFFFFF, math.exp(-((r - since * 25) / 1.6) ^ 2) * (1 - since / 1.2)) end
     return mix(c, 0x0A2A6A, (r / (edge * s)) ^ 5)
+end
+
+local function outCubic(f) f = 1 - f return 1 - f * f * f end
+-- The kawoosh: the horizon bursts out past the ring (0.3 s), holds, and pulls back into it by 1 s,
+-- its edge churning. Its colour at (x, y) from the middle (r away), t seconds in; nil past its
+-- edge. far: its reach, k the gate's scale.
+local function burst(x, y, r, t, Rh, far, k)
+    local reach
+    if t < 0.3 then reach = far * outCubic(t / 0.3)
+    elseif t < 0.55 then reach = far
+    else reach = far - (far - Rh) * outCubic(math.min(1, (t - 0.55) / 0.45)) end
+    if r > reach + 2.1 * k then return nil end
+    local a = atan(y, x)
+    reach = reach + k * (1.3 * sin(a * 7 + t * 23) + 0.8 * sin(a * 13 - t * 17))
+    if r > reach then return nil end
+    local ray = 0.5 + 0.5 * sin(a * 11 + r / k * 0.35 - t * 14)
+    local c = mix(0xFFFFFF, 0x8FD0FF, (r / reach) ^ 2 * 0.8 + ray * 0.25)
+    if t > 0.55 then c = mix(c, 0x5FB4FF, (t - 0.55) / 0.45 * 0.7) end
+    return c
+end
+
+-- The colour at (dx, dy) gate pixels from the middle at time now: the horizon and the iris over
+-- it inside the ring, the kawoosh past it; nil where none of them shows.
+local function insideColour(gate, G, dx, dy, now)
+    local Rh = G.Rh
+    local s = 22 / Rh
+    local r = sqrt(dx * dx + dy * dy)
+    local phase, t, closed = gate:_at(now)
+    if r > Rh then
+        -- Past the ring only the kawoosh shows, and not through a shut iris.
+        if phase ~= "kawoosh" or closed > 0 then return nil end
+        return burst(dx, dy, r, t, Rh, Rh + 11 * G.k, G.k) -- its reach: inside the gate's box
+    end
+    local colour
+    -- The horizon.
+    if phase == "kawoosh" then
+        colour = burst(dx, dy, r, t, Rh, Rh + 11 * G.k, G.k) or water(dx, dy, r, Rh, now, s)
+    elseif phase then
+        local edge = phase == "closing" and Rh * (1 - t / CLOSING) or Rh
+        if r < edge then colour = water(dx, dy, r, edge, now, s, phase == "open" and t) end
+    end
+    -- The iris over it.
+    local kind = gate._irisType
+    if closed > 0 and kind == "SHIELD" then
+        local a = atan(dy, dx)
+        local glow = 0.5 + 0.25 * sin(r * s * 0.7 - now * 3) + 0.25 * sin(a * 6 + now * 1.7 + r * s * 0.2)
+        local field = mix(0x1E4BB4, 0xBFE8FF, glow * 0.6 + (r / Rh) ^ 6 * 0.6)
+        return mix(colour or 0x0F0F0F, field, closed * 0.8)
+    elseif closed > 0 and BLADES[kind] then
+        -- A blade covers the point once the opening has shrunk inside it; the blades turn as
+        -- they close, and the seams between them curve like a camera's.
+        if r >= Rh * (1 - closed) then
+            -- Each blade is lit along its leading edge and shades off behind it, with a
+            -- one-pixel seam. A small gate has too few pixels for that: six blades, each one
+            -- flat shade lit from the upper left.
+            local metal, small = BLADES[kind], Rh < 12
+            local n = small and 6 or 16
+            local a = atan(dy, dx)
+            local turns = (a + closed * 1.2 + (r / Rh) * 1.4) / (2 * pi) * n
+            local b = turns % 1
+            if b * 2 * pi * math.max(r, 1) / n < 0.9 then return grey(metal[3]) end
+            if small then
+                local mid = (math.floor(turns) + 0.5) / n * 2 * pi - closed * 1.2 - 0.7
+                return grey(mix(metal[1], metal[2], 0.5 + 0.5 * cos(mid + 2.4)))
+            end
+            local light = 0.5 + 0.5 * cos(a + 2.4)
+            return grey(mix(metal[1], metal[2], 0.15 + 0.5 * (1 - b) + 0.35 * light * r / Rh))
+        end
+    end
+    return colour
 end
 
 local function inside(gate, parent, x, y, G)
@@ -579,58 +694,54 @@ local function inside(gate, parent, x, y, G)
     local w = math.min(G.w, math.ceil(cx + Rh)) - c0 + 1
     local h = math.min(G.h // 2, math.ceil((cy + Rh) / 2)) - r0 + 1
     local px0, py0 = c0 - 1, 2 * r0 - 2 -- local pixel (1, 1) is gate pixel (c0, 2 r0 - 1)
-    local s = 22 / Rh
     local shader = loom.widget.Shader(parent, x + c0 - 1, y + r0 - 1, w, h, function(px, py)
-        local dx, dy = px0 + px - cx, py0 + py - cy
-        local r = sqrt(dx * dx + dy * dy)
-        if r > Rh then return nil end
-        local now = computer.uptime()
-        local phase, t, closed = gate:_at(now)
-        local colour
-        -- The horizon.
-        if phase == "kawoosh" then
-            local u = t / KAWOOSH
-            if r <= Rh * math.min(1, u * 1.6) then
-                colour = mix(0x5FB4FF, 0xFFFFFF, (1 - math.max(0, u - 0.4) / 0.6) * (1 - r / Rh * 0.5))
-            end
-        elseif phase then
-            local edge = phase == "closing" and Rh * (1 - t / CLOSING) or Rh
-            if r < edge then colour = water(dx, dy, r, edge, now, s) end
-        end
-        -- The iris over it.
-        local kind = gate._irisType
-        if closed > 0 and kind == "SHIELD" then
-            local a = atan(dy, dx)
-            local glow = 0.5 + 0.25 * sin(r * s * 0.7 - now * 3) + 0.25 * sin(a * 6 + now * 1.7 + r * s * 0.2)
-            local field = mix(0x1E4BB4, 0xBFE8FF, glow * 0.6 + (r / Rh) ^ 6 * 0.6)
-            return mix(colour or 0x0F0F0F, field, closed * 0.8)
-        elseif closed > 0 and BLADES[kind] then
-            -- A blade covers the point once the opening has shrunk inside it; the blades turn as
-            -- they close, and the seams between them curve like a camera's.
-            if r >= Rh * (1 - closed) then
-                -- Each blade is lit along its leading edge and shades off behind it, with a
-                -- one-pixel seam. A small gate has too few pixels for that: six blades, each one
-                -- flat shade lit from the upper left.
-                local metal, small = BLADES[kind], Rh < 12
-                local n = small and 6 or 16
-                local a = atan(dy, dx)
-                local turns = (a + closed * 1.2 + (r / Rh) * 1.4) / (2 * pi) * n
-                local b = turns % 1
-                if b * 2 * pi * math.max(r, 1) / n < 0.9 then return metal[3] end
-                if small then
-                    local mid = (math.floor(turns) + 0.5) / n * 2 * pi - closed * 1.2 - 0.7
-                    return mix(metal[1], metal[2], 0.5 + 0.5 * cos(mid + 2.4))
-                end
-                local light = 0.5 + 0.5 * cos(a + 2.4)
-                return mix(metal[1], metal[2], 0.15 + 0.5 * (1 - b) + 0.35 * light * r / Rh)
-            end
-        end
-        return colour
+        return insideColour(gate, G, px0 + px - cx, py0 + py - cy, computer.uptime())
     end)
     shader:dither(false)
     shader:visible(false)
     shader.checkCollision = function() return false end
+    -- The kawoosh bursts past the ring: for it the Shader covers the whole gate, else the inside.
+    function shader.whole(on)
+        if on then px0, py0 = 0, 0 shader:x(x) shader:y(y) shader:size(G.w, G.h // 2)
+        else px0, py0 = c0 - 1, 2 * r0 - 2 shader:x(x + c0 - 1) shader:y(y + r0 - 1) shader:size(w, h) end
+    end
     return shader
+end
+
+-- While the gate dials its glyph track turns, the other way round at each chevron, and once the
+-- last chevron locks it comes to rest with the point of origin at the top (a Pegasus gate: a
+-- light runs round its glyphs instead). A chevron flashes white as it locks. Drawn over the still
+-- picture, in the cells G.band, only while some of it moves.
+local TURN, SETTLE, FLASH, TWO_PI = 1.4, 0.6, 0.35, 2 * math.pi
+-- One pixel of the band: geometry byte b at gate pixel (x, y), c the picture's colours.
+local function bandPixel(gate, G, c, b, x, y, now)
+    if b == 2 or (b >= 6 and b <= 44) then
+        if gate._chase then
+            if b == 2 then return c[2] end
+            return b - 6 == gate._chase and gate._glyphOn or gate._glyphOff
+        end
+        local dx, dy, k = x - G.cx, y - G.cy, G.k
+        local d = sqrt(dx * dx + dy * dy)
+        if G.flat then
+            local s = glyphMark(d - G.Rh, atan(dy, dx) - gate._turned, d, k)
+            if s then return s == gate._top and gate._glyphOn or gate._glyphOff end
+            return c[2]
+        end
+        local r = (d - (G.Rh + 2 * k)) / (3.5 * k)
+        if r >= 0 and r < 1 then
+            local sector = (((atan(dy, dx) - gate._turned + pi / 2) % TWO_PI) / TWO_PI * 39 + 0.5) % 39
+            local s = floor(sector)
+            local u = (sector - s - 0.2) / 0.6
+            if u >= 0 and u < 1 and (GLYPH_BITS[s + 1] >> (floor(r * 3) * 3 + floor(u * 3))) & 1 == 1 then
+                return s == gate._top and gate._glyphOn or gate._glyphOff
+            end
+        end
+        return c[2]
+    elseif b >= 56 then
+        local at = gate._litAt[b - 55]
+        if at and now - at < FLASH then return grey(mix(0xFFFFFF, c[b], (now - at) / FLASH)) end
+    end
+    return c[b]
 end
 
 -- look() -> state ("idle", "dial", "open" or "iris"), lit chevrons {[position] = true}, and the
@@ -644,6 +755,7 @@ function Gate:new(parent, x, y, Rh, look, bg, iris)
     o:size(G.w, G.h // 2)
     o._G, o._look, o._bg, o._iris = G, look, bg or C.page, iris
     o._from, o._want, o._irisAt = 0, 0, 0
+    o._litAt, o._dir = {}, 1
     o._inside = inside(o, parent, x, y, G)
     return o
 end
@@ -670,7 +782,7 @@ function Gate:_follow(state)
     local phase, _, closed = self:_at(now)
     local open = state == "open" or state == "iris"
     if self._open == nil then
-        self._phase, self._phaseAt = open and "open" or nil, now
+        self._phase, self._phaseAt = open and "open" or nil, now - 2
     elseif open and not self._open then
         self._phase, self._phaseAt = "kawoosh", now
     elseif not open and self._open then
@@ -692,6 +804,8 @@ function Gate:_follow(state)
     phase, _, closed = self:_at(now)
     if self._phase == "kawoosh" and phase == "open" then self._phase, self._phaseAt = "open", self._phaseAt + KAWOOSH end
     if self._phase == "closing" and phase == nil then self._phase = nil end
+    local whole = self._phase == "kawoosh"
+    if whole ~= self._whole then self._inside.whole(whole) self._whole = whole end
 
     -- Moving: a horizon that shows, an iris on its way, or a shield (it always shimmers). A
     -- move that ends by itself (the kawoosh, the closing horizon, the iris) wakes the gate when
@@ -717,15 +831,74 @@ function Gate:_follow(state)
     if still and still ~= self._still then self._inside:refresh() end
     self._still = still
 end
+-- Moves the glyph track and the chevron flashes on to now; true while any of them moves.
+function Gate:_turn(state, lit, engaged, total, theme, now)
+    local dt = math.min(0.25, now - (self._turnAt or now))
+    self._turnAt = now
+    local litAt, was, moving = self._litAt, self._lit, false
+    for p = 1, 9 do
+        if not lit[p] then litAt[p] = nil
+        elseif was and not was[p] then litAt[p] = now end -- not on first sight
+        if litAt[p] and now - litAt[p] < FLASH then moving = true end
+    end
+    self._lit = lit
+    if state == "dial" and engaged and total and engaged < total then
+        if self._engaged and engaged ~= self._engaged then self._dir = -self._dir end
+        self._engaged = engaged
+        self._spin, self._settle, moving = (self._spin or 0) + self._dir * TURN * dt, nil, true
+    else
+        self._engaged = nil
+        if self._spin and theme == "PG" then self._spin = nil
+        elseif self._spin then
+            if not self._settle then self._settle = {self._spin, floor(self._spin / TWO_PI + 0.5) * TWO_PI, now} end
+            local from, to, at = table.unpack(self._settle)
+            local f = (now - at) / SETTLE
+            if f >= 1 then self._spin, self._settle = nil, nil
+            else self._spin, moving = from + (to - from) * outCubic(f), true end
+        end
+    end
+    local spin = self._spin or 0
+    self._turned = spin
+    self._chase = theme == "PG" and self._spin and floor(spin / TWO_PI * 39) % 39 or nil
+    -- The glyph lit at the top while dialing: the one the turned track has brought there.
+    self._top = state == "dial" and floor((-spin % TWO_PI) / TWO_PI * 39 + 0.5) % 39 or -1
+    return moving
+end
+local function fill(x0, y0, x, r, n, t, b)
+    gpu.setBackground(b)
+    if t == b then gpu.fill(x0 + x, y0 + r, n, 1, " ")
+    else gpu.setForeground(t) gpu.fill(x0 + x, y0 + r, n, 1, "▀") end
+end
+-- Draws the band over the picture, in runs of equal cells along a row.
+function Gate:_overlay(x0, y0, now)
+    local G, c = self._G, self._colours
+    local px, w, band = G.px, G.w, G.band
+    local fx, fr, ft, fb, fn = 0, 0, nil, nil, 0
+    for i = 1, #band, 2 do
+        local x, r = band:byte(i, i + 1)
+        local t = bandPixel(self, G, c, px:byte((2 * r - 2) * w + x), x, 2 * r - 1, now)
+        local b = bandPixel(self, G, c, px:byte((2 * r - 1) * w + x), x, 2 * r, now)
+        if r == fr and x == fx + fn and t == ft and b == fb then fn = fn + 1
+        else
+            if fn > 0 then fill(x0, y0, fx, fr, fn, ft, fb) end
+            fx, fr, ft, fb, fn = x, r, t, b, 1
+        end
+    end
+    if fn > 0 then fill(x0, y0, fx, fr, fn, ft, fb) end
+end
 function Gate:draw()
     if not self:visible() then return end
-    local state, lit, theme = self._look()
+    local part = gpu.part(self) -- a turning ring redraws only the gate
+    local state, lit, theme, engaged, total = self._look()
     self:_follow(state)
     local key = {state, theme or "MW"}
     for p = 1, 9 do key[#key + 1] = lit[p] and "1" or "0" end
     key = table.concat(key, ":")
     if key ~= self._picture then
-        self._runs = picture(self._G, state, lit, theme, self._bg)
+        local T = THEMES[theme] or THEMES.MW
+        self._colours = colours(state, lit, theme, self._bg)
+        self._glyphOff, self._glyphOn = grey(T.glyph), T.light[2]
+        self._runs = picture(self._G, self._colours)
         self._picture = key
     end
     local x0, y0 = self:absX() - 1, self:absY() - 1
@@ -742,10 +915,202 @@ function Gate:draw()
             gpu.fill(x0 + x, y0 + y, n, 1, "▀")
         end
     end
+    local now = computer.uptime()
+    local moving = self:_turn(state, lit, engaged, total, theme, now)
+    if moving or self._spin then self:_overlay(x0, y0, now) end
+    gpu.partEnd(part)
+    -- 5 fps on the gate's own computer, where the gate needs the time.
+    if moving then run.request((package.loaded["gns.here"] or {}).gate and 0.2 or 0.05, self) end
     return true
 end
 function Gate:checkCollision() return false end
 ui.Gate = Gate
+
+---------------------------------------------------------------------------- the stargate in braille
+-- The tablet's gate: the same gate drawn in braille characters, 2 x 4 dots a cell, so the same
+-- cells hold four times the pixels of the half-block gate. A cell shows two colours: of its eight
+-- dots' colours the most common is its background, the one furthest from that its dots, and each
+-- dot takes the nearer of the two. The still picture is worked out once per state; the inside
+-- (horizon, kawoosh, iris) and the turning glyph track are worked out again each frame they move.
+local BIT = {0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80} -- dot (dx, dy) of a cell: BIT[dy * 2 + dx + 1]
+local BRAILLE = {}
+local function brailleChar(bits)
+    local ch = BRAILLE[bits]
+    if not ch then ch = unicode.char(0x2800 + bits) BRAILLE[bits] = ch end
+    return ch
+end
+local function apart(a, b)
+    local dr, dg, db = (a >> 16) - (b >> 16), ((a >> 8) & 0xFF) - ((b >> 8) & 0xFF), (a & 0xFF) - (b & 0xFF)
+    return dr * dr + dg * dg + db * db
+end
+-- One cell from its eight dot colours d: foreground, background and character. The background
+-- is the commonest colour; the dots, the colour with the most of (dots x distance from it), so
+-- a small bright chevron light still shows, and a ring of several greys snapped to the few a
+-- tier-2 screen has stays whole instead of breaking up.
+local seen, count = {}, {}
+local function brailleCell(d)
+    local n = 0
+    for i = 1, 8 do
+        local c, k = d[i], 1
+        while k <= n and seen[k] ~= c do k = k + 1 end
+        if k > n then n, seen[k], count[k] = k, c, 0 end
+        count[k] = count[k] + 1
+    end
+    if n == 1 then return d[1], d[1], " " end
+    local bg, best = seen[1], count[1]
+    for k = 2, n do if count[k] > best then bg, best = seen[k], count[k] end end
+    local fg, most = bg, -1
+    for k = 1, n do
+        local f = count[k] * apart(seen[k], bg)
+        if f > most then fg, most = seen[k], f end
+    end
+    local bits = 0
+    for i = 1, 8 do
+        local c = d[i]
+        if c == fg or (c ~= bg and apart(c, fg) < apart(c, bg)) then bits = bits | BIT[i] end
+    end
+    if bits == 0xFF then return fg, fg, " " end
+    return fg, bg, brailleChar(bits)
+end
+-- The cells of a braille gate: all of them, those holding some of the inside, and those holding
+-- some of the glyph track or a chevron light (string.char(column, row) each).
+local brailles = {}
+local function brailleGeometry(Rh)
+    if brailles[Rh] then return brailles[Rh] end
+    local G = geometry(Rh, true)
+    local B = {G = G, cols = (G.w + 1) // 2, rows = (G.h + 3) // 4}
+    local all, inner, band = {}, {}, {}
+    for r = 1, B.rows do
+        for c = 1, B.cols do
+            local hasInside, hasBand = false, false
+            for i = 0, 7 do
+                local x, y = 2 * c - 1 + i % 2, 4 * r - 3 + i // 2
+                local b = x <= G.w and y <= G.h and G.px:byte((y - 1) * G.w + x) or 0
+                if b == 5 then hasInside = true end
+                if b == 2 or (b >= 6 and b <= 44) or b >= 56 then hasBand = true end
+            end
+            local at = string.char(c, r)
+            all[#all + 1] = at
+            if hasInside then inner[#inner + 1] = at end
+            if hasBand then band[#band + 1] = at end
+        end
+    end
+    B.all, B.inner, B.band = table.concat(all), table.concat(inner), table.concat(band)
+    brailles[Rh] = B
+    return B
+end
+-- A braille gate's size in cells, for Rh (its horizon's radius in dots).
+ui.brailleSize = function(Rh) local B = brailleGeometry(Rh) return B.cols, B.rows end
+
+local dots = {}
+-- Cell (col, row)'s eight dot colours into dots: the picture's colours c, the moving band over
+-- them (band), the inside over both (inner; whole: past the ring too, for the kawoosh).
+local function cellDots(gate, G, c, col, row, now, band, inner, whole)
+    local px, w, h = G.px, G.w, G.h
+    for i = 0, 7 do
+        local x, y = 2 * col - 1 + i % 2, 4 * row - 3 + i // 2
+        local b = x <= w and y <= h and px:byte((y - 1) * w + x) or 0
+        local v
+        if inner and (b == 5 or whole) then v = insideColour(gate, G, x - G.cx, y - G.cy, now) end
+        if not v then v = band and bandPixel(gate, G, c, b, x, y, now) or c[b] end
+        dots[i + 1] = v
+    end
+    return brailleCell(dots)
+end
+-- The still picture: runs of cells with the same colours along a row, packed.
+local CELLS = "<I3I3BBs1"
+local function braillePicture(B, c)
+    local out = {}
+    for r = 1, B.rows do
+        local runFg, runBg, runX, text = nil, nil, nil, {}
+        for col = 1, B.cols + 1 do
+            local fg, bg, ch
+            if col <= B.cols then fg, bg, ch = cellDots(nil, B.G, c, col, r, 0, false, false) end
+            if col > B.cols or fg ~= runFg or bg ~= runBg then
+                if runX then out[#out + 1] = string.pack(CELLS, runFg, runBg, runX, r, table.concat(text)) end
+                runFg, runBg, runX, text = fg, bg, col, {}
+            end
+            text[#text + 1] = ch
+        end
+    end
+    return table.concat(out)
+end
+
+local BrailleGate = class(Widget)
+-- Gate's own following of the wormhole, iris and glyph track; the inside is drawn here, so
+-- what Gate tells its Shader is kept instead.
+BrailleGate._at, BrailleGate._follow, BrailleGate._turn = Gate._at, Gate._follow, Gate._turn
+local KEPT = {visible = function(self, v) self.shown = v end, animated = function(self, v) self.moving = v end,
+    fps = function() end, refresh = function() end, whole = function() end}
+KEPT.__index = KEPT
+-- As ui.Gate (look, bg, iris), Rh the horizon's radius in dots.
+function BrailleGate:new(parent, x, y, Rh, look, bg, iris)
+    local B = brailleGeometry(Rh)
+    local o = self.parent(parent, x, y)
+    setmetatable(o, self)
+    o:size(B.cols, B.rows)
+    o._B, o._G, o._look, o._bg, o._iris = B, B.G, look, bg or C.page, iris
+    o._from, o._want, o._irisAt = 0, 0, 0
+    o._litAt, o._dir = {}, 1
+    o._inside = setmetatable({}, KEPT)
+    return o
+end
+function BrailleGate:draw()
+    if not self:visible() then return end
+    local part = gpu.part(self)
+    local B, G = self._B, self._G
+    local state, lit, theme, engaged, total = self._look()
+    self:_follow(state)
+    local key = {state, theme or "MW"}
+    for p = 1, 9 do key[#key + 1] = lit[p] and "1" or "0" end
+    key = table.concat(key, ":")
+    if key ~= self._picture then
+        local T = THEMES[theme] or THEMES.MW
+        self._colours = colours(state, lit, theme, self._bg)
+        self._glyphOff, self._glyphOn = grey(T.glyph), T.light[2]
+        self._runs = braillePicture(B, self._colours)
+        self._picture = key
+    end
+    local x0, y0 = self:absX() - 1, self:absY() - 1
+    local fg, bg
+    local runs, at = self._runs, 1
+    while at <= #runs do
+        local t, b, x, y, s
+        t, b, x, y, s, at = string.unpack(CELLS, runs, at)
+        if b ~= bg then bg = b gpu.setBackground(b) end
+        if t ~= fg then fg = t gpu.setForeground(t) end
+        gpu.set(x0 + x, y0 + y, s)
+    end
+    local now = computer.uptime()
+    local moving = self:_turn(state, lit, engaged, total, theme, now)
+    local band, inner = moving or self._spin ~= nil, self._inside.shown
+    if band or inner then
+        local cells = self._whole and B.all or ((inner and B.inner or "") .. (band and B.band or ""))
+        local c = self._colours
+        for i = 1, #cells, 2 do
+            local col, row = cells:byte(i, i + 1)
+            local t, b, ch = cellDots(self, G, c, col, row, now, band, inner, self._whole)
+            if b ~= bg then bg = b gpu.setBackground(b) end
+            if t ~= fg then fg = t gpu.setForeground(t) end
+            gpu.set(x0 + col, y0 + row, ch)
+        end
+    end
+    gpu.partEnd(part)
+    -- 10 frames a second; 5 on the gate's own computer, where the gate needs the time.
+    if moving or self._inside.moving then run.request((package.loaded["gns.here"] or {}).gate and 0.2 or 0.1, self) end
+    return true
+end
+-- Seen idle while hidden: so the next wormhole bursts open and the iris is seen closing (Gate
+-- shows neither on first sight).
+function BrailleGate:idle()
+    if self._open ~= nil then return end
+    local kind
+    if self._iris then kind = select(2, self._iris()) end
+    self._open, self._seen, self._from, self._want = false, true, 0, 0
+    self._irisType = (BLADES[kind] or kind == "SHIELD") and kind or nil
+end
+function BrailleGate:checkCollision() return false end
+ui.BrailleGate = BrailleGate
 
 
 ---------------------------------------------------------------------------- modal dialogs
@@ -761,7 +1126,20 @@ end
 -- touches or focus. Returns its frame and close(); content goes in the frame (coordinates
 -- inside it). Focus a widget in it after adding them.
 function ui.modal(root, shell, w, h, title)
-    local frame = Frame(root, math.floor((ui.W - w) / 2) + 1, math.floor((ui.H - h) / 2) + 1)
+    local x, y = math.floor((ui.W - w) / 2) + 1, math.floor((ui.H - h) / 2) + 1
+    -- A black margin and a light outline round it: on a 16-colour screen the card greys are all
+    -- one grey, and the dialog would melt into the cards behind it.
+    local edge = Frame(root, x - 1, y - 1)
+    edge:size(w + 2, h + 2)
+    edge:backgroundColor(C.page)
+    edge:z(999)
+    ui.Paint(edge, 1, 1, w + 2, h + 2, function(self)
+        local line = string.rep("─", w)
+        self:text(1, 1, "┌" .. line .. "┐", C.dim, C.page)
+        for r = 2, h + 1 do self:text(1, r, "│", C.dim, C.page) self:text(w + 2, r, "│", C.dim, C.page) end
+        self:text(1, h + 2, "└" .. line .. "┘", C.dim, C.page)
+    end)
+    local frame = Frame(root, x, y)
     frame:size(w, h)
     frame:backgroundColor(C.card)
     frame:z(1000)
@@ -776,6 +1154,7 @@ function ui.modal(root, shell, w, h, title)
         scope = beforeScope
         if not beforeScope then shell:enabled(true) end
         frame:Destroy(true)
+        edge:Destroy(true)
         if before and before.getParent then ui.focusSoon(before) end
         loom.invalidate()
     end

@@ -31,9 +31,10 @@ local stargate = gns.stargate or component.stargate
 local dhd = gns.dhd or (component.isAvailable("dhd") and component.dhd or nil)
 
 -- settings.lua: the gate's published name and dimension, kawoosh avoidance (on unless false),
--- the IDCs that open the iris ({[code] = name}), port, public, sleep (idle minutes before it
--- shuts down; 0 never), alarm, redstoneWake, room (start in gate room mode) and localOnly (only
--- the client on this computer controls the gate).
+-- the IDCs that open the iris ({[code] = name}), port, allow (who may use each control of an
+-- owned gate: {dial, close, iris}), silent, sleep (idle minutes before it shuts down; 0 never),
+-- alarm, redstoneWake, room (start in gate room mode) and localOnly (only the client on this
+-- computer controls the gate).
 local settingsPath = gns.path.serverDirectory .. "settings.lua"
 local settings = gns.utility.readFile(settingsPath)
 if type(settings) ~= "table" then
@@ -47,27 +48,39 @@ while #settings.name > 32 do settings.name = unicode.sub(settings.name, 1, -2) e
 settings.idcs = type(settings.idcs) == "table" and settings.idcs or {}
 if settings.kawoosh == nil then settings.kawoosh = true end
 if settings.sleep == nil then settings.sleep = 5 end
+-- public on, from before each control had its own setting: anyone may dial.
+if settings.public ~= nil then
+    if settings.public == true then settings.allow = {dial = "anyone"} end
+    settings.public = nil
+end
 -- Returns true, or nil and why (a full disk keeps the old file).
 local function saveSettings()
     return gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))
 end
 
--- owner.lua, from a floppy made with gns floppy --own: {owner, ownerName}. An unregistered gate
--- takes it once, as if that device had set it up, and makes its own wake key (the owner's device
--- gets it the first time it opens the gate).
+-- owner.lua, from an installer floppy (gns floppy): {owner, ownerName, silent} with --own, the
+-- device that made it owning the gate as if it had set it up (the gate makes its own wake key,
+-- which the owner's device gets the first time it opens the gate); {unregistered = true} with
+-- --unregistered, a gate the first client to set it up owns. A gate nobody owns takes it once;
+-- without it, a new gate is public (gate.load).
 local state = gate.load(gns.path.serverDirectory .. "state")
 local ownerPath = gns.path.serverDirectory .. "owner.lua"
 local given = gns.utility.readFile(ownerPath)
-if type(given) == "table" and not state.owner and type(given.owner) == "string" and #given.owner == 22
-    and type(given.ownerName) == "string" and #given.ownerName > 0 then
-    state.owner, state.ownerName, state.wake = given.owner, given.ownerName, handshake.wakeKey()
-    pcall(computer.addUser, given.ownerName)
-    gate.save(state)
+if type(given) == "table" and (state.owner == nil or state.owner == gate.PUBLIC) then
+    if type(given.owner) == "string" and #given.owner == 22 and type(given.ownerName) == "string" and #given.ownerName > 0 then
+        state.owner, state.ownerName, state.wake = given.owner, given.ownerName, handshake.wakeKey()
+        pcall(computer.addUser, given.ownerName)
+        if given.silent == true then settings.silent = true end
+        gate.save(state)
+    elseif given.unregistered == true then
+        state.owner = nil
+        gate.save(state)
+    end
 end
 if given ~= nil then require("filesystem").remove(ownerPath) end
 saveSettings()
 
-local node = gate.start(state, stargate, settings, dhd)
+local node = gate.start(state, stargate, settings, dhd, saveSettings)
 
 -- The console commands (console.lua); admins run the same ones remotely.
 local run = dofile(gns.path.gns .. "console.lua").new(node, settings, saveSettings, dhd, stargate)
@@ -128,8 +141,7 @@ end
 function entry.console(own)
     owned = own
     print(("GNS gate %s"):format(settings.name))
-    print(state.owner and ("Owner %s (%s)%s"):format(tostring(state.ownerName), fingerprint(state.owner), settings.public and ", public" or "")
-        or "Not registered: the first client to set it up becomes its owner.")
+    run("owner", print)
     print("Modem " .. component.modem.address .. ", port " .. (settings.port or handshake.PORT))
     print("Device " .. fingerprint(state.identity.public))
     print("Type help for commands.")

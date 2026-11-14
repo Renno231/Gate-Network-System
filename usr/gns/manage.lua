@@ -28,7 +28,9 @@ if command == "help" or (command and not COMMANDS[command]) then
     print("gns floppy DEST --os  make an installer floppy with QuickOS and GNS (mkinstaller's")
     print("                    --os, --skip, --name, --first, --auto and --label pass through)")
     print("gns floppy ... --gate  only the gate server: no client or loom")
-    print("gns floppy ... --own   gates installed from it are this device's")
+    print("gns floppy ... --own   gates installed from it are this device's (--silent: and silent)")
+    print("gns floppy ... --unregistered  the first client to set a gate up owns it")
+    print("                    (without either, every gate installed from it is public)")
     print("gns help            this list")
     return
 end
@@ -38,7 +40,7 @@ end
 -- packs QuickOS beside it and leaves everything GNS installs (excluded files too) out of the OS.
 if command == "floppy" then
     if not args[2] then
-        io.stderr:write("Usage: gns floppy DEST [--gate] [--own] [--os[=GROUP,...]]\n")
+        io.stderr:write("Usage: gns floppy DEST [--gate] [--own [--silent] | --unregistered] [--os[=GROUP,...]]\n")
         return
     end
     local dest = shell.resolve(args[2])
@@ -70,8 +72,25 @@ if command == "floppy" then
         leaveOut("")
     end
     -- --own: the owner's key and player name ride in server/owner.lua, which a gate takes once.
-    -- No wake key: each gate makes its own.
+    -- No wake key: each gate makes its own. A tablet has no disk drive: in a charger beside a
+    -- computer case with one, the computer boots from the tablet's own drive, and --own takes
+    -- the tablet's key. --unregistered: the first client to set a gate up owns it. Without
+    -- either, a gate installed from the floppy is public.
     local ownerPath = gnsPath .. "server/owner.lua"
+    if options.own and options.unregistered then
+        io.stderr:write("--own and --unregistered: choose one.\n")
+        return
+    end
+    if options.silent and not options.own then
+        io.stderr:write("--silent goes with --own (a gate set up from a tablet takes its network profile's).\n")
+        return
+    end
+    if options.unregistered then
+        local file = assert(io.open(ownerPath, "w"))
+        file:write("return {unregistered = true}")
+        file:close()
+        print("Gates installed from it are unregistered: the first client to set one up owns it.")
+    end
     if options.own then
         local vaultPath = gnsPath .. "client/vault"
         local vault = dofile(gnsPath .. "vault.lua")
@@ -96,9 +115,10 @@ if command == "floppy" then
             return
         end
         local file = assert(io.open(ownerPath, "w"))
-        file:write("return " .. require("serialization").serialize({owner = key, ownerName = player}))
+        file:write("return " .. require("serialization").serialize({owner = key, ownerName = player, silent = options.silent or nil}))
         file:close()
-        print(("Gates installed from it will belong to %s (%s)."):format(player, vault.fingerprint(key)))
+        print(("Gates installed from it will belong to %s (%s)%s."):format(player, vault.fingerprint(key),
+            options.silent and " and be silent" or ""))
     end
     -- An installer floppy also turns gns autorun on at the computer's first boot (usr/gns/autorun-rc.lua).
     local enable

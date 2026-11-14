@@ -160,6 +160,9 @@ end)
 ---------------------------------------------------------------------------- network profiles
 -- A profile is a name, a port and the gates that belong to it (client.lua keeps them in the vault
 -- and listens on their ports). Using one shows only its gates in the address book and on Dial.
+-- A profile also holds the settings its gates get: silent (they answer only their owner and
+-- players with access), and who may dial, close a wormhole and work the iris. A gate this device
+-- sets up on the profile's port takes them; Dial's APPLY gives one set up earlier them again.
 local profiles = clientEnv.vault.state.profiles
 local function profileNamed(name)
     local want = tostring(name or ""):gsub("_", " "):lower()
@@ -191,6 +194,48 @@ local function setMember(p, r, on)
     if next(r.Profiles) == nil then r.Profiles = nil end
     clientEnv.changed()
 end
+-- A gate keeps its settings when the profile changes: Dial offers APPLY when one picked in range
+-- differs from its profile.
+local function setSilent(p, on)
+    p.silent = on or nil
+    clientEnv.changed()
+    return on and ("%s is silent: gates you set up on port %d answer only you and players with access."):format(p.name, p.port)
+        or ("%s is not silent: gates you set up on it answer every scan."):format(p.name)
+end
+-- Who may use each control at a profile's gates: anyone, users (players with access; the
+-- default), admins or the owner.
+local CONTROLS = {dial = "dial", close = "close a wormhole", iris = "work the iris"}
+local LEVEL = {anyone = "anyone", users = "user", admins = "admin", owner = "owner"}
+local SAID = {anyone = "anyone", user = "users", admin = "admins", owner = "owner"}
+local NEXT = {user = "admin", admin = "owner", owner = "anyone", anyone = "user"}
+local function allowed(p, control) return p.allow and p.allow[control] or "user" end
+local function setAllow(p, control, level)
+    p.allow = p.allow or {}
+    p.allow[control] = level ~= "user" and level or nil
+    if not next(p.allow) then p.allow = nil end
+    clientEnv.changed()
+    return ("At %s's gates, %s may %s."):format(p.name, SAID[level], CONTROLS[control])
+end
+-- The settings a profile's gates get, one row each; Enter or a touch changes one.
+local function profileDefaults(p)
+    local w, h = math.min(ui.W - 4, 60), math.min(ui.H - 2, 12)
+    local box, close = ui.modal(clientEnv.root, clientEnv.shell, w, h, "DEFAULTS · " .. p.name)
+    local rows = {{"silent", "Silent"}, {"dial", "Who may dial"}, {"close", "Who may close a wormhole"}, {"iris", "Who may work the iris"}}
+    local list = ui.List(box, 2, 3, w - 2, #rows, {items = rows,
+        cells = function(r)
+            local v = r[1] == "silent" and (p.silent and "on" or "off") or SAID[allowed(p, r[1])]
+            return {{2, ui.pad(r[2], w - 16)}, {w - 12, v, C.amber}}
+        end,
+        press = function(r)
+            if r[1] == "silent" then log(setSilent(p, not p.silent)) else log(setAllow(p, r[1], NEXT[allowed(p, r[1])])) end
+        end})
+    ui.Paint(box, 3, h - 4, w - 4, 2, function(self)
+        local lines = ui.wrap(("Gates you set up on port %d get these. Dial's APPLY gives them to a gate set up before."):format(p.port), w - 4)
+        for i = 1, 2 do self:text(1, i, ui.pad(lines[i] or "", w - 4), C.faint, C.card) end
+    end)
+    ui.Button(box, w - 11, h - 1, 10, 1, "CLOSE", C.raised, C.text, close)
+    ui.focusSoon(list)
+end
 local function deleteProfile(p)
     local _, i = profileNamed(p.name)
     if i then table.remove(profiles, i) end
@@ -218,16 +263,16 @@ local function profileGates(p)
 end
 local function showProfiles()
     if ui.modalOpen() then return end
-    local w, h = math.min(ui.W - 4, 60), math.min(ui.H - 2, 17)
+    local w, h = math.min(ui.W - 4, 66), math.min(ui.H - 2, 17)
     local box, close = ui.modal(clientEnv.root, clientEnv.shell, w, h, "NETWORK PROFILES")
     local list = ui.List(box, 2, 3, w - 2, h - 7, {items = profiles, empty = "No profiles: every gate shows. NEW makes one.",
         selected = function(p) return p.name == settings.profile end,
-        cells = function(p) return {{2, ui.pad(p.name, w - 30)}, {w - 27, "port " .. p.port, C.dim}, {w - 15, members(p) .. " gates", C.dim}} end})
+        cells = function(p) return {{2, ui.pad(p.name, w - 37)}, {w - 34, p.silent and "silent" or "", C.amber}, {w - 26, "port " .. p.port, C.dim}, {w - 14, members(p) .. " gates", C.dim}} end})
     ui.Paint(box, 3, h - 3, w - 4, 1, function(self)
         local p = clientEnv.profile()
         self:text(1, 1, ui.pad(p and ("Showing only " .. p.name .. "'s gates.") or "Showing every gate. USE shows only a profile's.", w - 4), C.faint, C.card)
     end)
-    local bw = (w - 14) // 5
+    local bw = (w - 16) // 6
     local function chosen(fn)
         return function()
             local p = list:cursorItem()
@@ -253,16 +298,17 @@ local function showProfiles()
         clientEnv.ask(("Delete the profile %s? Its gates stay in the address book."):format(p.name), {title = "DELETE"},
             function() log(deleteProfile(p)) end)
     end))
-    ui.Button(box, 11 + 4 * bw, h - 1, bw, 1, "CLOSE", C.raised, C.text, close)
+    ui.Button(box, 11 + 4 * bw, h - 1, bw, 1, "DEFAULTS", C.raised, C.text, chosen(function(p) close() profileDefaults(p) end))
+    ui.Button(box, 13 + 5 * bw, h - 1, bw, 1, "CLOSE", C.raised, C.text, close)
     ui.focusSoon(list)
 end
-local PROFILE_USAGE = "Usage: profile new <name> <port> | use <name>|all | add|remove <name> <gate> ... | delete <name>"
-clientEnv.command("profile", "profile: the network profiles; profile new <name> <port>, use <name>|all, add|remove <name> <gate> ..., delete <name>", function(args)
+local PROFILE_USAGE = "Usage: profile new <name> <port> | use <name>|all | add|remove <name> <gate> ... | silent <name> on|off | allow <name> dial|close|iris anyone|users|admins|owner | delete <name>"
+clientEnv.command("profile", "profile: the network profiles; profile new <name> <port>, use <name>|all, add|remove <name> <gate> ..., silent <name> on|off, allow <name> dial|close|iris anyone|users|admins|owner, delete <name>", function(args)
     local word = (args[1] or ""):lower()
     if word == "" then
         local lines = {}
         for _, p in ipairs(profiles) do
-            lines[#lines + 1] = ("%s%s: port %d, %d gates"):format(p.name, p.name == settings.profile and " (in use)" or "", p.port, members(p))
+            lines[#lines + 1] = ("%s%s: port %d, %d gates%s"):format(p.name, p.name == settings.profile and " (in use)" or "", p.port, members(p), p.silent and ", silent" or "")
         end
         return #lines > 0 and table.concat(lines, "; ") or "No profiles: every gate shows. profile new <name> <port> makes one."
     elseif word == "new" then
@@ -275,6 +321,16 @@ clientEnv.command("profile", "profile: the network profiles; profile new <name> 
     local p = profileNamed(args[2])
     if not p then return PROFILE_USAGE end
     if word == "delete" then return deleteProfile(p) end
+    if word == "silent" then
+        local v = (args[3] or ""):lower()
+        if v ~= "on" and v ~= "off" then return PROFILE_USAGE end
+        return setSilent(p, v == "on")
+    end
+    if word == "allow" then
+        local control, level = (args[3] or ""):lower(), LEVEL[(args[4] or ""):lower()]
+        if not CONTROLS[control] or not level then return PROFILE_USAGE end
+        return setAllow(p, control, level)
+    end
     if word ~= "add" and word ~= "remove" then return PROFILE_USAGE end
     local done = {}
     for i = 3, #args do

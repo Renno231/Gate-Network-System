@@ -761,18 +761,22 @@ local function build()
     shell:size(W, H)
     shell:backgroundColor(C.page)
     clientEnv.root, clientEnv.shell = root, shell
-    local navW = wide and 20 or 15
+    local navW = 20
 
-    -- Top bar: the screen's name; on the right the dialing gate's network and role, and the time.
+    -- Top bar: on a computer the screen's name, on a tablet the screens as tabs (below); on the
+    -- right the dialing gate's network and role, and the time.
     ui.Paint(shell, 1, 1, W, 1, function(self)
         self:fill(1, 1, W, 1, C.side)
-        self:text(2, 1, "◆ GNS", C.amber, C.side)
-        for _, s in ipairs(SCREENS) do if s[1] == clientEnv.screen then self:text(9, 1, s[3], C.dim, C.side) end end
+        self:text(2, 1, wide and "◆ GNS" or "◆", C.amber, C.side)
+        if wide then
+            for _, s in ipairs(SCREENS) do if s[1] == clientEnv.screen then self:text(9, 1, s[3], C.dim, C.side) end end
+        end
         local x = W - 6 - (gns.isRepeating and 10 or 0)
         self:text(x, 1, os.date("%H:%M"), C.dim, C.side)
         local from = clientEnv.fromGate()
-        if from then
+        if from and (wide or not gns.isRepeating) then
             local tag, colour, name = from.tag, from.tag == "public" and C.dim or C.amber, from.name
+            if not wide and tag == "unregistered" then tag = "unreg" end
             x = x - unicode.len(tag) - 4
             self:tag(x, 1, tag, colour, C.side)
             if wide then
@@ -788,41 +792,40 @@ local function build()
         end, {around = C.side})
     end
 
-    -- Side bar: the screens, then this device.
-    ui.Paint(shell, 1, 2, navW, H - 2, function(self) self:fill(1, 1, navW, H - 2, C.side) end)
-    local pitch = wide and 4 or 3
-    for i, s in ipairs(SCREENS) do
-        local y = 3 + (i - 1) * pitch
-        local b = ui.Button(shell, 1, y, navW - 1, 3, "", function()
-            return s[1] == clientEnv.screen and C.head or C.side
-        end, C.dim, function() clientEnv.show(s[1]) end, {around = C.side})
-        b.isNav = true
-        b.draw = function(self)
-            if not self:visible() then return end
-            local here = s[1] == clientEnv.screen
-            local bg = self:focused() and C.hover or (here and C.head or C.side)
-            local gpu = require("loom.gpu")
-            gpu.setBackground(bg)
-            self:_gpufill(self:absX(), y, navW - 1, 3, " ")
-            gpu.setForeground(C.faint)
-            self:_gpuset(3, y + 1, tostring(i))
-            gpu.setForeground((here or self:focused()) and C.text or C.dim)
-            self:_gpuset(6, y + 1, s[2])
-            if s[1] == "chat" and chat.unread > 0 then
-                gpu.setForeground(C.amber)
-                self:_gpuset(6 + unicode.len(s[2]) + 2, y + 1, "●" .. chat.unread)
+    if wide then
+        -- Side bar: the screens, then this device.
+        ui.Paint(shell, 1, 2, navW, H - 2, function(self) self:fill(1, 1, navW, H - 2, C.side) end)
+        local pitch = 4
+        for i, s in ipairs(SCREENS) do
+            local y = 3 + (i - 1) * pitch
+            local b = ui.Button(shell, 1, y, navW - 1, 3, "", function()
+                return s[1] == clientEnv.screen and C.head or C.side
+            end, C.dim, function() clientEnv.show(s[1]) end, {around = C.side})
+            b.draw = function(self)
+                if not self:visible() then return end
+                local here = s[1] == clientEnv.screen
+                local bg = self:focused() and C.hover or (here and C.head or C.side)
+                local gpu = require("loom.gpu")
+                gpu.setBackground(bg)
+                self:_gpufill(self:absX(), y, navW - 1, 3, " ")
+                gpu.setForeground(C.faint)
+                self:_gpuset(3, y + 1, tostring(i))
+                gpu.setForeground((here or self:focused()) and C.text or C.dim)
+                self:_gpuset(6, y + 1, s[2])
+                if s[1] == "chat" and chat.unread > 0 then
+                    gpu.setForeground(C.amber)
+                    self:_gpuset(6 + unicode.len(s[2]) + 2, y + 1, "●" .. chat.unread)
+                end
+                if here then
+                    gpu.setForeground(C.amber)
+                    for r = y, y + 2 do self:_gpuset(1, r, "▌") end
+                end
+                return true
             end
-            if here then
-                gpu.setForeground(C.amber)
-                for r = y, y + 2 do self:_gpuset(1, r, "▌") end
-            end
-            return true
         end
-    end
-    ui.Paint(shell, 1, 1, navW, H - 1, function(self)
-        local open = #clientEnv.gateconnections
-        local dot = open > 0 and C.green or C.faint
-        if wide then
+        ui.Paint(shell, 1, 1, navW, H - 1, function(self)
+            local open = #clientEnv.gateconnections
+            local dot = open > 0 and C.green or C.faint
             local y = H - 11
             self:text(3, y, "THIS DEVICE", C.faint, C.side)
             self:text(3, y + 1, ui.pad(deviceName, navW - 4), C.text, C.side)
@@ -832,11 +835,29 @@ local function build()
             local found = #chat.devices
             self:text(3, y + 5, "●", found > 0 and C.green or C.faint, C.side)
             self:text(5, y + 5, ("%d device%s found"):format(found, found == 1 and "" or "s"), C.dim, C.side)
-        else
-            self:text(2, H - 2, "●", dot, C.side)
-            self:text(4, H - 2, ("%d in range"):format(open), C.dim, C.side)
+        end)
+    else
+        -- On a tablet the screens are tabs along the top bar; the screen shown joins the page.
+        local x = 4
+        for i, s in ipairs(SCREENS) do
+            local tx, w = x, unicode.len(s[2]) + 4
+            local b = ui.Button(shell, tx, 1, w, 1, "", C.side, C.dim, function() clientEnv.show(s[1]) end, {around = C.side})
+            b.draw = function(self)
+                if not self:visible() then return end
+                local here = s[1] == clientEnv.screen
+                local gpu = require("loom.gpu")
+                gpu.setBackground(self:focused() and C.hover or (here and C.page or C.side))
+                self:_gpufill(tx, 1, w, 1, " ")
+                local unread = s[1] == "chat" and chat.unread > 0
+                gpu.setForeground(unread and C.amber or C.faint)
+                self:_gpuset(tx + 1, 1, unread and "●" or tostring(i))
+                gpu.setForeground(here and C.amber or (self:focused() and C.text or C.dim))
+                self:_gpuset(tx + 3, 1, s[2])
+                return true
+            end
+            x = x + w
         end
-    end)
+    end
 
     -- Bottom bar: the command bar, and this device's fingerprint.
     local print = "Device " .. clientVault:fingerprint()
@@ -893,7 +914,7 @@ local function build()
     end
 
     -- Dial, built with every layout; show builds the screen in use.
-    R = {x = navW + 3, y = 3, w = W - navW - (wide and 4 or 3), h = H - 4}
+    R = wide and {x = navW + 3, y = 3, w = W - navW - 4, h = H - 4} or {x = 2, y = 3, w = W - 2, h = H - 4}
     local path = interfacePath .. "dial.lua"
     frames.dial, screenInfo.dial = screenFrame(function(frame)
         return assert(loadfile(path))(gns, clientEnv, path, frame, {w = R.w, h = R.h, wide = wide})

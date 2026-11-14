@@ -4,14 +4,20 @@
 -- the OC users of its computer; never other gates' entries (the address book lives on clients).
 -- See docs/design/networks.md. Every function except open needs a device that has passed open
 -- (handshake.lua: over link the gate keeps what each modem proved), and a role:
---   user   dial, close their own dial, the iris (on a registered gate, only with ownership or
---          a grant: not the public's), status, energy, GDO, signed pass, routes and dial-back
+--   guest  status and energy: a stranger on an owned gate that lets anyone use one of its controls
+--   user   dial, close their own dial, the iris, GDO, signed pass, routes and dial-back
 --   admin  also the console, the gate log, cutting off users, scheduled dials and remote updates
 --          (a gate with an internet card also updates itself from GitHub every 2 hours)
---   owner  also cutting off admins
--- An unregistered gate, or a public one, gives everyone the user role; a registered private
--- gate gives roles only to its owner and to holders of the owner's grants. Anyone may hand a
--- gate a signed route (a relaying gate has no role of its own): the route's signer needs one.
+--   owner  also cutting off admins, and giving the gate to the public
+-- Who owns a gate (state.owner): "public" (PUBLIC), the placeholder a default install puts there so
+-- nobody can claim the gate; nil, an unregistered gate (installed from a floppy made for it),
+-- which the first client to set it up owns; or the owner's key. A public or unregistered gate
+-- gives everyone the user role. An owned gate gives roles to its owner and to holders of the
+-- owner's grants, and settings.allow sets, for each control (dial, close, iris), who may use it:
+-- "owner", "admin", "user" (anyone with a grant, the default) or "anyone". A silent owned gate
+-- (settings.silent) answers only its owner and grant holders: no scan answer, no refusal.
+-- Anyone may hand a gate a signed route (a relaying gate has no role of its own): the route's
+-- signer needs one.
 local api = require("api")
 local component = require("component")
 local computer = require("computer")
@@ -30,7 +36,14 @@ local replace = dofile("/usr/gns/vault.lua").replace
 
 local gate = {}
 
-local TYPE, RANK = dialing.TYPE, grants.RANK
+local TYPE = dialing.TYPE
+local RANK = setmetatable({guest = 0}, {__index = grants.RANK})
+-- The owner a default install gives a gate: it holds the place, so the gate is public and nobody claims it.
+local PUBLIC = "public"
+gate.PUBLIC = PUBLIC
+-- What each control is called in a refusal, and who an allow level names.
+local CONTROL = {dial = "dialing", close = "closing a wormhole", iris = "the iris"}
+local WHO = {owner = "the owner", admin = "the owner and admins", user = "players with access"}
 local ROUTE_WAIT = 60 -- seconds a route waits for the gate to be free, and for its wormhole to open
 -- JSG leaves some states for idle with no signal. A Milky Way DHD press locks its chevron in 10
 -- to 29 ticks (StargateMilkyWayBaseTile): the gate looks again once it should have. "failing" (a
@@ -67,7 +80,7 @@ function gate.load(path)
     if file then file:close() end
     if type(state) ~= "table" or type(state.identity) ~= "table" then
         local private, public = ecc.keypair()
-        state = {identity = {private = tostring(private), public = tostring(public)}, seq = 0}
+        state = {identity = {private = tostring(private), public = tostring(public)}, seq = 0, owner = PUBLIC}
     end
     if state.book then -- a state from before owners and grants: only the key pair and entry carry over
         state.entry = state.book[state.identity.public]
@@ -116,10 +129,11 @@ end
 
 -- Starts the gate. stargate is the JSG stargate component (or a stand-in with the same
 -- methods); dhd is the DHD component or nil; settings = {name, dim, port, kawoosh, idcs,
--- public, sleep, alarm, redstoneWake}, read live. Returns a node with the endpoint, the state,
+-- allow, silent, sleep, alarm, redstoneWake}, read live, and saveSettings() keeps them. Returns a node with the endpoint, the state,
 -- the dialer, applyWake() and stop(). node.console(line, out), when set (server.lua), runs a
 -- console command for an admin's console call.
-function gate.start(state, stargate, settings, dhd)
+function gate.start(state, stargate, settings, dhd, saveSettings)
+    saveSettings = saveSettings or function() return true end
     -- The gate's endpoint, the connections it accepts and those it makes. Detached: the gate runs
     -- on after the gns command that started it ends; node.stop closes it.
     local bucket = require("tnet").bucket("gns.gate"):detach()
@@ -228,6 +242,26 @@ function gate.start(state, stargate, settings, dhd)
         return out
     end
     local function who(session) return session.name or "a public user" end
+    -- An owned gate: one with an owner's key, not public and not unregistered.
+    local function owned() return state.owner ~= nil and state.owner ~= PUBLIC end
+    local function silent() return settings.silent == true and owned() end
+    -- The level a control needs (settings.allow); public and unregistered gates let everyone use each.
+    local function needs(control)
+        local level = owned() and type(settings.allow) == "table" and settings.allow[control]
+        return (level == "anyone" or WHO[level]) and level or "user"
+    end
+    -- The role a device with no ownership or grant gets: on a public or unregistered gate the
+    -- user role; on an owned one the guest role while it lets anyone use a control; else none.
+    local function strangerRole()
+        if not owned() then return "user" end
+        for control in pairs(CONTROL) do if needs(control) == "anyone" then return "guest" end end
+    end
+    -- Whether session may use control; else an error saying who may.
+    local function may(session, control)
+        local need = needs(control)
+        if need == "anyone" or RANK[session.role or "guest"] >= RANK[need] then return end
+        error(("%s is for %s here"):format(CONTROL[control], WHO[need]), 0)
+    end
     local function addressText(address)
         local own = TYPE[dialer.gateType()] or "MW"
         local glyphs = type(address) == "table" and (address[own] or address.MW or address.PG or address.UN) or {}
@@ -266,7 +300,7 @@ function gate.start(state, stargate, settings, dhd)
     -- connection made with it wakes the gate too), and with a redstone card a wake threshold, so
     -- the DHD's signal on an incoming wormhole starts the computer.
     local function applyWake()
-        if state.wake then pcall(modem.setWakeMessage, state.wake, true) end
+        pcall(modem.setWakeMessage, state.wake, true) -- nil (a public gate): no message wakes it
         if component.isAvailable("redstone") then
             local threshold = settings.redstoneWake == false and 0 or math.tointeger(settings.redstoneWake) or 1
             pcall(component.redstone.setWakeThreshold, threshold)
@@ -406,7 +440,7 @@ function gate.start(state, stargate, settings, dhd)
     -- s, need: as dialer.status's.
     local function status(s, need)
         s = dialer.status(s, need)
-        s.name, s.registered, s.public, s.alarm = settings.name, state.owner ~= nil, settings.public == true, alarm
+        s.name, s.registered, s.public, s.alarm = settings.name, state.owner ~= nil, state.owner == PUBLIC, alarm
         s.handDialed = state.handDialed
         s.seq = state.entry and state.entry.seq -- clients take a newer signed entry (a rename) when it changes
         return s
@@ -415,9 +449,9 @@ function gate.start(state, stargate, settings, dhd)
     -- The role key has here, its player name when the role comes from ownership or a grant (nil
     -- for the public's user role), and the grant; or nil and the reason.
     local function roleFor(key, list)
-        if state.owner and key == state.owner then return "owner", state.ownerName end
+        if owned() and key == state.owner then return "owner", state.ownerName end
         local reason = "private gate"
-        if state.owner and type(list) == "table" then
+        if owned() and type(list) == "table" then
             -- A real list passes at its first good grant (one or two signatures; a cut-off grant
             -- costs none), so three signature checks a call bound what forged grants cost.
             local budget = {n = 3}
@@ -427,7 +461,8 @@ function gate.start(state, stargate, settings, dhd)
                 reason = why
             end
         end
-        if not state.owner or settings.public then return "user" end
+        local role = strangerRole()
+        if role then return role end
         return nil, reason
     end
 
@@ -463,6 +498,13 @@ function gate.start(state, stargate, settings, dhd)
                     error("this gate takes commands only from its own computer", 0)
                 end
             end
+            -- The gate changed hands (set up, or given to the public): the role comes again from the new owner.
+            if session.ownerAt ~= state.owner then
+                session.role, session.name, session.grant = roleFor(session.key, session.grant and {session.grant})
+                session.refused = not session.role and session.name or nil
+                if not session.role then session.name = nil end
+                session.ownerAt, session.cutSeq = state.owner, state.cutSeq
+            end
             if session.grant and session.cutSeq ~= state.cutSeq then
                 local role, why = grants.check(session.grant, state.owner, identity.public, session.key, state.cut)
                 if not role then
@@ -471,9 +513,10 @@ function gate.start(state, stargate, settings, dhd)
                     session.cutSeq = state.cutSeq
                 end
             end
-            -- The public's user role ends once the gate is registered or made private.
-            if session.role and not session.name and state.owner and not settings.public then
-                session.role, session.refused = nil, "private gate"
+            -- A stranger's role follows the gate's settings: it ends once no control is anyone's.
+            if not session.name then
+                session.role = strangerRole()
+                session.refused = not session.role and (session.refused or "private gate") or nil
             end
             if minRole then
                 if not session.role then error(session.refused or "private gate", 0) end
@@ -794,17 +837,24 @@ function gate.start(state, stargate, settings, dhd)
             end
             local role, name, g = roleFor(request.key, request.grants)
             local session = {key = request.key, role = role, name = name, grant = g, cutSeq = state.cutSeq,
-                refused = not role and name or nil}
+                refused = not role and name or nil, ownerAt = state.owner}
+            -- A silent gate answers a modem it restarted without (call open first) only if its
+            -- last open was the owner's or a grant holder's.
+            if caller and proofs[conn.address] then proofs[conn.address].ok = role ~= nil and name ~= nil end
             if caller then
                 if full(devices, conn.address) then devices = {} end -- each opens again on "call open first"
                 devices[conn.address] = session
             else
                 sessions[conn] = session
             end
-            reply.role, reply.owner, reply.registered = role, state.owner, state.owner ~= nil
+            reply.role, reply.registered, reply.public = role, state.owner ~= nil, state.owner == PUBLIC
+            reply.owner, reply.silent = owned() and state.owner or nil, silent() or nil
             if role then
                 reply.status, reply.entry = current(), state.entry
                 if name then reply.wake = state.wake end
+                -- Who may use each control, for the owner's and admins' devices: theirs compare it
+                -- with their network profile's ({} when every control is at its default).
+                if name and RANK[role] >= RANK.admin then reply.allow = owned() and type(settings.allow) == "table" and settings.allow or {} end
                 if role == "admin" then addAdmin(name, g.serial) end
                 if role == "owner" and not isUser(name) then pcall(computer.addUser, name) end
             else
@@ -815,7 +865,8 @@ function gate.start(state, stargate, settings, dhd)
             return reply
         end, "Proves both sides' keys; returns the caller's role (from ownership, a grant or a public gate), the gate's status and entry"},
 
-        register = {opened("user", function(session, player, wake)
+        register = {opened("user", function(session, player, wake, opts)
+            if state.owner == PUBLIC then error("this gate is public: nobody can claim it", 0) end
             if state.owner then error("this gate already has an owner", 0) end
             if type(player) ~= "string" or #player == 0 or #player > 32 then error("bad player name", 0) end
             if type(wake) ~= "string" or #wake < 8 or #wake > 64 then error("bad wake key", 0) end
@@ -823,14 +874,34 @@ function gate.start(state, stargate, settings, dhd)
             pcall(computer.addUser, player)
             applyWake()
             save()
-            session.role, session.name = "owner", player
-            record(player .. " registered the gate as its owner")
+            session.role, session.name, session.ownerAt = "owner", player, state.owner
+            -- The network's settings the owner's device brings (its network profile's): silent, and
+            -- who may use each control.
+            if type(opts) == "table" then
+                if opts.silent == true then settings.silent = true end
+                if type(opts.allow) == "table" then
+                    local allow = {}
+                    for control in pairs(CONTROL) do
+                        local level = opts.allow[control]
+                        if level == "anyone" or level == "admin" or level == "owner" then allow[control] = level end
+                    end
+                    settings.allow = next(allow) and allow or nil
+                end
+                if settings.silent or settings.allow then saveSettings() end
+            end
+            record(player .. " registered the gate as its owner" .. (settings.silent and "; it is silent" or ""))
             return true
-        end), "Makes the caller the owner of an unregistered gate: player becomes its OC user, wake its wake key"},
+        end), "Makes the caller the owner of an unregistered gate: player becomes its OC user, wake its wake key; opts {silent, allow}"},
 
-        status = {opened("user", function() return current() end, true, true), "The gate's name, type, state, iris, energy, TPS and last dial"},
+        release = {opened("owner", function(session)
+            node.release(who(session))
+            return true
+        end), "The owner gives the gate to the public: nobody owns it or can claim it, and everyone may use it"},
 
-        dial = {opened("user", function(session, address, opts)
+        status = {opened("guest", function() return current() end, true, true), "The gate's name, type, state, iris, energy, TPS and last dial"},
+
+        dial = {opened("guest", function(session, address, opts)
+            may(session, "dial")
             opts = type(opts) == "table" and opts or {}
             -- Dialing over an open outgoing wormhole closes it: the same rule as closeWormhole.
             local gateState, outgoing = "dialing", nil -- dialer.dial answers its own dial with no call
@@ -883,11 +954,12 @@ function gate.start(state, stargate, settings, dhd)
             return result
         end), "Dials an address {MW = {...}, PG = {...}, UN = {...}}; opts {fast, idc, speed, wait (from idle only), closeAfter (seconds open)}. Returns the glyph count, cost and duration"},
 
-        energy = {opened("user", function(_, address)
+        energy = {opened("guest", function(_, address)
             return dialer.cost(address)
         end, true, true), "What dialing an address would cost and how long the wormhole could stay open"},
 
-        closeWormhole = {opened("user", function(session)
+        closeWormhole = {opened("guest", function(session)
+            may(session, "close")
             if RANK[session.role] < RANK.admin and not ownDial(session) then
                 error("only who dialed, or an admin, can close it", 0)
             end
@@ -903,19 +975,20 @@ function gate.start(state, stargate, settings, dhd)
             return dialer.close()
         end), "Stops a dial in progress or closes the outgoing wormhole (users: their own dial)"},
 
-        sendIdc = {opened("user", function(session, code)
+        sendIdc = {opened("guest", function(session, code)
+            may(session, "dial")
             code = math.tointeger(tonumber(code))
             if not code or code < 0 then error("bad IDC", 0) end
             record(who(session) .. " sent an IDC through the wormhole")
             return dialer.sendCode(code)
         end), "The GDO: sends a numeric IDC through the open outgoing wormhole"},
 
-        challenge = {opened("user", function(session)
+        challenge = {opened("guest", function(session)
             session.challenge = tostring(ecc.random.random()):sub(1, 16)
             return session.challenge
         end, false, true), "A fresh challenge for a signed pass"},
 
-        pass = {opened("user", function(session, sig)
+        pass = {opened("guest", function(session, sig)
             if not session.name then error("passes are for the owner and grant holders", 0) end
             local challenge = session.challenge
             session.challenge = nil
@@ -932,10 +1005,10 @@ function gate.start(state, stargate, settings, dhd)
             return dialer.admit(session.name)
         end, false, true), "A signed pass for the incoming wormhole: opens the iris for the owner or a grant holder"},
 
-        -- The iris: anyone who may dial an unregistered gate; on a registered one the owner and
-        -- grant holders, not the public a public gate lets dial (they send an IDC instead).
-        iris = {opened("user", function(session, want)
-            if state.owner and not session.name then error("the iris needs a grant here", 0) end
+        -- The iris: everyone on a public or unregistered gate; on an owned one whom settings.allow.iris
+        -- names (by default the owner and grant holders, not strangers: they send an IDC instead).
+        iris = {opened("guest", function(session, want)
+            may(session, "iris")
             local target = ({open = "OPENED", close = "CLOSED"})[want]
             if want ~= nil and not target then error("open or close", 0) end
             local now, before = dialer.iris(target)
@@ -954,6 +1027,7 @@ function gate.start(state, stargate, settings, dhd)
             if r.hops[at].gate and r.hops[at].gate ~= identity.public then error("not the next gate", 0) end
             local role, name = roleFor(r.key, r.grants)
             if not role then error("the route's signer has no access here", 0) end
+            may({role = role}, "dial")
             if recent[r.id .. at] then return "already queued" end
             -- Anyone may sign a route for a public gate, with up to an hour's delay: the public
             -- shares 8 places, so it never crowds out the owner's and grant holders' routes.
@@ -1004,7 +1078,7 @@ function gate.start(state, stargate, settings, dhd)
             if type(line) ~= "string" or #line > 256 then error("bad command line", 0) end
             note("console " .. tostring(session.name or "?") .. ": " .. line)
             local lines = {}
-            node.console(line, function(text) lines[#lines + 1] = tostring(text) end)
+            node.console(line, function(text) lines[#lines + 1] = tostring(text) end, session.role)
             return lines
         end), "Runs a gate console command (admin); returns its output lines"},
 
@@ -1096,6 +1170,12 @@ function gate.start(state, stargate, settings, dhd)
                 caller = nil
             end
             done = {at = now, ok = result[1], text = link.pack(table.unpack(result, 2, result.n))}
+            -- A silent gate answers only a device whose open made it the owner or a grant holder (or,
+            -- after a restart, whose last open did): to anyone else it sends nothing at all.
+            if silent() then
+                local s = devices[from]
+                done.quiet = not (s and s.role and s.name) and not (not s and proofs[from] and proofs[from].ok)
+            end
             for k, d in pairs(answered) do if now - d.at > link.KEEP then answered[k] = nil end end
             if method ~= "hello" then answered[key] = done end
             -- Only a device using the gate is sent its changes: a scan's hello and open, a cost
@@ -1110,6 +1190,7 @@ function gate.start(state, stargate, settings, dhd)
             end
             if next(watchers) then changed() end -- the call may have changed what the gate shows
         end
+        if done.quiet then return end
         if not pcall(link.send, to, from, p, link.REPLY, id, done.ok, done.text) then
             pcall(link.send, to, from, p, link.REPLY, id, false, link.pack("the answer is too big for a modem message"))
         end
@@ -1188,6 +1269,24 @@ function gate.start(state, stargate, settings, dhd)
 
     -- Signs the gate's entry again after its name or dimension changed.
     function node.publish() return publish(state, stargate, settings) end
+
+    -- The owner gives the gate to the public (by: who, for the gate log): it has no owner key,
+    -- admins or grants any more, nobody can claim it, everyone may use it and it answers every
+    -- scan. Its computer has no OC users (anyone may type at it), and it no longer sleeps, since
+    -- only the owner's and grant holders' devices held its wake key.
+    function node.release(by)
+        if not owned() then error("only an owned gate can be given to the public", 0) end
+        for name in pairs(state.admins) do pcall(computer.removeUser, name) end
+        if state.ownerName then pcall(computer.removeUser, state.ownerName) end
+        state.owner, state.ownerName, state.wake, state.admins = PUBLIC, nil, nil, {}
+        state.cut, state.cutSeq = {}, state.cutSeq + 1
+        dropStale()
+        settings.allow, settings.silent = nil, nil
+        saveSettings()
+        applyWake()
+        save()
+        record(tostring(by) .. " gave the gate to the public")
+    end
 
     -- A new wake key: holders who have not opened the gate since can no longer wake it.
     function node.newWake()

@@ -75,7 +75,15 @@ local function issuers()
 end
 
 ---------------------------------------------------------------------------- actions
+-- The newest log line when SET UP, INVITE or JOIN was last pressed: lines after it are that
+-- action's answer, shown on the ACCESS card.
+local noteAfter
+local function pressed()
+    local a = clientEnv.activity
+    noteAfter = a[#a] or false
+end
 local function setUp()
+    pressed()
     clientEnv.runCommands("setup")
 end
 
@@ -91,7 +99,7 @@ local function accept(as, request, role, scope)
     for _, key in ipairs(as.gates) do
         local a = vaultState.access[key]
         if a and (gateKey == "" or key == gateKey) then
-            gates[key] = {name = a.name, modem = a.modem, port = a.port, wake = a.wake}
+            gates[key] = {name = a.name, modem = a.modem, port = a.port, wake = a.wake, silent = a.silent}
         end
     end
     vaultState.issued[#vaultState.issued + 1] = {grant = g, cut = false}
@@ -157,6 +165,7 @@ local function startInvite(issuer)
     log(("Inviting as %s. Players choose JOIN on their device."):format(issuer.label))
 end
 local function toggleInvite()
+    pressed()
     if host then
         stopInvite()
         log("Invitation closed.")
@@ -189,6 +198,7 @@ local function keep(offer, role)
             a.name, a.modem, a.owner, a.role = tostring(info.name or a.name), info.modem or a.modem, g.owner, role
             a.port = math.tointeger(info.port) or a.port
             a.wake = type(info.wake) == "string" and info.wake or a.wake
+            a.silent = info.silent == true or nil
             vaultState.access[key] = a
         end
     end
@@ -196,6 +206,7 @@ local function keep(offer, role)
 end
 local joining, closed = false, false
 local function join()
+    pressed()
     if joining then log("Still waiting for an answer.") return end
     local function ask(name)
         if not name or not name:match("%S") then return end
@@ -238,14 +249,29 @@ function M.build(frame, R)
             if a.role == "owner" then owned = owned + 1 elseif a.role == "admin" then admin = admin + 1 end
         end
         self:text(3, 2, ui.pad(("You: %s · %s"):format(tostring(clientEnv.player or "player unknown"), short(identity.public)), R.w - 4), C.amber, C.card)
-        local line = ("%d gates owned, admin at %d, %d grants held, %d issued"):format(owned, admin, #vaultState.grants, #vaultState.issued)
+        local line = ("%d %s owned, admin at %d, %d grants held, %d issued"):format(owned, owned == 1 and "gate" or "gates", admin, #vaultState.grants, #vaultState.issued)
         if host then line = line .. (" · inviting as %s, %d waiting"):format(as.label, #queue) end
         self:text(3, 3, ui.pad(line, R.w - 4), C.faint, C.card)
+        -- What SET UP would do to the gate picked on Dial, or the answer to the last button.
+        local a = clientEnv.activity
+        local note, colour = nil, C.text
+        if noteAfter ~= nil and a[#a] ~= noteAfter then
+            note = a[#a].text
+        else
+            local c = clientEnv.fromGate()
+            colour = C.dim
+            if not c then note = "SET UP: pick a gate in range on Dial first."
+            elseif c.public then note = ("SET UP: %s is public; nobody can claim it."):format(c.name)
+            elseif c.registered then note = ("SET UP: %s already has an owner."):format(c.name)
+            else note, colour = ("SET UP makes %s yours (the gate picked on Dial)."):format(c.name), C.amber end
+        end
+        local lines = ui.wrap(note, R.w - 4)
+        for i = 1, 2 do self:text(3, 3 + i, ui.pad(lines[i] or "", R.w - 4), colour, C.card) end
     end
 
     local inviteLabel = function() return host and "STOP" or "INVITE" end
     local inviteColour = function() return host and C.red or C.green end
-    ui.card(frame, 1, 1, R.w, 4, "ACCESS", nil, header)
+    ui.card(frame, 1, 1, R.w, 6, "ACCESS", nil, header)
     local bx = R.w - (wide and 54 or 44)
     local first = ui.Button(frame, bx, 2, wide and 12 or 9, 1, "SET UP", C.amber, C.black, setUp)
     ui.Button(frame, bx + (wide and 14 or 11), 2, wide and 12 or 9, 1, inviteLabel, inviteColour, C.black, toggleInvite)
@@ -266,7 +292,7 @@ function M.build(frame, R)
         return {{2, ui.pad(g.name, 16)}, {19, ui.pad(scopeOf(g), w - 30)}, {w - 9, "[" .. role .. "]", ROLE_COLOUR[role]}}
     end
     local issuedList
-    local ly, lh = 6, R.h - 7
+    local ly, lh = 8, R.h - 9
     if wide then
         local w3 = (R.w - 4) // 3
         ui.card(frame, 1, ly, w3, lh, "GATES", function() return #gateRows() .. "" end)

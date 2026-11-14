@@ -38,9 +38,13 @@ local function console(connection)
     local lines = {"Remote console of " .. connection.name .. ". Type help for its commands, exit to close."}
     local list = ui.List(box, 2, 3, w - 2, h - 5, {items = lines, scrollOnly = true,
         cells = function(item) return {{1, item, item:sub(1, 6) == "gate> " and C.amber or C.text}} end})
+    -- Each line wrapped to the dialog (a tablet's 80 columns cut the gate's status lines off),
+    -- the rest of a line indented.
     local function out(text)
-        lines[#lines + 1] = text
-        if #lines > 300 then table.remove(lines, 1) end
+        text = tostring(text)
+        local parts = require("unicode").len(text) > w - 5 and ui.wrap(text, w - 7) or {text} -- short lines keep their columns
+        for i, line in ipairs(parts) do lines[#lines + 1] = (i > 1 and "  " or "") .. line end
+        while #lines > 300 do table.remove(lines, 1) end
         list._scroll = math.huge
     end
     local field = ui.Field(box, 3, h - 1, w - 16, {clear = true, placeholder = "gate> command", submit = function(text)
@@ -83,21 +87,64 @@ end
 
 -- Registers an unregistered gate to this device: its key becomes the owner, the player its OC
 -- user, and a new wake key starts it from now on.
-local function setup(c)
+-- into: the network profile to set it up on (Dial's one-tap SET UP); the gate also joins its gates.
+local function setup(c, into)
     if not c then return "No gate in range." end
+    if c.public then return c.name .. " is public: nobody can claim it." end
     if c.registered then return c.name .. " already has an owner." end
+    -- The network profile the gate is on (the one in use, else one on its port): a silent one
+    -- makes the gate silent.
+    local profile = into or clientEnv.profile()
+    if not (profile and profile.port == c.port) then
+        profile = nil
+        for _, p in ipairs(clientEnv.vault.state.profiles) do if p.port == c.port then profile = p break end end
+    end
+    local silent = profile and profile.silent or nil
+    local allow = profile and profile.allow or nil
     local player = clientEnv.player
     if not player then return "Press a key on this device first, so OC names the player." end
     local wake = handshake.wakeKey()
     c.proxy:async(guard(function(ok, result)
         if ok ~= true then log(c.name .. ": not set up: " .. tostring(result)) return end
-        c.role, c.registered, c.owner, c.tag = "owner", true, identity.public, "owner"
+        c.role, c.registered, c.owner, c.tag, c.silent = "owner", true, identity.public, "owner", silent
+        c.allow = {}
+        for k, v in pairs(allow or {}) do c.allow[k] = v end
         remember(c, wake)
+        local entry = into and clientEnv.findEntry(c.name)
+        if entry then
+            entry.Profiles = entry.Profiles or {}
+            entry.Profiles[into.name] = true
+        end
         local saved, err = clientEnv.vault:save()
         if not saved then log("Vault not saved: " .. tostring(err)) end
-        log(("%s is yours: %s is its OC user, and this device holds its wake key."):format(c.name, player))
-    end)).register(player, wake)
+        log(("%s is yours: %s is its OC user, and this device holds its wake key.%s%s"):format(c.name, player,
+            silent and " It is silent: it answers only you and players with access." or "",
+            entry and (" It is in " .. into.name .. ".") or ""))
+    end)).register(player, wake, {silent = silent, allow = allow})
     return ("Setting up %s for %s..."):format(c.name, player)
+end
+
+-- Brings a gate (one this device owns or administers) in line with its network profile p:
+-- lines are the gate console commands that differ (dial.lua's profileChanges), sent in turn.
+local SAID = {anyone = "anyone", user = "users", admin = "admins", owner = "owner"}
+local function apply(c, p, lines)
+    if not (c and p) then return "No gate in range." end
+    if #lines == 0 then return c.name .. " already has " .. p.name .. "'s settings." end
+    local function send(i)
+        c.proxy:async(guard(function(ok, result)
+            if ok ~= true then log(("%s: %s not applied: %s"):format(c.name, p.name, tostring(result))) return end
+            if i < #lines then send(i + 1) return end
+            c.silent = p.silent or nil
+            c.allow = {}
+            for k, v in pairs(p.allow or {}) do c.allow[k] = v end
+            local said = {}
+            for _, k in ipairs({"dial", "close", "iris"}) do said[#said + 1] = k .. " " .. SAID[c.allow[k] or "user"] end
+            log(("%s now has %s's settings: %s; %s."):format(c.name, p.name, c.silent and "silent" or "answers every scan", table.concat(said, ", ")))
+            loom.invalidate()
+        end)).console(lines[i])
+    end
+    send(1)
+    return ("Giving %s %s's settings..."):format(c.name, p.name)
 end
 
 -- Remote update: this device's gate-side GNS files (or the paths given, under /usr), pushed to
@@ -155,6 +202,7 @@ local function update(c, paths)
 end
 
 return {remote = remote, console = console, gateLog = gateLog, setup = setup, update = update,
+    apply = apply,
     ssh = function(args)
     local c = args[1] and findGate(args[1])
     local rest = 2

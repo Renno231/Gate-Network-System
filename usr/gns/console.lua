@@ -9,8 +9,9 @@ local sides = require("sides")
 local console = {}
 
 -- node: from gate.start; settings and save(): the gate's settings and how to keep them; dhd:
--- the DHD or nil; stargate: the gate. Returns run(line, out): runs one command line, writing
--- each line of its output with out(text).
+-- the DHD or nil; stargate: the gate. Returns run(line, out, role): runs one command line, writing
+-- each line of its output with out(text). role: the caller's, for a command sent from a client
+-- (gate.lua console); nil at the gate computer, where only its OC users type.
 function console.new(node, settings, saveSettings, dhd, stargate)
     local state = node.state
     local unsaved -- why the last settings save in this command failed
@@ -18,10 +19,17 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         local ok, why = saveSettings()
         if not ok then unsaved = why or "the disk is full" end
     end
+    local LEVELS = {anyone = "anyone", users = "user", admins = "admin", owner = "owner"}
+    local SAID = {anyone = "anyone", user = "users", admin = "admins", owner = "owner"}
+    local function level(control)
+        local v = type(settings.allow) == "table" and settings.allow[control]
+        return SAID[v] and v or "user"
+    end
     local function ownerLine()
-        if not state.owner then return "Not registered: the first client to set it up becomes its owner." end
-        return ("Owner %s (%s), %s"):format(tostring(state.ownerName), fingerprint(state.owner),
-            settings.public and "public: anyone may dial" or "private: the owner and grant holders")
+        if state.owner == nil then return "Not registered: the first client to set it up becomes its owner." end
+        if state.owner == "public" then return "Public: nobody owns it or can claim it; anyone may use it." end
+        return ("Owner %s (%s); dial: %s, close: %s, iris: %s%s"):format(tostring(state.ownerName), fingerprint(state.owner),
+            SAID[level("dial")], SAID[level("close")], SAID[level("iris")], settings.silent and "; silent" or "")
     end
     local function onOff(word) if word == "on" then return true elseif word == "off" then return false end end
 
@@ -37,7 +45,9 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         {"idc", "list the IDCs that open the iris for incoming travellers"},
         {"idc add <code> <name>", "let an IDC open the iris; idc remove <code>"},
         {"kawoosh on|off", "close the iris while the wormhole forms"},
-        {"public on|off", "let anyone dial; the iris stays the owner's and grant holders' (a registered gate is private otherwise)"},
+        {"allow [dial|close|iris] [anyone|users|admins|owner]", "who may use each control (users: anyone with access; the default)"},
+        {"silent on|off", "answer only the owner and players with access: strangers' scans and calls get nothing"},
+        {"owner public", "give the gate to the public (the owner only): nobody owns it or can claim it"},
         {"local on|off", "take commands only from the client on this computer; travellers still pass"},
         {"port <number>", "the modem port of this gate's network (restart gns after)"},
         {"sleep <minutes>|off", "shut down when idle; the wake key or the DHD wakes it"},
@@ -49,7 +59,9 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         {"cut", "how many grants this gate has cut off"},
     }
     function commands.help(_, out)
-        for _, u in ipairs(usage) do out(("%-22s %s"):format(u[1], u[2])) end
+        for _, u in ipairs(usage) do
+            if #u[1] > 22 then out(u[1]) out((" "):rep(23) .. u[2]) else out(("%-22s %s"):format(u[1], u[2])) end
+        end
     end
     function commands.status(_, out)
         local s = node.dialer.status()
@@ -132,12 +144,43 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         save()
         out("Kawoosh avoidance " .. argument)
     end
-    commands.public = function(argument, out)
-        local on = onOff(argument)
-        if on == nil then out("Usage: public on|off (now " .. (settings.public and "on" or "off") .. ")") return end
-        settings.public = on
+    local function ownedGate(out)
+        if state.owner == nil or state.owner == "public" then
+            out("Only an owned gate has these settings: on this one anyone may use every control.")
+            return false
+        end
+        return true
+    end
+    function commands.allow(argument, out)
+        local control, who = argument:match("^(%S*)%s*(%S*)$")
+        if control == "" then
+            for _, c in ipairs({"dial", "close", "iris"}) do out(("%-6s %s"):format(c, SAID[level(c)])) end
+            return
+        end
+        if not ({dial = true, close = true, iris = true})[control] or not LEVELS[who] then
+            out("Usage: allow [dial|close|iris] [anyone|users|admins|owner]")
+            return
+        end
+        if not ownedGate(out) then return end
+        settings.allow = type(settings.allow) == "table" and settings.allow or {}
+        settings.allow[control] = LEVELS[who] ~= "user" and LEVELS[who] or nil
+        if not next(settings.allow) then settings.allow = nil end
         save()
-        out(on and "Public: anyone in range may dial." or "Private: only the owner and grant holders.")
+        out(("%s: %s"):format(control, who))
+    end
+    function commands.silent(argument, out)
+        local on = onOff(argument)
+        if on == nil then out("Usage: silent on|off (now " .. (settings.silent and "on" or "off") .. ")") return end
+        if not ownedGate(out) then return end
+        settings.silent = on or nil
+        save()
+        out(on and "Silent: only the owner and players with access get an answer." or "The gate answers every scan.")
+    end
+    function commands.owner(argument, out, role)
+        if argument ~= "public" then out(ownerLine()) out("owner public: give the gate to the public") return end
+        if role and role ~= "owner" then out("Only the owner can give the gate to the public.") return end
+        node.release(role and "the owner" or "the gate console")
+        out("The gate is public now: nobody owns it or can claim it, and anyone may use it.")
     end
     commands["local"] = function(argument, out)
         local on = onOff(argument)
@@ -212,7 +255,7 @@ function console.new(node, settings, saveSettings, dhd, stargate)
         out(count .. " grants cut off")
     end
 
-    return function(line, out)
+    return function(line, out, role)
         local name, argument = tostring(line):match("^%s*(%S+)%s*(.-)%s*$")
         if not name then return end
         local command = commands[name]
@@ -221,7 +264,7 @@ function console.new(node, settings, saveSettings, dhd, stargate)
             return
         end
         unsaved = nil
-        local ok, err = pcall(command, argument, out)
+        local ok, err = pcall(command, argument, out, role)
         if not ok then out("Error: " .. tostring(err)) end
         if unsaved then out("Not saved: " .. tostring(unsaved) .. "; the change is lost on restart.") end
     end

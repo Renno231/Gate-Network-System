@@ -15,7 +15,10 @@
 -- --gate              (with floppy) only the gate server: no client, no loom. A gate server's
 --                     own install (install.lua gate) always makes these.
 -- --own               (with floppy) gates installed from it are registered to this device: it
---                     asks for the vault password and the owner's player name
+--                     asks for the vault password and the owner's player name; --silent too:
+--                     they answer only the owner and players with access
+-- --unregistered      (with floppy) the first client to set a gate up owns it. Without --own
+--                     or --unregistered, gates installed from the floppy are public
 -- gns help            this list
 -- --repeating reruns the program after it exits (for development).
 local shell = require("shell")
