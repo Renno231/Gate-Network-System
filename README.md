@@ -10,7 +10,7 @@ grant, and an address shared between players cannot be altered on the way.
 - **Dialing.** Scan for gates in range and dial any gate in your address book from any of them.
   The gate dials the shortest address that works, continues glyphs already engaged, can press
   its DHD for a fast dial, closes its iris while the wormhole forms and sends your IDC once it
-  is open. Disengage and iris control from the client; live gate state, energy and server TPS,
+  is open. Disengage and iris control from the client; the state, energy and server TPS of the gate you use,
   and a drawn stargate that follows the real gate: its chevrons lock, the event horizon bursts
   open and ripples like the show's water, and the iris blades or the shield close over it.
 - **Command bar.** Press `;` and type: `d 5` dials gate 5 from the nearest gate, `d 1 2` dials
@@ -20,8 +20,8 @@ grant, and an address shared between players cannot be altered on the way.
   the screens. Touch and the mouse work too.
 - **Incoming wormholes.** The gate closes its iris for every incoming wormhole and opens it only
   for a known IDC or a signed pass, answering the traveller either way. Until then its
-  off-world alarm is up: it can drive redstone out to the base's lights or doors, and the
-  devices of its owner and admins in range show it. A sleeping gate with IDCs shuts its iris
+  off-world alarm is up: the gate computer sounds it, and it can drive redstone out to the
+  base's lights or doors. A sleeping gate with IDCs shuts its iris
   before it sleeps, so nothing gets through before it wakes. A shield iris needs power to stay
   shut: JSG opens it once the gate's store falls below its draw (500 RF/t by default), asleep or
   not. When the iris cannot move (its mode is not OC, or a shield has no power), the traveller
@@ -35,8 +35,8 @@ grant, and an address shared between players cannot be altered on the way.
   hears you however far away it is. Its answers reach you reliably within about 10 blocks of
   your own gate: OC's wireless loses more of them through blocks further out. Routes are signed, so no
   gate on the way needs your address book. Admins can schedule a dial to repeat.
-- **Home gate, energy check.** Mark one gate home and dial it with its IDC in one step. Before
-  a dial the client shows what it costs and how long the wormhole can stay open.
+- **Home gate, energy check.** Mark one gate home and dial it with its IDC in one step. `energy`
+  shows what a dial costs and how long the wormhole can stay open; each dial logs it too.
 - **Hand dials.** When a player dials out by hand on a gate's DHD, the gate keeps the address;
   `save` adds it to the address book of any device that opens the gate (a kiosk keeps it
   hidden).

@@ -46,7 +46,7 @@ function invite.host(onRequest, bucket)
         end,
     }
     local endpoint = api.expose(invite.ENDPOINT, lib, invite.PORT, nil, nil, bucket)
-    disco.offer(invite.ENDPOINT, invite.PORT)
+    disco.offer(invite.ENDPOINT, invite.PORT, true) -- answers JOIN's find; never announced on a timer
     local host = {}
     function host.accept(request, offer) request.offer, request.state = offer, "accepted" end
     function host.deny(request) request.state = "denied" end

@@ -91,7 +91,7 @@ function room.run(node, settings)
     local gpu = component.gpu
     local before, flash, last = 0, false, nil
     local function frame()
-        -- node.view, not node.status: a status costs the gate about nine stargate calls, a tick each.
+        -- node.view, not node.status: a status costs the gate five stargate calls, a tick each.
         local s = node.view()
         local engaged = s.state == "open" and 0 or #(s.glyphs or {})
         -- One beep per chevron: JSG hides the glyphs while the wormhole forms and shows them again
@@ -107,8 +107,8 @@ function room.run(node, settings)
         return s.state ~= "idle" or engaged > 0 or s.dialing or s.alarm
     end
     -- Drawn again on each signal but a modem message (JSG's chevron, gate and iris events, a DHD
-    -- press), and each second while the gate is busy: its clock, the alarm's flash, and a failed
-    -- dial (JSG ends one without a signal). An idle gate costs nothing until something happens.
+    -- press), and each second while the gate is busy for its clock and the alarm's flash: node.view
+    -- asks the stargate nothing then. An idle gate costs nothing until something happens.
     local ok, err = pcall(function() -- Ctrl+Alt+C: the room stops drawing too
         local active, due = frame(), computer.uptime() + 1
         while true do

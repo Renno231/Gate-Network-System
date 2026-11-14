@@ -280,14 +280,21 @@ local function editAddress(r, galaxy, start)
     -- The address last dialed by hand at the DHD of the gate in range, to look over before SAVE.
     ui.Button(box, bx, 18, 11, 1, "READ DHD", C.raised, C.text, function()
         local c = clientEnv.fromGate()
-        local hand = c and c.status and c.status.handDialed
-        local from, glyphs = next(type(hand) == "table" and type(hand.address) == "table" and hand.address or {})
         if not c then note = "No gate in range" return end
-        if not GALAXY[from] or type(glyphs) ~= "table" then note = c.name .. " has no hand dial" return end
-        edited[from] = {}
-        for i, g in ipairs(glyphs) do edited[from][i] = tostring(g) end
-        galaxy = from
-        note = ("Hand dial at %s, %s: SAVE keeps it"):format(c.name, tostring(hand.time))
+        note = "Reading " .. c.name .. "'s DHD..."
+        -- Asked now: a gate tells this device nothing unless asked or in use.
+        clientEnv.fresh(c, function()
+            local hand = c.status and c.status.handDialed
+            local from, glyphs = next(type(hand) == "table" and type(hand.address) == "table" and hand.address or {})
+            if not GALAXY[from] or type(glyphs) ~= "table" then note = c.name .. " has no hand dial"
+            else
+                edited[from] = {}
+                for i, g in ipairs(glyphs) do edited[from][i] = tostring(g) end
+                galaxy = from
+                note = ("Hand dial at %s, %s: SAVE keeps it"):format(c.name, tostring(hand.time))
+            end
+            require("loom").invalidate()
+        end)
     end)
     local half = 14
     ui.Button(box, w // 2 - half - 1, h - 1, half, 1, "SAVE", C.green, C.black, function()

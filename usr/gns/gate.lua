@@ -32,6 +32,20 @@ local gate = {}
 
 local TYPE, RANK = dialing.TYPE, grants.RANK
 local ROUTE_WAIT = 60 -- seconds a route waits for the gate to be free, and for its wormhole to open
+-- JSG leaves some states for idle with no signal: the gate looks again once it should have,
+-- after the signal that began them: a Milky Way DHD press locks its chevron in 10 to 29 ticks,
+-- a failed dial fails for 53 to 83 (StargateMilkyWayBaseTile, StargateAbstractBaseTile).
+local QUIET_AFTER = {stargate_dhd_chevron_engaged = 1.5, stargate_failed = 4.3}
+-- Signals that change nothing a status shows: a ring glyph starting to spin, a traveller, a hit
+-- on the iris, an IDC and its answer (the dialer's own state shows what they did).
+local UNSHOWN = {stargate_spin_start = true, stargate_traveler = true, stargate_event_iris_hit = true,
+    received_code = true, code_respond = true}
+-- The iris state each iris signal leaves (JSG signals a move as it starts and as it ends).
+local IRIS = {stargate_iris_opening = "OPENING", stargate_iris_closing = "CLOSING",
+    stargate_iris_opened = "OPENED", stargate_iris_closed = "CLOSED"}
+-- A chevron signal carries the glyph count and name; the gate is dialing until a DHD press
+-- locks, idle once a ring glyph has.
+local CHEVRON = {stargate_dhd_chevron_engaged = "dialing", stargate_spin_chevron_engaged = "idle"}
 -- The gate log (gatelog, for admins): what happened at the gate, newest LOG_KEEP entries, in its
 -- own file beside the state so it never fills the disk. Entries collect in memory and are written
 -- in one open at most every LOG_FLUSH seconds, and when the gate stops, sleeps or restarts.
@@ -174,17 +188,27 @@ function gate.start(state, stargate, settings, dhd)
         end
         while #history > LOG_KEEP do table.remove(history, 1) end
     end
+    local flushHistory, flushTimer
     local function record(text)
         local e = {os.date("%d %H:%M"), (tostring(text):gsub("\n", " "))}
         history[#history + 1], unwritten[#unwritten + 1] = e, e
         while #history > LOG_KEEP do table.remove(history, 1) end
+        -- Written LOG_FLUSH seconds after the first entry not yet in the file, with any that came
+        -- meanwhile: nothing runs while nothing is logged. A full disk keeps the entries for the
+        -- flush after the next one logged.
+        if not flushTimer then
+            flushTimer = timer(LOG_FLUSH, function()
+                flushTimer = nil
+                flushHistory()
+            end)
+        end
     end
-    local function flushHistory()
+    function flushHistory()
         if #unwritten == 0 then return end
         if lines + #unwritten > 2 * LOG_KEEP then
             local out = {}
             for i, e in ipairs(history) do out[i] = serialization.serialize(e) end
-            -- A full disk keeps the old log, and the entries wait for the next flush.
+            -- A full disk keeps the old log.
             if replace(historyPath, table.concat(out, "\n") .. "\n") then lines, unwritten = #history, {} end
             return
         end
@@ -194,7 +218,6 @@ function gate.start(state, stargate, settings, dhd)
         file:close()
         lines, unwritten = lines + #unwritten, {}
     end
-    local historyTimer = timer(LOG_FLUSH, flushHistory, math.huge)
     -- The newest count entries (all when nil), newest first.
     local function newest(count)
         count = math.max(1, math.min(math.tointeger(tonumber(count)) or LOG_KEEP, LOG_KEEP))
@@ -250,8 +273,9 @@ function gate.start(state, stargate, settings, dhd)
     applyWake()
 
     -- Off-world activation: an incoming wormhole raises the alarm until a known IDC or a pass
-    -- lets someone through, or it closes. The redstone output (settings.alarm: a side, or "all")
-    -- drives the base's lights or doors; admin tablets in range hear a broadcast.
+    -- lets someone through, or it closes. The gate computer sounds it, and the redstone output
+    -- (settings.alarm: a side, or "all") drives the base's lights or doors. Nothing is sent to
+    -- any device: a gate tells a device only what it asks, or about the dial it is using.
     local function setAlarm(on)
         if alarm == on then return end
         alarm = on
@@ -266,7 +290,7 @@ function gate.start(state, stargate, settings, dhd)
         end
         if on then
             note("off-world activation")
-            pcall(modem.broadcast, port, "gns-alarm", settings.name or "?")
+            pcall(computer.beep, "--.--")
         end
     end
     dialer.on.incoming = function()
@@ -293,24 +317,93 @@ function gate.start(state, stargate, settings, dhd)
         save()
     end
     dialer.adopt(dialBy)
+
+    ------------------------------------------------------------------------ changes
+    -- The gate runs on what happens to it, as GDS's did: a stargate signal, the dialer's news from
+    -- its own timers, or a call. Each wakes the waits (waitFor) and the watchers' push (below),
+    -- once, a tick later, for a burst of them; nothing asks the stargate in between.
+    local waiters, push = {}, nil
+    local settle
+    local changes = 0 -- how many times something happened (restartWhenIdle looks again only then)
+    local function changed()
+        changes = changes + 1
+        if settle or stopped then return end
+        settle = timer(0.05, function()
+            settle = nil
+            local list = {}
+            for w in pairs(waiters) do list[#list + 1] = w end
+            for _, w in ipairs(list) do if waiters[w] then w() end end
+            if push then push() end
+        end)
+    end
+    -- What the shown status (node.view) needs asked again, by what the stargate's signals said:
+    -- a chevron or iris signal says it all itself (shown, below); a wormhole's asks the state,
+    -- glyphs and energy; the end of a state JSG gives no signal for asks the state and glyphs.
+    -- responds: the far gates' answers.
+    local need, shown, chevrons, responds = {}, {}, {}, 0
+    local function moved()
+        need.state, need.glyphs = true, true
+        changed()
+    end
+    dialer.on.changed = function(still) if still then moved() else changed() end end
+    local counter = event.register(nil, function(name, _, _, count, _, glyph)
+        if type(name) ~= "string" then return end
+        if name == "code_respond" then responds = responds + 1 end
+        if UNSHOWN[name] then return changed() end
+        if name:sub(1, 9) ~= "stargate_" then return end
+        -- A player's press (not GNS's own dial, which steps on): the chevron locks with no signal.
+        local quiet = QUIET_AFTER[name]
+        if quiet and (name ~= "stargate_dhd_chevron_engaged" or (dialer.gateType() == "MILKYWAY" and not dialer.busy())) then
+            timer(quiet, moved)
+        end
+        if IRIS[name] then
+            shown.iris = IRIS[name]
+        elseif CHEVRON[name] and type(glyph) == "string" and math.tointeger(count) then
+            shown.state = CHEVRON[name]
+            chevrons[#chevrons + 1] = {math.tointeger(count), glyph}
+        else
+            need.state, need.glyphs, need.energy = true, true, true
+        end
+        changed()
+    end, math.huge, math.huge)
+
+    -- Waits until test() holds or seconds pass; then calls done(held). test runs now, then again
+    -- only when something happens (changed, above), or after the seconds it gives as its second
+    -- value, for a change that comes with no signal.
+    local function waitFor(test, seconds, done)
+        local w, again, deadline
+        local function finish(held)
+            waiters[w] = nil
+            if again then event.cancel(again) end
+            event.cancel(deadline)
+            done(held)
+        end
+        w = function()
+            if again then event.cancel(again) again = nil end
+            local ok, held, retry = pcall(test)
+            if ok and held then return finish(true) end
+            if ok and retry then again = timer(math.max(retry, 0.05), w) end
+        end
+        waiters[w] = true
+        deadline = timer(seconds, function() if waiters[w] then finish(false) end end)
+        w()
+    end
+
     -- Shut for the sleep (below): open again unless a wormhole is coming in, which waits for its IDC.
     -- While a wormhole forms JSG says only "unstable", not which way it goes, so that waits (at
-    -- most 30 s) until it says; an incoming one keeps the iris shut (dialing.lua admits it).
+    -- most 30 s) for its next signal; an incoming one keeps the iris shut (dialing.lua admits it).
     if state.irisAsleep then
         state.irisAsleep = nil
         save()
-        local deadline = computer.uptime() + 30
-        local function wake()
+        waitFor(function() return stargate.getGateStatus() ~= "unstable" end, 30, function()
             local gateState, outgoing = stargate.getGateStatus()
-            if gateState == "unstable" then return computer.uptime() < deadline end
             if gateState ~= "incoming" and not (gateState == "open" and not outgoing) then pcall(dialer.iris, "OPENED") end
-            return false
-        end
-        if wake() then timer(0.25, wake, math.huge) end
+        end)
     end
 
-    local function status()
-        local s = dialer.status()
+    -- s, need: as dialer.status's.
+    local function status(s, need)
+        s = dialer.status(s, need)
         s.name, s.registered, s.public, s.alarm = settings.name, state.owner ~= nil, settings.public == true, alarm
         s.handDialed = state.handDialed
         s.seq = state.entry and state.entry.seq -- clients take a newer signed entry (a rename) when it changes
@@ -394,48 +487,41 @@ function gate.start(state, stargate, settings, dhd)
     local pins, ownProofs = {}, {} -- the gate keys seen, and this gate's proofs, by far gate modem
 
     -- Free: idle, no dial of GNS's own, and no player dialing at the DHD (dialer.handBusy). One
-    -- stargate call (a tick): the sleep and route checks ask it often.
+    -- stargate call (a tick). A player's dial: also the seconds until it stops counting.
     local function gateFree()
-        return not dialer.busy() and not dialer.handBusy() and stargate.getGateStatus() == "idle"
-    end
-
-    -- Waits (on timers) until test() holds or seconds pass; then calls done(held).
-    local function waitFor(test, seconds, done)
-        local deadline = computer.uptime() + seconds
-        local id
-        id = timer(0.5, function()
-            local ok, held = pcall(test)
-            held = ok and held
-            if held or computer.uptime() >= deadline then
-                event.cancel(id)
-                done(held)
-            end
-        end, math.huge)
+        if dialer.busy() then return false end
+        local hand, freeAt = dialer.handBusy()
+        if hand then return false, freeAt - computer.uptime() end
+        return stargate.getGateStatus() == "idle"
     end
 
     -- Hands route r, from hop at, to the gate at the far end of this gate's open wormhole. A hop
     -- that names its gate's key (the client knew it) goes only to the gate proving that key, so no
     -- other device sees the route and its IDCs; a hop without one is offered to each GNS gate in
     -- range, and only the gate the previous hop dialed takes it (its queue checks the address).
-    -- Over link.lua: each message is sent again until answered, so the relay's losses across the
-    -- wormhole cost time, not the route. Gates are tried one at a time: a first open's signature
-    -- checks hold this computer for seconds.
-    -- The far iris may still be shut, waiting for the hop's IDC, and no message crosses it: ask
-    -- again every 2 s while the wormhole stays open, up to RELAY_TRIES times.
-    local RELAY_TRIES = 10
+    -- Over link.lua each message is sent once: JSG's relay carries it about 10 blocks past the far
+    -- gate (networks.md), shut iris or not. Gates are tried one at a time: a first open's
+    -- signature checks hold this computer for seconds.
+    -- No gate answers when the far computer is still starting (the incoming wormhole's DHD
+    -- redstone woke it): started, it asks for the IDC again (dialing.lua), and the hello goes once more.
     -- Relays due or under way, counted from the dial: a close asked for once the wormhole is open
     -- waits for them (closeWormhole), so the hop it carries is not cut off, even a close sent the
     -- moment the wormhole opens. done() is called once, however the relay ends.
     local relaying = 0
-    local function relay(r, at, tries, done)
-        tries = tries or 1
+    local function relay(r, at, again, done)
         local want = r.hops[at].gate
         local found = {}
         link.hello({[port] = true, [handshake.PORT] = true}, 2, function(address, p, _, hello)
             if not component.list("modem")[address] then found[#found + 1] = {address = address, port = p, name = hello.name} end
         end, function()
-            local s, outgoing = stargate.getGateStatus()
-            if #found == 0 and tries < RELAY_TRIES and s == "open" and outgoing then return relay(r, at, tries + 1, done) end
+            if #found == 0 and not again and dialer.openedAt and not dialer.incoming then
+                local seen = responds
+                return waitFor(function() return responds ~= seen or not dialer.openedAt end, ROUTE_WAIT, function(held)
+                    if held and dialer.openedAt then return relay(r, at, true, done) end
+                    note(("route: no gate past the wormhole took hop %d"):format(at))
+                    done()
+                end)
+            end
             local i = 0
             local function try()
                 i = i + 1
@@ -477,16 +563,15 @@ function gate.start(state, stargate, settings, dhd)
                 if not ok then note("route: " .. tostring(result)) return end
                 dialer.by = r.key
                 noteDialer()
+                changed()
                 if at < #r.hops then
                     pending, relaying = pending + 1, relaying + 1
-                    waitFor(function()
-                        if dialer.busy() then return false end
-                        local s, outgoing = stargate.getGateStatus()
-                        return s == "open" and outgoing
-                    end, ROUTE_WAIT, function(open)
+                    -- The dial ends open (dialer.openedAt) or failed: no stargate call.
+                    waitFor(function() return not dialer.busy() end, ROUTE_WAIT, function(ended)
+                        local open = ended and dialer.openedAt ~= nil and not dialer.incoming
                         pending = pending - 1
-                        if not open then relaying = relaying - 1 note("route: the wormhole did not open") return end
-                        relay(r, at + 1, nil, function() relaying = relaying - 1 end)
+                        if not open then relaying = relaying - 1 changed() note("route: the wormhole did not open") return end
+                        relay(r, at + 1, nil, function() relaying = relaying - 1 changed() end)
                     end)
                 end
             end)
@@ -606,10 +691,17 @@ function gate.start(state, stargate, settings, dhd)
     end
     -- The check runs from the gate's start: QuickOS keeps a thread's timers with the thread, so one
     -- the self-update's thread made would end with it, before the gate was ever idle.
+    -- The stargate is asked again only after something happened, or once a player's dial at the
+    -- DHD stops counting.
     local restarting = false
     local function restartWhenIdle() restarting = true end
+    local checked, freeAt
     timer(2, function()
-        if not restarting or pending > 0 or clientHere() or not gateFree() then return end
+        if not restarting or pending > 0 or clientHere() then return end
+        if checked == changes and computer.uptime() < freeAt then return end
+        checked = changes
+        local free, wait = gateFree()
+        if not free then freeAt = computer.uptime() + (wait or math.huge) return end
         flushHistory()
         keepProofs()
         computer.shutdown(true)
@@ -669,7 +761,7 @@ function gate.start(state, stargate, settings, dhd)
     end
 
     -- The status a caller gets: the cached view (node.view, one stargate call) with the energy and
-    -- TPS now (one more call, and file calls), instead of building it again (about nine calls).
+    -- TPS now (one more call, and file calls), instead of building it again (five calls).
     local function current()
         local s = node.view()
         local ok, energy = pcall(stargate.getEnergyStored)
@@ -739,13 +831,15 @@ function gate.start(state, stargate, settings, dhd)
         dial = {opened("user", function(session, address, opts)
             opts = type(opts) == "table" and opts or {}
             -- Dialing over an open outgoing wormhole closes it: the same rule as closeWormhole.
-            local gateState, outgoing = stargate.getGateStatus()
+            local gateState, outgoing = "dialing", nil -- dialer.dial answers its own dial with no call
+            if not dialer.busy() then gateState, outgoing = stargate.getGateStatus() end
             -- A dial that waited for the gate goes out from idle only, never over a new wormhole.
             if opts.wait and gateState ~= "idle" then error("already dialing", 0) end
             if gateState == "open" and outgoing and RANK[session.role] < RANK.admin and dialer.by ~= session.key then
                 error("the gate is open to another player's dial: only who dialed, or an admin, can close it", 0)
             end
-            local ok, result = pcall(dialer.dial, address, {fast = opts.fast == true, idc = math.tointeger(opts.idc), speed = tonumber(opts.speed)})
+            local ok, result = pcall(dialer.dial, address, {fast = opts.fast == true, idc = math.tointeger(opts.idc),
+                speed = tonumber(opts.speed), status = {gateState, outgoing}})
             if not ok then
                 -- The client stops its own dial and dials again, unless it is to the same gate;
                 -- another player's it waits out.
@@ -754,7 +848,7 @@ function gate.start(state, stargate, settings, dhd)
                     error(result == "already dialing it" and "your dial is in progress to it" or "your dial is in progress", 0)
                 end
                 if busy then result = "already dialing" end
-                -- D2: a client waiting for the gate asks again each second; only other refusals are history.
+                -- D2: a client waiting for the gate dials again once it is free; only other refusals are history.
                 if result ~= "already dialing" and result ~= "already open to it" then
                     record(("%s was refused a dial to %s: %s"):format(who(session), addressText(address), tostring(result)))
                 end
@@ -769,11 +863,10 @@ function gate.start(state, stargate, settings, dhd)
             if after and after > 0 then
                 local mine = {}
                 timedDial = mine
-                waitFor(function()
-                    local s, out = stargate.getGateStatus()
-                    return timedDial ~= mine or (s == "open" and out)
-                end, 120 + (tonumber(opts.speed) or 0) + 10, function(open)
-                    if not open or timedDial ~= mine then return end
+                -- The dial ends open (dialer.openedAt) or failed: no stargate call.
+                waitFor(function() return timedDial ~= mine or not dialer.busy() end,
+                    120 + (tonumber(opts.speed) or 0) + 10, function(ended)
+                    if not ended or timedDial ~= mine or not dialer.openedAt or dialer.incoming then return end
                     timer(after, function()
                         local s, out = stargate.getGateStatus()
                         if timedDial ~= mine or s ~= "open" or not out then return end
@@ -843,8 +936,7 @@ function gate.start(state, stargate, settings, dhd)
             if state.owner and not session.name then error("the iris needs a grant here", 0) end
             local target = ({open = "OPENED", close = "CLOSED"})[want]
             if want ~= nil and not target then error("open or close", 0) end
-            local before = stargate.getIrisState()
-            local now = dialer.iris(target)
+            local now, before = dialer.iris(target)
             if now ~= before then
                 record(("%s %s the iris"):format(who(session), before == "CLOSED" and "opened" or "closed"))
             end
@@ -972,9 +1064,16 @@ function gate.start(state, stargate, settings, dhd)
     local LINKED = {open = true, register = true, status = true, dial = true, energy = true, closeWormhole = true,
         sendIdc = true, challenge = true, pass = true, iris = true, queue = true, cut = true}
     local answered = {} -- modem .. call id → {at, ok, text}
-    -- Devices watching the gate's status: modem → {untilAt, port, via (the card that heard it)}. A call from a device with a role
-    -- watches for 60 s; on each change of state the gate sends its whole status to each watcher.
+    -- Devices watching the gate's status: modem → {untilAt, port, via (the card that heard it)}. A device with a role
+    -- that uses the gate (USE) watches for 60 s; on each change of state the gate sends its whole status to each watcher.
     local watchers, WATCH = {}, 60
+    -- What a watcher sees change: not energy, TPS or the seconds open, which move all the time.
+    local function shape(s)
+        return table.concat({tostring(s.state), tostring(s.outgoing), tostring(s.iris), tostring(s.irisProblem),
+            tostring(s.dialing), tostring(s.lastDial), #(s.glyphs or {}), tostring(s.name), tostring(s.alarm),
+            tostring(s.seq), tostring(s.handDialed and s.handDialed.time)}, "|")
+    end
+    local USE = {status = true, dial = true, closeWormhole = true, sendIdc = true, iris = true, queue = true}
     local function onCall(_, to, from, p, _, kind, id, method, payload)
         if kind ~= link.CALL or p ~= port or stopped or type(id) ~= "string" or #id > 32 then return end
         if component.type(to) ~= "modem" then return end
@@ -996,49 +1095,48 @@ function gate.start(state, stargate, settings, dhd)
             end
             done = {at = now, ok = result[1], text = link.pack(table.unpack(result, 2, result.n))}
             for k, d in pairs(answered) do if now - d.at > link.KEEP then answered[k] = nil end end
-            -- A scan's hello neither repeats nor renews a watch: only a device's calls do.
-            if method ~= "hello" then
-                answered[key] = done
-                local s = devices[from]
-                if s and s.role then watchers[from] = {untilAt = now + WATCH, port = p, via = to} end
+            if method ~= "hello" then answered[key] = done end
+            -- Only a device using the gate is sent its changes: a scan's hello and open, a cost
+            -- or a cut start nothing.
+            -- A dial is watched while it lasts (push), or, refused for a busy gate, while the
+            -- client waits to dial again (up to 300 s). A status call's answer is what it was shown.
+            local s = USE[method] and devices[from]
+            if s and s.role then
+                local w = watchers[from]
+                watchers[from] = {untilAt = now + (method == "dial" and 300 or WATCH), port = p, via = to, key = s.key,
+                    shown = method == "status" and shape(node.view()) or (w and w.port == p and w.shown or nil)}
             end
+            if next(watchers) then changed() end -- the call may have changed what the gate shows
         end
         if not pcall(link.send, to, from, p, link.REPLY, id, done.ok, done.text) then
             pcall(link.send, to, from, p, link.REPLY, id, false, link.pack("the answer is too big for a modem message"))
         end
     end
     event.listen("modem_message", onCall)
-    -- What a watcher sees change: not energy, TPS or the seconds open, which move all the time.
-    local function shape(s)
-        return table.concat({tostring(s.state), tostring(s.outgoing), tostring(s.iris), tostring(s.irisProblem),
-            tostring(s.dialing), tostring(s.lastDial), #(s.glyphs or {}), tostring(s.name), tostring(s.alarm),
-            tostring(s.seq), tostring(s.handDialed and s.handDialed.time)}, "|")
-    end
-    -- status() costs a tick per stargate call, about half a second in all: built every half
-    -- second it would leave the computer no time for its signals. So it is built only when
-    -- something it shows may have changed: a signal of the stargate's (its gate, chevron, iris
-    -- and IDC events; not a key or touch at a client on this computer), the gate's state (one
-    -- call, and only while it is not idle: JSG ends a failed dial without a signal, but leaves
-    -- idle only with one), or the dialer's or this gate's own state.
-    local signals = 0
-    local counter = event.register(nil, function(name)
-        if type(name) == "string" and (name:sub(1, 9) == "stargate_" or name == "received_code" or name == "code_respond") then
-            signals = signals + 1
-        end
-    end, math.huge, math.huge)
+    -- A whole status costs a tick per stargate call, five in all. So it is built once, then
+    -- kept up to date by the stargate's signals (need, shown, above): a chevron or iris signal
+    -- costs no call, a wormhole's three; the dialer's or this gate's own state none.
     -- The status, built again only then: the watchers, the callers (current) and the room display
-    -- (room.lua) read it as often as they like for one stargate call. Each gets a copy, its seconds
+    -- (room.lua) read it as often as they like, at no stargate call between. Each gets a copy, its seconds
     -- open and left moved on from when it was built.
-    local viewed, viewKey, viewOwn, viewAt
+    local viewed, viewOwn, viewAt
     function node.view()
         local hand = state.handDialed
-        local own = table.concat({signals, tostring(dialer.state), tostring(dialer.irisProblem), tostring(settings.name),
+        local own = table.concat({tostring(dialer.state), tostring(dialer.irisProblem), tostring(settings.name),
             tostring(alarm), tostring(state.entry and state.entry.seq), tostring(hand and hand.time), tostring(dialer.busy())}, "|")
-        if not (viewed and own == viewOwn and viewed.state == "idle") then
-            local gateState, outgoing = stargate.getGateStatus()
-            local key = own .. "|" .. tostring(gateState) .. "|" .. tostring(outgoing)
-            if key ~= viewKey then viewed, viewKey, viewAt = status(), key, computer.uptime() end
-            viewOwn = own
+        if not viewed or own ~= viewOwn or next(need) or next(shown) or #chevrons > 0 then
+            local asked = need
+            need = {}
+            if viewed then
+                for k, v in pairs(shown) do viewed[k] = v end
+                -- Each chevron signal adds its glyph to those shown; one missed asks for them all.
+                for _, c in ipairs(chevrons) do
+                    local list = {table.unpack(viewed.glyphs or {})}
+                    if #list == c[1] - 1 then list[c[1]] = c[2] viewed.glyphs = list else asked.glyphs = true end
+                end
+                viewed = status(viewed, asked)
+            else viewed = status() end
+            shown, chevrons, viewOwn, viewAt = {}, {}, own, computer.uptime()
         end
         local s, since = {}, math.floor(computer.uptime() - viewAt)
         for k, v in pairs(viewed) do s[k] = v end
@@ -1046,34 +1144,37 @@ function gate.start(state, stargate, settings, dhd)
         if s.left then s.left = math.max(0, s.left - since) end
         return s
     end
-    local shown, pushes = nil, 0
-    local watchTimer = timer(0.5, function()
-        if not next(watchers) then shown = nil return end
+    -- Each device using the gate is sent its status when what it shows differs from what that
+    -- device was last sent (changed, above): a device that starts using the gate gets it at once.
+    local pushes = 0
+    push = function()
+        if not next(watchers) then return end
         local s = node.view()
-        local now, current = computer.uptime(), shape(s)
-        if current == shown then return end
-        shown, pushes = current, pushes + 1
-        local text = link.pack(s)
+        local now, current, text = computer.uptime(), shape(s), nil
         for address, w in pairs(watchers) do
             -- A cut since its grant was checked: no more pushes until a call checks it again.
             local d = devices[address]
-            if now > w.untilAt or (d and d.grant and d.cutSeq ~= state.cutSeq) then watchers[address] = nil
-            else pcall(link.send, w.via, address, w.port, link.STATUS, pushes, text) end
+            local live = dialer.by ~= nil and dialer.by == w.key -- its dial, or its wormhole open
+            if (now > w.untilAt and not live) or (d and d.grant and d.cutSeq ~= state.cutSeq) then watchers[address] = nil
+            elseif w.shown ~= current then
+                if not text then pushes, text = pushes + 1, link.pack(s) end
+                w.shown = current
+                pcall(link.send, w.via, address, w.port, link.STATUS, pushes, text)
+            end
         end
-    end, math.huge)
+    end
     record("gate started")
 
     function node.stop()
         stopped = true
         event.ignore("modem_message", onCall)
-        event.cancel(watchTimer)
         event.cancel(counter)
         link.stop()
         -- The endpoint and every connection the gate accepted or made.
         bucket:close()
         event.cancel(scheduleTimer)
         event.cancel(sleepTimer)
-        event.cancel(historyTimer)
+        if flushTimer then event.cancel(flushTimer) end
         event.cancel(updateTimer)
         flushHistory()
         dialer.stop()

@@ -1,4 +1,4 @@
--- GNS gate server: serves this computer's stargate to GNS clients, announces it on disco, and
+-- GNS gate server: serves this computer's stargate to GNS clients (they find it by link.lua's hello), and
 -- gives the gate's owner and admins a console (or the gate room display). Started by
 -- /usr/bin/gns. The gate itself runs on timers and listeners; only the console holds the
 -- terminal. With gns.background it starts the gate and returns, so the client can run on the
@@ -9,7 +9,6 @@ if type(gns) ~= "table" or type(gns.path) ~= "table" or type(gns.utility) ~= "ta
 end
 local component = require("component")
 local computer = require("computer")
-local disco = require("disco")
 local serialization = require("serialization")
 local term = require("term")
 local unicode = require("unicode")
@@ -69,7 +68,6 @@ if given ~= nil then require("filesystem").remove(ownerPath) end
 saveSettings()
 
 local node = gate.start(state, stargate, settings, dhd)
-disco.offer("gns", settings.port or handshake.PORT)
 
 -- The console commands (console.lua); admins run the same ones remotely.
 local run = dofile(gns.path.gns .. "console.lua").new(node, settings, saveSettings, dhd, stargate)
@@ -79,7 +77,6 @@ local entry = {}
 local function stop()
     if here.gate ~= entry then return end
     here.gate = nil
-    disco.withdraw("gns")
     node.stop()
     print("GNS gate stopped.")
 end

@@ -2,8 +2,9 @@
 --   a call         "gnsc", id, method, args       (args serialized)
 --   its answer     "gnsr", id, ok, results        to the caller's modem, on the call's port
 --   a gate status  "gnss", seq, status            to the devices watching the gate (gate.lua)
--- The caller sends a call again every second until its answer comes, for up to WAIT seconds; the
--- gate keeps each answer KEEP seconds, so a call heard twice is answered twice and run once.
+-- Each call and hello is sent once, as on GDS: OC delivers a modem message in range. The caller
+-- waits up to WAIT seconds (game time) for the answer; the gate keeps each answer KEEP seconds,
+-- so a call that reaches it twice (by two modems) is answered twice and run once.
 -- OC sets every message's sender address, so a gate knows the caller by its modem: gate.lua keeps
 -- what each modem proved with the gate.open handshake and answers "call open first" to one it
 -- does not know (a gate that restarted); a proxy given reopen opens it again and calls once more.
@@ -69,8 +70,28 @@ local function onMessage(_, _, from, port, distance, kind, id, ok, payload)
     end
 end
 event.listen("modem_message", onMessage)
+
+-- A wait's time is up when its timer fires, but the OS runs an expired timer with whatever signal
+-- it pulls next: a computer busy past the deadline (a big redraw on a lagging server) would drop
+-- answers that came in time and wait in its queue. So the timer only pushes END; it is pulled
+-- after every answer queued before it, and the wait ends then.
+local END = "gns_link_end"
+local function onEnd(_, id)
+    local w = waiting[id]
+    if not w then return end
+    waiting[id] = nil
+    if w.many then
+        if w.done then w.done() end
+    else
+        w.callback(false, "Timeout calling remote function: " .. w.method)
+    end
+end
+event.listen(END, onEnd)
+local function expire(id) return function() computer.pushSignal(END, id) end end
+
 function link.stop()
     event.ignore("modem_message", onMessage)
+    event.ignore(END, onEnd)
     for id, w in pairs(waiting) do event.cancel(w.timer) waiting[id] = nil end
 end
 
@@ -78,43 +99,24 @@ end
 -- calling remote function: method") when none came within WAIT seconds.
 function link.call(address, port, method, callback, ...)
     local id, text = newId(), link.pack(...)
-    local card = component.modem.address
-    local function send() return pcall(link.send, card, address, port, link.CALL, id, method, text) end
-    local sent, err = send()
+    local sent, err = pcall(link.send, component.modem.address, address, port, link.CALL, id, method, text)
     if not sent then return callback(false, tostring(err)) end
-    local w, deadline = {address = address, callback = callback}, computer.uptime() + link.WAIT
-    w.timer = event.timer(1, function()
-        if waiting[id] ~= w then return false end
-        if computer.uptime() >= deadline then
-            waiting[id] = nil
-            callback(false, "Timeout calling remote function: " .. method)
-            return false
-        end
-        send()
-    end, math.huge)
+    local w = {address = address, callback = callback, method = method}
+    w.timer = event.timer(link.WAIT, expire(id))
     waiting[id] = w
 end
 
 -- Asks every gate on ports ({[port] = true}) to say who it is: answer(modem, port, distance,
 -- {name, key}) for each answer as it comes (a gate may answer more than once), then done()
--- after seconds. The question goes out three times in the first second: through a wormhole
--- (JSG's relay) a message is often lost.
+-- after seconds. One broadcast from each modem, on each port.
 function link.hello(ports, seconds, answer, done)
     local id, text = newId(), link.pack()
-    local w = {many = answer}
-    local function ask()
-        if waiting[id] ~= w then return end
-        for address in component.list("modem") do
-            for port in pairs(ports) do pcall(link.broadcast, address, port, link.CALL, id, "hello", text) end
-        end
-    end
-    w.timer = event.timer(seconds, function()
-        if waiting[id] == w then waiting[id] = nil end
-        if done then done() end
-    end)
+    local w = {many = answer, done = done}
+    w.timer = event.timer(seconds, expire(id))
     waiting[id] = w
-    ask()
-    event.timer(0.5, ask, 2)
+    for address in component.list("modem") do
+        for port in pairs(ports) do pcall(link.broadcast, address, port, link.CALL, id, "hello", text) end
+    end
 end
 
 -- A stand-in for an api proxy: proxy:async(callback).method(...) makes the call; close does

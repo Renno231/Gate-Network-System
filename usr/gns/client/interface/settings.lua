@@ -53,8 +53,7 @@ local function blocked()
     table.sort(list)
     return list
 end
--- A new gate port: the client hears that port's off-world alarms and opens its gates. The old
--- port closes, so its network's alarms stop, unless a profile, invitations (invite.PORT, 161),
+-- A new gate port: the client opens that port's gates. The old port closes, unless a profile, invitations (invite.PORT, 161),
 -- chat (peer.PORT, 162), disco or the gate on this computer still use it.
 local function setPort(port)
     local old, modem = settings.port, require("component").modem

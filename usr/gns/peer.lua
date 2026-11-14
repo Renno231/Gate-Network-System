@@ -85,7 +85,7 @@ function peer.start(identity, pins, name, on, bucket)
         end, "Offers database rows, with the signed gate entries behind them"},
     }
     local endpoint = api.expose(peer.ENDPOINT, lib, peer.PORT, nil, nil, bucket)
-    disco.offer(peer.ENDPOINT, peer.PORT)
+    disco.offer(peer.ENDPOINT, peer.PORT, true) -- answers finds; never announced on a timer
 
     local node, open = {}, {} -- open: modem → {proxy, address, fingerprint}
     local own = component.modem.address

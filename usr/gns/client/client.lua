@@ -130,7 +130,7 @@ local settings = {
     fastDial = true, -- press the gate's DHD instead of spinning the ring
     dialSpeed = 0, -- seconds a whole dial takes, spread over the glyphs (GDS's speed); 0: fastest
     autoLogToDatabase = true, -- add gates learned from scans to the address book
-    nearbyScanRate = 30, -- seconds between automatic scans for gates; 0 turns them off
+    nearbyScanRate = 0, -- seconds between automatic scans for gates; 0 (off, as on GDS): at start and on SCAN
     modemRange = 400, -- wireless strength in blocks (16 to 400)
     autoAcceptShared = false, -- take gates shared by other devices without asking
     chatBlacklist = {}, -- device fingerprint -> true: their chat and shares are dropped
@@ -213,16 +213,17 @@ function clientEnv.log(text)
 end
 ui.onError = function(err) clientEnv.log("Error: " .. tostring(err)) end
 
--- Edits are saved to the vault a few seconds after the last one (a save encrypts the whole
--- vault, so a burst of edits costs one), and when the client closes.
-local dirty = false
-function clientEnv.changed() dirty = true end
-local saveTimer = event.timer(5, function()
-    if not dirty then return end
-    dirty = false
-    local saved, err = clientVault:save()
-    if not saved then clientEnv.log("Vault not saved: " .. tostring(err)) end
-end, math.huge)
+-- Edits are saved to the vault 5 s after the first one (a save encrypts the whole vault, so a
+-- burst of edits costs one), and when the client closes. Nothing runs while nothing changes.
+local saveTimer
+function clientEnv.changed()
+    if saveTimer then return end
+    saveTimer = event.timer(5, function()
+        saveTimer = nil
+        local saved, err = clientVault:save()
+        if not saved then clientEnv.log("Vault not saved: " .. tostring(err)) end
+    end)
+end
 
 -- Address book entries by number (their place in the book) or name: a name may be cut short,
 -- with _ for spaces. Returns the row and its number.
@@ -402,22 +403,7 @@ local function onTouch(_, _, _, _, _, player) lastInput = computer.uptime() noti
 event.listen("key_down", onKey)
 event.listen("touch", onTouch)
 
--- Off-world activations: a gate broadcasts gns-alarm on its port when a wormhole comes in
--- unannounced. Gates this device administers show it here.
-local function onAlarm(_, _, from, port, _, kind, name)
-    if kind ~= "gns-alarm" or not clientEnv.ports()[port] then return end
-    for _, a in pairs(vaultState.access) do
-        if a.modem == from and (a.role == "admin" or a.role == "owner") then
-            local text = ("Unscheduled off-world activation at %s"):format(tostring(a.name or name))
-            clientEnv.log(text)
-            chat.show(text)
-            pcall(computer.beep, 1000, 0.3)
-            return
-        end
-    end
-end
 clientEnv.listen()
-event.listen("modem_message", onAlarm)
 
 ---------------------------------------------------------------------------- commands
 -- The command bar: ; focuses it. Commands are separated by ;, words by spaces. Each screen adds
@@ -813,11 +799,10 @@ local function closeClient()
         pcall(root.Destroy, root, true) -- a root frame's Destroy also unregisters its screen event listeners
     end
     loom.onKey(nil)
-    event.cancel(saveTimer)
+    if saveTimer then event.cancel(saveTimer) end
     event.cancel(sleepTimer)
     event.ignore("key_down", onKey)
     event.ignore("touch", onTouch)
-    event.ignore("modem_message", onAlarm)
     pcall(clientEnv.peer.stop)
     clientEnv.link.stop()
     local saved, saveError = clientVault:save()
