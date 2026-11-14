@@ -1,5 +1,5 @@
 -- Guide screen: how to use GNS. Up and Down (or the mouse wheel) scroll it.
-local _, clientEnv, _, frame, R = ...
+local _, clientEnv = ...
 local ui = clientEnv.ui
 local C = ui.C
 
@@ -97,22 +97,26 @@ room [on|off]   gate room mode (at the gate): the screen shows the dialing room
 At the gate itself, gns autorun on starts the gate server when the computer boots.
 ]]
 
--- Wrapped to the screen, headings in amber.
-local lines = {}
-local width = R.w - 6
-for line in (TEXT .. "\n"):gmatch("(.-)\n") do
-    local heading = line:match("^#(.*)")
-    if heading then
-        if #lines > 0 then lines[#lines + 1] = {""} end
-        lines[#lines + 1] = {"▌ " .. heading, C.amber}
-    elseif line:match("^%S+.-   ") or line == "" then
-        lines[#lines + 1] = {line, C.dim} -- a command table row
-    else
-        for _, l in ipairs(ui.wrap(line, width)) do lines[#lines + 1] = {l, C.text} end
+local M = {}
+function M.build(frame, R)
+    -- Wrapped to the screen, headings in amber.
+    local lines = {}
+    local width = R.w - 6
+    for line in (TEXT .. "\n"):gmatch("(.-)\n") do
+        local heading = line:match("^#(.*)")
+        if heading then
+            if #lines > 0 then lines[#lines + 1] = {""} end
+            lines[#lines + 1] = {"▌ " .. heading, C.amber}
+        elseif line:match("^%S+.-   ") or line == "" then
+            lines[#lines + 1] = {line, C.dim} -- a command table row
+        else
+            for _, l in ipairs(ui.wrap(line, width)) do lines[#lines + 1] = {l, C.text} end
+        end
     end
+    ui.card(frame, 1, 1, R.w, R.h, "GUIDE", "↑ ↓ scroll")
+    local list = ui.List(frame, 2, 2, R.w - 2, R.h - 1, {items = lines, scrollOnly = true,
+        cells = function(item) return {{2, item[1], item[2]}} end})
+    return {first = list}
 end
-ui.card(frame, 1, 1, R.w, R.h, "GUIDE", "↑ ↓ scroll")
-local list = ui.List(frame, 2, 2, R.w - 2, R.h - 1, {items = lines, scrollOnly = true,
-    cells = function(item) return {{2, item[1], item[2]}} end})
 
-return {first = list}
+return M

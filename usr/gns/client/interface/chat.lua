@@ -4,7 +4,7 @@
 -- Settings takes them without asking; blocked devices are ignored.
 --
 -- Commands: find, say, share, block, accept, refuse.
-local _, clientEnv, _, frame, R = ...
+local _, clientEnv = ...
 local ui = clientEnv.ui
 local C = ui.C
 local loom = require("loom")
@@ -12,7 +12,6 @@ local unicode = require("unicode")
 local chat, node, settings = clientEnv.chat, clientEnv.peer, clientEnv.settings
 local database, vaultState = clientEnv.database, clientEnv.vault.state
 local log = clientEnv.log
-local wide = R.wide
 
 local function show(text) chat.show(text) log(text) end
 
@@ -114,7 +113,7 @@ end
 -- Choose the device, the gates and whether their IDCs go too. selected: rows chosen already.
 -- Where addresses are hidden (a kiosk), nothing is shared, as the GATES screen's SHARE.
 local HIDDEN = "Addresses and IDCs are hidden on this device (Settings)."
-function clientEnv.openShare(selected)
+local function openShare(selected)
     if ui.modalOpen() then return end
     if not settings.showCodes then log(HIDDEN) return end
     if #chat.devices == 0 then
@@ -164,119 +163,124 @@ function clientEnv.openShare(selected)
 end
 
 ---------------------------------------------------------------------------- the screen
-local lw = wide and 36 or 18
-local pitch = wide and 2 or 1
-ui.card(frame, 1, 1, lw, R.h - 4, "DEVICES", wide and function() return #chat.devices .. " found" end or nil, function(self)
-    if not wide then return end
-    local d = chat.to
-    local dy = R.h - 13
-    self:text(3, dy, "CHAT WITH", C.faint, C.card)
-    if not d then
-        self:text(3, dy + 1, "everyone found", C.amber, C.card)
-        self:text(3, dy + 2, ui.pad("Enter on a device chats with it alone.", lw - 4), C.faint, C.card)
-        return
-    end
-    self:text(3, dy + 1, ui.pad(d.name, lw - 4), C.amber, C.card)
-    self:text(3, dy + 2, d.fingerprint, C.dim, C.card)
-    self:text(3, dy + 4, "Enter on it again: everyone.", C.faint, C.card)
-end)
-local devices = ui.List(frame, 1, 2, lw, wide and (R.h - 18) or (R.h - 6), {items = chat.devices, pitch = pitch,
-    empty = "None found yet. FIND looks for GNS devices in range.",
-    cells = function(d, _, w)
-        if wide then return {{2, ui.pad(d.name, 14)}, {17, d.fingerprint:sub(1, 13), C.faint}} end
-        return {{1, ui.pad(d.name, w - 1)}}
-    end,
-    selected = function(d) return chat.to and chat.to.fingerprint == d.fingerprint end,
-    press = function(d)
-        chat.to = (not chat.to or chat.to.fingerprint ~= d.fingerprint) and d or nil
-    end})
-local bw = (lw - 1) // 2
-ui.Button(frame, 1, R.h - 2, bw, 3, "FIND", C.amber, C.black, function() local m = find() if m then log(m) end end, {around = C.page})
-ui.Button(frame, bw + 3, R.h - 2, lw - bw - 2, 3, "BLOCK", C.red, C.black, function()
-    local d = devices:cursorItem()
-    if d then block(d.fingerprint, d.name) else log("Choose a device to block.") end
-end, {around = C.page})
+local M = {openShare = openShare}
+function M.build(frame, R)
+    local wide = R.wide
+    local lw = wide and 36 or 18
+    local pitch = wide and 2 or 1
+    ui.card(frame, 1, 1, lw, R.h - 4, "DEVICES", wide and function() return #chat.devices .. " found" end or nil, function(self)
+        if not wide then return end
+        local d = chat.to
+        local dy = R.h - 13
+        self:text(3, dy, "CHAT WITH", C.faint, C.card)
+        if not d then
+            self:text(3, dy + 1, "everyone found", C.amber, C.card)
+            self:text(3, dy + 2, ui.pad("Enter on a device chats with it alone.", lw - 4), C.faint, C.card)
+            return
+        end
+        self:text(3, dy + 1, ui.pad(d.name, lw - 4), C.amber, C.card)
+        self:text(3, dy + 2, d.fingerprint, C.dim, C.card)
+        self:text(3, dy + 4, "Enter on it again: everyone.", C.faint, C.card)
+    end)
+    local devices = ui.List(frame, 1, 2, lw, wide and (R.h - 18) or (R.h - 6), {items = chat.devices, pitch = pitch,
+        empty = "None found yet. FIND looks for GNS devices in range.",
+        cells = function(d, _, w)
+            if wide then return {{2, ui.pad(d.name, 14)}, {17, d.fingerprint:sub(1, 13), C.faint}} end
+            return {{1, ui.pad(d.name, w - 1)}}
+        end,
+        selected = function(d) return chat.to and chat.to.fingerprint == d.fingerprint end,
+        press = function(d)
+            chat.to = (not chat.to or chat.to.fingerprint ~= d.fingerprint) and d or nil
+        end})
+    local bw = (lw - 1) // 2
+    ui.Button(frame, 1, R.h - 2, bw, 3, "FIND", C.amber, C.black, function() local m = find() if m then log(m) end end, {around = C.page})
+    ui.Button(frame, bw + 3, R.h - 2, lw - bw - 2, 3, "BLOCK", C.red, C.black, function()
+        local d = devices:cursorItem()
+        if d then block(d.fingerprint, d.name) else log("Choose a device to block.") end
+    end, {around = C.page})
 
-local cx, cw = lw + 3, R.w - lw - 2
-local sw = cw - 18
-ui.card(frame, cx, 1, cw, 5, "SHARED WITH YOU", function() return #chat.pending > 0 and (#chat.pending .. " waiting") or "none waiting" end)
-local pending = ui.List(frame, cx, 2, sw, 4, {items = chat.pending,
-    empty = "Gates other devices share appear here.",
-    cells = function(s, _, w)
-        local names = {}
-        for i = 1, math.min(#s.rows, 4) do names[i] = s.rows[i].Name end
-        local text = ("%s: %s%s"):format(s.from.name, table.concat(names, ", "), #s.rows > 4 and ", ..." or "")
-        local tag = chat.hasIDCs(s) and "[with IDCs]" or ""
-        return {{2, ui.pad(text, w - 15)}, {w - 12, tag, C.amber}}
-    end})
-local function pendingIndex() local _, i = pending:cursorItem() return chat.pending[i] and i end
-ui.Button(frame, cx + cw - 16, 2, 14, 1, "ACCEPT", C.green, C.black, function()
-    if pendingIndex() then log(accept(pendingIndex())) end
-end)
-ui.Button(frame, cx + cw - 16, 3, 14, 1, "REFUSE", C.raised, C.text, function()
-    if pendingIndex() then log(refuse(pendingIndex())) end
-end)
-ui.Button(frame, cx + cw - 16, 4, 14, 1, wide and "BLOCK SENDER" or "BLOCK", C.red, C.black, function()
-    local i = pendingIndex()
-    if i then
-        local s = table.remove(chat.pending, i)
-        block(s.from.fingerprint, s.from.name)
-    end
-end)
+    local cx, cw = lw + 3, R.w - lw - 2
+    local sw = cw - 18
+    ui.card(frame, cx, 1, cw, 5, "SHARED WITH YOU", function() return #chat.pending > 0 and (#chat.pending .. " waiting") or "none waiting" end)
+    local pending = ui.List(frame, cx, 2, sw, 4, {items = chat.pending,
+        empty = "Gates other devices share appear here.",
+        cells = function(s, _, w)
+            local names = {}
+            for i = 1, math.min(#s.rows, 4) do names[i] = s.rows[i].Name end
+            local text = ("%s: %s%s"):format(s.from.name, table.concat(names, ", "), #s.rows > 4 and ", ..." or "")
+            local tag = chat.hasIDCs(s) and "[with IDCs]" or ""
+            return {{2, ui.pad(text, w - 15)}, {w - 12, tag, C.amber}}
+        end})
+    local function pendingIndex() local _, i = pending:cursorItem() return chat.pending[i] and i end
+    ui.Button(frame, cx + cw - 16, 2, 14, 1, "ACCEPT", C.green, C.black, function()
+        if pendingIndex() then log(accept(pendingIndex())) end
+    end)
+    ui.Button(frame, cx + cw - 16, 3, 14, 1, "REFUSE", C.raised, C.text, function()
+        if pendingIndex() then log(refuse(pendingIndex())) end
+    end)
+    ui.Button(frame, cx + cw - 16, 4, 14, 1, wide and "BLOCK SENDER" or "BLOCK", C.red, C.black, function()
+        local i = pendingIndex()
+        if i then
+            local s = table.remove(chat.pending, i)
+            block(s.from.fingerprint, s.from.name)
+        end
+    end)
 
--- Messages as bubbles, newest at the bottom: theirs on the left, yours on the right.
-local top, bottom = 7, R.h - 2
-local function chatNote()
-    if chat.to then return wide and (chat.to.name .. " · " .. chat.to.fingerprint:sub(1, 13)) or chat.to.name end
-    return #chat.devices > 0 and ("everyone · " .. #chat.devices) or nil
+    -- Messages as bubbles, newest at the bottom: theirs on the left, yours on the right.
+    local top, bottom = 7, R.h - 2
+    local function chatNote()
+        if chat.to then return wide and (chat.to.name .. " · " .. chat.to.fingerprint:sub(1, 13)) or chat.to.name end
+        return #chat.devices > 0 and ("everyone · " .. #chat.devices) or nil
+    end
+    ui.card(frame, cx, top, cw, bottom - top + 1, function() return "CHAT · " .. (chatNote() or "nobody found yet") end, nil, function(self)
+        local rows, room, max = {}, bottom - top - 1, cw - 10
+        local i = #chat.lines
+        while i >= 1 and #rows < room do
+            local e = chat.lines[i]
+            local lines = ui.wrap(e.text, e.who and max or (cw - 6))
+            local block = {}
+            if e.who then
+                block[#block + 1] = {kind = "who", e = e}
+                for _, l in ipairs(lines) do block[#block + 1] = {kind = "bubble", e = e, text = l} end
+            else
+                for _, l in ipairs(lines) do block[#block + 1] = {kind = "note", e = e, text = l} end
+            end
+            block[#block + 1] = {kind = "gap"}
+            for j = #block, 1, -1 do table.insert(rows, 1, block[j]) end
+            i = i - 1
+        end
+        while #rows > room do table.remove(rows, 1) end
+        for r, row in ipairs(rows) do
+            local y = r + 1
+            local e = row.e
+            if row.kind == "who" then
+                local label = e.who .. " · " .. e.time
+                self:text(e.mine and (cw - unicode.len(label) - 1) or 3, y, label, C.faint, C.card)
+            elseif row.kind == "bubble" then
+                local w = unicode.len(row.text) + 2
+                self:block(e.mine and (cw - w - 1) or 3, y, w, row.text, e.mine and C.blue or C.raised, e.mine and C.black or C.text)
+            elseif row.kind == "note" then
+                self:text(3, y, ui.pad(e.time .. "  " .. row.text, cw - 4), C.faint, C.card)
+            end
+        end
+    end)
+    ui.Button(frame, cx + cw - 9, top, 9, 1, "SHARE", C.blue, C.black, function() openShare() end, {around = C.head})
+    local field = ui.Field(frame, cx, R.h, cw - 11, {clear = true, around = C.page,
+        placeholder = "Message · Enter sends", submit = function(text) local m = say(text) if m then log(m) end end})
+    ui.Button(frame, cx + cw - 9, R.h, 9, 1, "SEND", C.amber, C.black, function()
+        local m = say(field:text())
+        field:text("")
+        if m then log(m) end
+    end, {around = C.page})
+    return {first = devices, shown = function() chat.unread = 0 loom.invalidate() end}
 end
-ui.card(frame, cx, top, cw, bottom - top + 1, function() return "CHAT · " .. (chatNote() or "nobody found yet") end, nil, function(self)
-    local rows, room, max = {}, bottom - top - 1, cw - 10
-    local i = #chat.lines
-    while i >= 1 and #rows < room do
-        local e = chat.lines[i]
-        local lines = ui.wrap(e.text, e.who and max or (cw - 6))
-        local block = {}
-        if e.who then
-            block[#block + 1] = {kind = "who", e = e}
-            for _, l in ipairs(lines) do block[#block + 1] = {kind = "bubble", e = e, text = l} end
-        else
-            for _, l in ipairs(lines) do block[#block + 1] = {kind = "note", e = e, text = l} end
-        end
-        block[#block + 1] = {kind = "gap"}
-        for j = #block, 1, -1 do table.insert(rows, 1, block[j]) end
-        i = i - 1
-    end
-    while #rows > room do table.remove(rows, 1) end
-    for r, row in ipairs(rows) do
-        local y = r + 1
-        local e = row.e
-        if row.kind == "who" then
-            local label = e.who .. " · " .. e.time
-            self:text(e.mine and (cw - unicode.len(label) - 1) or 3, y, label, C.faint, C.card)
-        elseif row.kind == "bubble" then
-            local w = unicode.len(row.text) + 2
-            self:block(e.mine and (cw - w - 1) or 3, y, w, row.text, e.mine and C.blue or C.raised, e.mine and C.black or C.text)
-        elseif row.kind == "note" then
-            self:text(3, y, ui.pad(e.time .. "  " .. row.text, cw - 4), C.faint, C.card)
-        end
-    end
-end)
-ui.Button(frame, cx + cw - 9, top, 9, 1, "SHARE", C.blue, C.black, function() clientEnv.openShare() end, {around = C.head})
-local field = ui.Field(frame, cx, R.h, cw - 11, {clear = true, around = C.page,
-    placeholder = "Message · Enter sends", submit = function(text) local m = say(text) if m then log(m) end end})
-ui.Button(frame, cx + cw - 9, R.h, 9, 1, "SEND", C.amber, C.black, function()
-    local m = say(field:text())
-    field:text("")
-    if m then log(m) end
-end, {around = C.page})
 
 ---------------------------------------------------------------------------- commands
-clientEnv.command({"find"}, "find: look for GNS devices in range", function() return find() end)
-clientEnv.command({"say"}, "say <text>: chat with the chosen device, or every device found", function(_, line)
+clientEnv.command("find", "find: look for GNS devices in range", function() return find() end)
+clientEnv.command("say", "say <text>: chat with the chosen device, or every device found", function(_, line)
     return say(line:match("^%s*%S+%s*(.*)$") or "")
 end)
-clientEnv.command({"share"}, "share <gate> [gate ...] [idc] [@device]: share gates; idc sends their IDCs too", function(args)
+clientEnv.command("share", "share <gate> [gate ...] [idc] [@device]: share gates; idc sends their IDCs too", function(args)
     if not settings.showCodes then return HIDDEN end
     local rows, withIDCs, device = {}, false, chat.to or (#chat.devices == 1 and chat.devices[1]) or nil
     for _, a in ipairs(args) do
@@ -294,16 +298,16 @@ clientEnv.command({"share"}, "share <gate> [gate ...] [idc] [@device]: share gat
     if not device then return "Choose a device: share ... @name (find lists them)." end
     return share(device, rows, withIDCs)
 end)
-clientEnv.command({"block"}, "block <device>: drop a device's chat and shares from now on (Settings unblocks)", function(args)
+clientEnv.command("block", "block <device>: drop a device's chat and shares from now on (Settings unblocks)", function(args)
     local d = deviceNamed(args[1])
     if not d then return "No device " .. tostring(args[1]) .. " found." end
     block(d.fingerprint, d.name)
 end)
-clientEnv.command({"accept"}, "accept [n]: take the gates shared with you (the first share, or the nth)", function(args)
+clientEnv.command("accept", "accept [n]: take the gates shared with you (the first share, or the nth)", function(args)
     return accept(math.tointeger(tonumber(args[1])))
 end)
-clientEnv.command({"refuse"}, "refuse [n]: refuse gates shared with you", function(args)
+clientEnv.command("refuse", "refuse [n]: refuse gates shared with you", function(args)
     return refuse(math.tointeger(tonumber(args[1])))
 end)
 
-return {first = devices, shown = function() chat.unread = 0 loom.invalidate() end}
+return M

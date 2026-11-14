@@ -540,10 +540,15 @@ end
 -- bursts out (the kawoosh) when the wormhole opens and shrinks away when it closes. The iris is
 -- JSG's: metal blades (titanium, or darker trinium) that close in a spiral, or the shield, a
 -- glowing forcefield. The Shader animates only while something moves.
+-- One channel of mix; outside it, so the horizon's thousands of mixes a frame make no closures.
+local floor = math.floor
+local function channel(a, b, f, s)
+    local x, y = (a >> s) & 0xFF, (b >> s) & 0xFF
+    return floor(x + (y - x) * f + 0.5) << s
+end
 local function mix(a, b, f)
-    f = math.max(0, math.min(1, f))
-    local function ch(s) local x, y = (a >> s) & 0xFF, (b >> s) & 0xFF return math.floor(x + (y - x) * f + 0.5) << s end
-    return ch(16) | ch(8) | ch(0)
+    f = f < 0 and 0 or f > 1 and 1 or f
+    return channel(a, b, f, 16) | channel(a, b, f, 8) | channel(a, b, f, 0)
 end
 local KAWOOSH, CLOSING, IRIS_TIME, SHIELD_TIME = 0.8, 0.6, 1.5, 0.6
 -- Blade shades: dark, light, seam.

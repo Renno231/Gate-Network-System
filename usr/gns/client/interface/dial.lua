@@ -16,9 +16,8 @@ local unicode = require("unicode")
 local event = require("event")
 local component = require("component")
 local fs = require("filesystem")
-local handshake = dofile(gns.path.gns .. "handshake.lua")
+local handshake = clientEnv.handshake
 local entries = clientEnv.entries
-local dialing = dofile(gns.path.gns .. "dialing.lua")
 local route = dofile(gns.path.gns .. "route.lua")
 local fingerprint = clientEnv.vaultModule.fingerprint
 
@@ -31,6 +30,21 @@ local log = clientEnv.log
 local settings = clientEnv.settings
 local wide = R.wide
 local GALAXY = {MW = "Milky Way", PG = "Pegasus", UN = "Universe"}
+local TYPE = {MILKYWAY = "MW", PEGASUS = "PG", UNIVERSE = "UN"} -- the stargate's getGateType
+local ORIGIN = {MW = "Point of Origin", PG = "Subido", UN = "Glyph 17"}
+-- Each galaxy's glyph names, for the glyph touch view and the address book's glyph editor.
+local GLYPHS = {
+    MW = {"Andromeda", "Aquarius", "Aries", "Auriga", "Bootes", "Cancer", "Canis Minor", "Capricornus", "Centaurus", "Cetus",
+        "Corona Australis", "Crater", "Equuleus", "Eridanus", "Gemini", "Hydra", "Leo", "Leo Minor", "Libra", "Lynx",
+        "Microscopium", "Monoceros", "Norma", "Orion", "Pegasus", "Perseus", "Pisces", "Piscis Austrinus", "Sagittarius",
+        "Scorpius", "Sculptor", "Scutum", "Serpens Caput", "Sextans", "Taurus", "Triangulum", "Virgo"},
+    PG = {"Aaxel", "Abrin", "Acjesis", "Aldeni", "Alura", "Amiwill", "Arami", "Avoniv", "Baselai", "Bydo", "Ca Po", "Danami",
+        "Dawnre", "Ecrumig", "Elenami", "Gilltin", "Hacemill", "Hamlinto", "Illume", "Laylox", "Lenchan", "Olavii", "Once El",
+        "Poco Re", "Ramnon", "Recktic", "Robandus", "Roehi", "Salma", "Sandovi", "Setas", "Sibbron", "Tahnan", "Zamilloz", "Zeo"},
+    UN = {},
+}
+for i = 1, 36 do if i ~= 17 then GLYPHS.UN[#GLYPHS.UN + 1] = "Glyph " .. i end end
+clientEnv.GLYPHS = GLYPHS
 
 -- State kept across layout changes (the screen is built again, clientEnv stays).
 local dial = clientEnv.dialState or {busy = false, sinceScan = 0}
@@ -328,7 +342,7 @@ local function row() -- the destination row
 end
 local function galaxyOf(connection)
     local s = connection and connection.status
-    return s and dialing.TYPE[s.type] or "MW"
+    return s and TYPE[s.type] or "MW"
 end
 -- The glyphs a dial from connection's galaxy engages: six and the point of origin (all eight
 -- from another galaxy, as the gate works out).
@@ -337,7 +351,7 @@ local function plannedGlyphs(connection, r)
     local address = r and r.Address and r.Address[galaxy] or {}
     local list = {}
     for i = 1, math.min(6, #address) do list[i] = address[i] end
-    if #list > 0 then list[#list + 1] = dialing.ORIGIN[galaxy] end
+    if #list > 0 then list[#list + 1] = ORIGIN[galaxy] end
     return list
 end
 
@@ -1386,7 +1400,7 @@ function clientEnv.showGlyphs()
     if ui.modalOpen() then return end
     local c = clientEnv.fromGate()
     local galaxy = galaxyOf(c)
-    local glyphs = (clientEnv.GLYPHS or {})[galaxy] or {}
+    local glyphs = GLYPHS[galaxy] or {}
     local typed = {}
     local cell = galaxy == "UN" and 10 or 18
     local w = math.min(ui.W - 4, 2 + ((ui.W - 8) // cell) * cell + 2)

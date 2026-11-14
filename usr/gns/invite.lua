@@ -7,7 +7,7 @@ local api = require("api")
 local computer = require("computer")
 local disco = require("disco")
 local event = require("event")
-local grants = dofile("/usr/gns/grants.lua")
+local grants = ... -- grants.lua, as loaded by the caller
 
 local invite = {ENDPOINT = "gns-invite", PORT = 161, MAX_PENDING = 16}
 

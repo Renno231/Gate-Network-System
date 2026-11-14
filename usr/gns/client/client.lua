@@ -263,10 +263,11 @@ end
 ---------------------------------------------------------------------------- chat
 -- The peer service runs while the client is open, so chat lines and shared gates arrive whatever
 -- screen is showing. Entries: {time, text, who, mine}; notes have no who.
-local peer = dofile(gns.path.gns .. "peer.lua")
+local handshake = dofile(gns.path.gns .. "handshake.lua")
+local peer = loadfile(gns.path.gns .. "peer.lua")(handshake, vault.fingerprint)
 local entries = dofile(gns.path.gns .. "entries.lua")
 -- One copy each of the stateless modules, for the screens too.
-clientEnv.vaultModule, clientEnv.entries = vault, entries
+clientEnv.vaultModule, clientEnv.entries, clientEnv.handshake = vault, entries, handshake
 vaultState.peerPins = vaultState.peerPins or {}
 local chat = {lines = {}, pending = {}, devices = {}, unread = 0} -- pending: shares waiting for an answer
 clientEnv.chat = chat
@@ -390,9 +391,16 @@ local lastInput = computer.uptime()
 local IDLE = 5 * 60
 function clientEnv.idle() return computer.uptime() - lastInput >= IDLE end
 local onTablet = component.isAvailable("tablet")
+-- The screens loaded beside Dial: name → the module its file returned (see "the screens").
+local loaded = {}
+-- A screen still at work while not shown (Access inviting or joining): a tablet stays on for it,
+-- as players may still be on their way.
+local function busy()
+    for _, m in pairs(loaded) do if m.busy and m.busy() then return true end end
+end
 local sleepTimer = event.timer(15, function()
     local minutes = settings.tabletSleep
-    if clientEnv.inviting and clientEnv.inviting() then lastInput = computer.uptime() end
+    if busy() then lastInput = computer.uptime() end
     if not onTablet or minutes <= 0 or computer.uptime() - lastInput < minutes * 60 then return end
     local saved, err = clientVault:save()
     if not saved then clientEnv.log("Not shutting down: the vault was not saved: " .. tostring(err)) lastInput = computer.uptime() return end
@@ -407,10 +415,21 @@ clientEnv.listen()
 
 ---------------------------------------------------------------------------- commands
 -- The command bar: ; focuses it. Commands are separated by ;, words by spaces. Each screen adds
--- its own: clientEnv.command(names, usage, fn(args, line)); fn returns the text to report.
+-- its own: clientEnv.command(names, usage, fn(args, line)); fn returns the text to report. A
+-- screen that loads on demand names a command by its first name only: its names are in COMMANDS.
+local COMMANDS = {
+    gates = {{"new"}, {"add", "address"}, {"idc"}, {"import"}, {"loc", "location"}, {"gen", "generate"}, {"rename", "rn"},
+        {"delete", "del", "remove", "rmv"}, {"swap"}, {"move", "mv"}, {"edit"}},
+    chat = {{"find"}, {"say"}, {"share"}, {"block"}, {"accept"}, {"refuse"}},
+    access = {{"grants"}, {"invite"}, {"join"}, {"cut"}},
+    settings = {{"set", "s"}, {"get", "g"}, {"backup"}, {"backups"}, {"restore"}, {"profile", "pf"}},
+}
+local namesOf = {}
+for _, list in pairs(COMMANDS) do for _, names in ipairs(list) do namesOf[names[1]] = names end end
 local commands, commandOrder = {}, {}
-function clientEnv.command(names, usage, fn)
-    local spec = {names = names, usage = usage, fn = fn}
+function clientEnv.command(names, usage, fn, screen)
+    if type(names) == "string" then names = namesOf[names] end
+    local spec = {names = names, usage = usage, fn = fn, screen = screen}
     local old = commands[names[1]]
     for _, name in ipairs(names) do commands[name] = spec end
     for i, s in ipairs(commandOrder) do -- screens built again (a new layout) replace their commands
@@ -439,7 +458,13 @@ end
 clientEnv.runCommands = runCommands
 clientEnv.command({"help", "cmds", "?"}, "help [command]: the commands, or how to use one", function(args)
     local spec = args[1] and commands[args[1]:lower()]
-    if spec then return spec.usage .. (#spec.names > 1 and ("  (also " .. table.concat(spec.names, ", ", 2) .. ")") or "") end
+    if spec and spec.screen then -- not loaded: the usage is in the screen's file
+        clientEnv.loadInterface(spec.screen)
+        local screen = spec.screen
+        spec = commands[args[1]:lower()]
+        clientEnv.closeInterface(screen)
+    end
+    if spec and spec.usage then return spec.usage .. (#spec.names > 1 and ("  (also " .. table.concat(spec.names, ", ", 2) .. ")") or "") end
     local names = {}
     for _, s in ipairs(commandOrder) do names[#names + 1] = s.names[1] end
     return "Commands: " .. table.concat(names, ", ") .. ". help <command> shows one. Gates are numbers in the address book or names (_ for spaces)."
@@ -557,12 +582,99 @@ local SCREENS = {
     {"dial", "DIAL", "Dial"}, {"gates", "GATES", "Address book"}, {"chat", "CHAT", "Chat & share"},
     {"access", "ACCESS", "Access & grants"}, {"settings", "SETTINGS", "Settings"}, {"guide", "GUIDE", "Guide"},
 }
-local frames, screenInfo = {}, {}
+local frames, screenInfo = {}, {} -- Dial's and the shown screen's
 clientEnv.screen = "dial"
--- Shows a screen and puts the focus on its first control.
+local interfacePath = gns.path.clientDirectory .. "interface/"
+local R -- this build's screen area
+
+---------------------------------------------------------------------------- the screens
+-- Dial is always loaded. The other screens load when opened and unload when left, and a command
+-- of theirs loads its screen just to run (COMMANDS routes it), so the screens nobody uses take no
+-- memory. A screen's file runs with (gns, clientEnv, path): its top level holds its logic and
+-- commands, and it returns {build = function(frame, R) → {first, shown}, busy, close}. A busy
+-- screen stays loaded when left, until it is not; close undoes what it set up, when it unloads.
+function clientEnv.loadInterface(name)
+    if loaded[name] then return loaded[name] end
+    local path = interfacePath .. name .. ".lua"
+    local chunk, err = loadfile(path)
+    if not chunk then return nil, err end
+    local ok, m = pcall(chunk, gns, clientEnv, path)
+    if not ok then return nil, m end
+    loaded[name] = m
+    return m
+end
+local function stub(screen, names)
+    clientEnv.command(names, nil, function(args, line)
+        local m, err = clientEnv.loadInterface(screen)
+        if not m then error(err, 0) end
+        local spec = commands[names[1]]
+        if spec.screen then error(screen .. ".lua has no command " .. names[1], 0) end
+        local ok, result = pcall(spec.fn, args, line)
+        clientEnv.closeInterface(screen)
+        if not ok then error(result, 0) end
+        return result
+    end, screen)
+end
+function clientEnv.closeInterface(name)
+    local m = loaded[name]
+    if not m or name == clientEnv.screen or (m.busy and m.busy()) then return end
+    loaded[name] = nil
+    if m.close then pcall(m.close) end
+    for _, names in ipairs(COMMANDS[name] or {}) do stub(name, names) end
+end
+for _, s in ipairs({"gates", "chat", "access", "settings"}) do
+    for _, names in ipairs(COMMANDS[s]) do stub(s, names) end
+end
+-- SHARE on Gates opens Chat's share dialog.
+function clientEnv.openShare(rows)
+    local m = clientEnv.loadInterface("chat")
+    if m then m.openShare(rows) end
+    clientEnv.closeInterface("chat")
+end
+-- The home gate: one gate of the address book (home on Dial dials it with its IDC).
+function clientEnv.setHome(r)
+    for _, x in ipairs(clientEnv.database) do x.home = nil end
+    if r then r.home = true end
+    clientEnv.changed()
+    loom.invalidate()
+end
+
+-- A screen's frame, built by run(frame); a screen that fails shows why.
+local function screenFrame(run)
+    local frame = loom.widget.Frame(shell, R.x, R.y)
+    frame:size(R.w, R.h)
+    frame:backgroundColor(C.page)
+    frame:visible(false)
+    local ok, info = pcall(run, frame)
+    if not ok then
+        ui.Paint(frame, 1, 1, R.w, R.h, function(self)
+            for i, line in ipairs(ui.wrap("This screen failed to load: " .. tostring(info), R.w - 4)) do
+                self:text(3, i + 1, line, C.red, C.page)
+            end
+        end)
+    end
+    return frame, ok and type(info) == "table" and info or {}
+end
+
+-- Shows a screen and puts the focus on its first control. The screen left is dropped.
+local SCREEN = {}
+for _, s in ipairs(SCREENS) do SCREEN[s[1]] = true end
 function clientEnv.show(name)
-    if not frames[name] then return end
+    if not SCREEN[name] then return end
+    local old = clientEnv.screen
     clientEnv.screen = name
+    if old ~= name and old ~= "dial" and frames[old] then
+        frames[old]:Destroy(true)
+        frames[old], screenInfo[old] = nil, nil
+    end
+    for n in pairs(loaded) do clientEnv.closeInterface(n) end
+    if not frames[name] then
+        frames[name], screenInfo[name] = screenFrame(function(frame)
+            local m, err = clientEnv.loadInterface(name)
+            if not m then error(err, 0) end
+            return m.build(frame, {w = R.w, h = R.h, wide = ui.wide})
+        end)
+    end
     for n, f in pairs(frames) do f:visible(n == name) f:enabled(n == name) end
     if name == "chat" then chat.unread = 0 end
     local first = screenInfo[name] and screenInfo[name].first
@@ -596,7 +708,6 @@ function clientEnv.fromGate()
     return other or best
 end
 
-local interfacePath = gns.path.clientDirectory .. "interface/"
 local function build()
     for k in pairs(frames) do frames[k] = nil end
     for k in pairs(screenInfo) do screenInfo[k] = nil end
@@ -740,28 +851,12 @@ local function build()
         end)
     end
 
-    -- The screens.
-    local R = {x = navW + 3, y = 3, w = W - navW - (wide and 4 or 3), h = H - 4}
-    for _, s in ipairs(SCREENS) do
-        local frame = loom.widget.Frame(shell, R.x, R.y)
-        frame:size(R.w, R.h)
-        frame:backgroundColor(C.page)
-        frame:visible(false)
-        frames[s[1]] = frame
-        local path = interfacePath .. s[1] .. ".lua"
-        local loaded, err = loadfile(path)
-        local ok, info = false, err
-        if loaded then ok, info = pcall(loaded, gns, clientEnv, path, frame, {w = R.w, h = R.h, wide = wide}) end
-        if ok then
-            screenInfo[s[1]] = type(info) == "table" and info or {}
-        else
-            ui.Paint(frame, 1, 1, R.w, R.h, function(self)
-                for i, line in ipairs(ui.wrap("This screen failed to load: " .. tostring(info), R.w - 4)) do
-                    self:text(3, i + 1, line, C.red, C.page)
-                end
-            end)
-        end
-    end
+    -- Dial, built with every layout; show builds the screen in use.
+    R = {x = navW + 3, y = 3, w = W - navW - (wide and 4 or 3), h = H - 4}
+    local path = interfacePath .. "dial.lua"
+    frames.dial, screenInfo.dial = screenFrame(function(frame)
+        return assert(loadfile(path))(gns, clientEnv, path, frame, {w = R.w, h = R.h, wide = wide})
+    end)
     clientEnv.show(clientEnv.screen)
     return root
 end
@@ -797,6 +892,10 @@ local function closeClient()
         built = false
         for _, fn in ipairs(clientEnv.onClose) do pcall(fn) end
         pcall(root.Destroy, root, true) -- a root frame's Destroy also unregisters its screen event listeners
+    end
+    for name, m in pairs(loaded) do
+        loaded[name] = nil
+        if m.close then pcall(m.close) end
     end
     loom.onKey(nil)
     if saveTimer then event.cancel(saveTimer) end

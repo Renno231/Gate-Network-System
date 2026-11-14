@@ -9,19 +9,18 @@
 -- vaultState.access[gate key] = {name, modem, port, wake, owner, role}.
 --
 -- Commands: grants, invite, join, cut.
-local gns, clientEnv, _, frame, R = ...
+local gns, clientEnv = ...
 local ui = clientEnv.ui
 local C = ui.C
 local loom = require("loom")
 local event = require("event")
 local grants = dofile(gns.path.gns .. "grants.lua")
-local invite = dofile(gns.path.gns .. "invite.lua")
+local invite = loadfile(gns.path.gns .. "invite.lua")(grants)
 local fingerprint = clientEnv.vaultModule.fingerprint
 
 local vaultState = clientEnv.vault.state
 local identity = vaultState.identity
 local log = clientEnv.log
-local wide = R.wide
 local ROLE_COLOUR = {owner = C.amber, admin = C.blue, user = C.text, cut = C.red}
 
 local function save()
@@ -140,9 +139,6 @@ local function stopInvite()
     if host then host.stop() end
     host, as, queue, timer, answering = nil, nil, {}, nil, nil
 end
-clientEnv.onClose[#clientEnv.onClose + 1] = stopInvite
--- A tablet stays on while it invites: players may still be on their way to JOIN.
-function clientEnv.inviting() return host ~= nil end
 local function startInvite(issuer)
     queue, as = {}, issuer
     local this
@@ -199,7 +195,6 @@ local function keep(offer, role)
     save()
 end
 local joining, closed = false, false
-clientEnv.onClose[#clientEnv.onClose + 1] = function() closed = true end
 local function join()
     if joining then log("Still waiting for an answer.") return end
     local function ask(name)
@@ -231,85 +226,90 @@ local function cutOff(issued)
 end
 
 ---------------------------------------------------------------------------- the screen
-local view = clientEnv.accessView or "gates" -- compact: which list shows
-local VIEWS = {"gates", "held", "issued"}
-local TITLE = {gates = "GATES", held = "GRANTS HELD", issued = "GRANTS ISSUED"}
-local function header(self)
-    local owned, admin = 0, 0
-    for _, a in pairs(vaultState.access) do
-        if a.role == "owner" then owned = owned + 1 elseif a.role == "admin" then admin = admin + 1 end
+local M = {}
+function M.build(frame, R)
+    local wide = R.wide
+    local view = clientEnv.accessView or "gates" -- compact: which list shows
+    local VIEWS = {"gates", "held", "issued"}
+    local TITLE = {gates = "GATES", held = "GRANTS HELD", issued = "GRANTS ISSUED"}
+    local function header(self)
+        local owned, admin = 0, 0
+        for _, a in pairs(vaultState.access) do
+            if a.role == "owner" then owned = owned + 1 elseif a.role == "admin" then admin = admin + 1 end
+        end
+        self:text(3, 2, ui.pad(("You: %s · %s"):format(tostring(clientEnv.player or "player unknown"), short(identity.public)), R.w - 4), C.amber, C.card)
+        local line = ("%d gates owned, admin at %d, %d grants held, %d issued"):format(owned, admin, #vaultState.grants, #vaultState.issued)
+        if host then line = line .. (" · inviting as %s, %d waiting"):format(as.label, #queue) end
+        self:text(3, 3, ui.pad(line, R.w - 4), C.faint, C.card)
     end
-    self:text(3, 2, ui.pad(("You: %s · %s"):format(tostring(clientEnv.player or "player unknown"), short(identity.public)), R.w - 4), C.amber, C.card)
-    local line = ("%d gates owned, admin at %d, %d grants held, %d issued"):format(owned, admin, #vaultState.grants, #vaultState.issued)
-    if host then line = line .. (" · inviting as %s, %d waiting"):format(as.label, #queue) end
-    self:text(3, 3, ui.pad(line, R.w - 4), C.faint, C.card)
-end
 
-local inviteLabel = function() return host and "STOP" or "INVITE" end
-local inviteColour = function() return host and C.red or C.green end
-ui.card(frame, 1, 1, R.w, 4, "ACCESS", nil, header)
-local bx = R.w - (wide and 54 or 44)
-local first = ui.Button(frame, bx, 2, wide and 12 or 9, 1, "SET UP", C.amber, C.black, setUp)
-ui.Button(frame, bx + (wide and 14 or 11), 2, wide and 12 or 9, 1, inviteLabel, inviteColour, C.black, toggleInvite)
-ui.Button(frame, bx + (wide and 28 or 22), 2, wide and 12 or 9, 1, "JOIN", C.blue, C.black, join)
+    local inviteLabel = function() return host and "STOP" or "INVITE" end
+    local inviteColour = function() return host and C.red or C.green end
+    ui.card(frame, 1, 1, R.w, 4, "ACCESS", nil, header)
+    local bx = R.w - (wide and 54 or 44)
+    local first = ui.Button(frame, bx, 2, wide and 12 or 9, 1, "SET UP", C.amber, C.black, setUp)
+    ui.Button(frame, bx + (wide and 14 or 11), 2, wide and 12 or 9, 1, inviteLabel, inviteColour, C.black, toggleInvite)
+    ui.Button(frame, bx + (wide and 28 or 22), 2, wide and 12 or 9, 1, "JOIN", C.blue, C.black, join)
 
-local gateCells = function(row, _, w)
-    local a = row.a
-    return {{2, ui.pad(tostring(a.name), w - 26)}, {w - 23, "[" .. tostring(a.role) .. "]", ROLE_COLOUR[a.role] or C.text},
-        {w - 13, a.wake and "wake" or "", C.dim}, {w - 7, inRange(row.key) and "near" or "", C.green}}
-end
-local heldCells = function(g, _, w)
-    local by = g.signer ~= g.owner and ("  by " .. short(g.signer)) or "" -- an admin signed it
-    return {{2, ui.pad(scopeOf(g) .. by, w - 12)}, {w - 9, "[" .. g.role .. "]", ROLE_COLOUR[g.role]}}
-end
-local issuedCells = function(x, _, w)
-    local g = x.grant
-    local role = x.cut and "cut" or g.role
-    return {{2, ui.pad(g.name, 16)}, {19, ui.pad(scopeOf(g), w - 30)}, {w - 9, "[" .. role .. "]", ROLE_COLOUR[role]}}
-end
-local issuedList
-local ly, lh = 6, R.h - 7
-if wide then
-    local w3 = (R.w - 4) // 3
-    ui.card(frame, 1, ly, w3, lh, "GATES", function() return #gateRows() .. "" end)
-    ui.List(frame, 1, ly + 1, w3, lh - 1, {items = gateRows, cells = gateCells,
-        empty = "None yet. SET UP a gate in range, or JOIN to be granted one."})
-    ui.card(frame, w3 + 3, ly, w3, lh, "GRANTS HELD", function() return #vaultState.grants .. "" end)
-    ui.List(frame, w3 + 3, ly + 1, w3, lh - 1, {items = function() return vaultState.grants end, cells = heldCells,
-        empty = "None. JOIN while an owner or admin nearby invites."})
-    ui.card(frame, 2 * w3 + 5, ly, R.w - 2 * w3 - 4, lh, "GRANTS ISSUED", function() return #vaultState.issued .. "" end)
-    issuedList = ui.List(frame, 2 * w3 + 5, ly + 1, R.w - 2 * w3 - 4, lh - 1, {items = issuedRows, cells = issuedCells,
-        empty = "None. INVITE hands players nearby a grant."})
-    ui.Button(frame, 2 * w3 + 5, R.h, R.w - 2 * w3 - 4, 1, "CUT OFF", C.red, C.black, function() cutOff(issuedList:cursorItem()) end, {around = C.page})
-else
-    ui.card(frame, 1, ly, R.w, lh, "", nil)
-    ui.chooser(frame, 2, ly, 26, function() return TITLE[view] end, function()
-        for i, v in ipairs(VIEWS) do if v == view then view = VIEWS[(i - 2) % 3 + 1] break end end
-        clientEnv.accessView = view
-    end, function()
-        for i, v in ipairs(VIEWS) do if v == view then view = VIEWS[i % 3 + 1] break end end
-        clientEnv.accessView = view
-    end, {around = C.head})
-    issuedList = ui.List(frame, 1, ly + 1, R.w, lh - 1, {
-        items = function()
-            if view == "gates" then return gateRows() elseif view == "held" then return vaultState.grants end
-            return issuedRows()
-        end,
-        cells = function(item, i, w)
-            if view == "gates" then return gateCells(item, i, w) elseif view == "held" then return heldCells(item, i, w) end
-            return issuedCells(item, i, w)
-        end,
-        empty = function()
-            return ({gates = "None yet: SET UP or JOIN.", held = "None: JOIN to be granted.", issued = "None: INVITE grants."})[view]
-        end})
-    ui.Button(frame, R.w - 12, R.h, 12, 1, "CUT OFF", C.red, C.black, function()
-        if view ~= "issued" then log("Choose GRANTS ISSUED first.") return end
-        cutOff(issuedList:cursorItem())
-    end, {around = C.page})
+    local gateCells = function(row, _, w)
+        local a = row.a
+        return {{2, ui.pad(tostring(a.name), w - 26)}, {w - 23, "[" .. tostring(a.role) .. "]", ROLE_COLOUR[a.role] or C.text},
+            {w - 13, a.wake and "wake" or "", C.dim}, {w - 7, inRange(row.key) and "near" or "", C.green}}
+    end
+    local heldCells = function(g, _, w)
+        local by = g.signer ~= g.owner and ("  by " .. short(g.signer)) or "" -- an admin signed it
+        return {{2, ui.pad(scopeOf(g) .. by, w - 12)}, {w - 9, "[" .. g.role .. "]", ROLE_COLOUR[g.role]}}
+    end
+    local issuedCells = function(x, _, w)
+        local g = x.grant
+        local role = x.cut and "cut" or g.role
+        return {{2, ui.pad(g.name, 16)}, {19, ui.pad(scopeOf(g), w - 30)}, {w - 9, "[" .. role .. "]", ROLE_COLOUR[role]}}
+    end
+    local issuedList
+    local ly, lh = 6, R.h - 7
+    if wide then
+        local w3 = (R.w - 4) // 3
+        ui.card(frame, 1, ly, w3, lh, "GATES", function() return #gateRows() .. "" end)
+        ui.List(frame, 1, ly + 1, w3, lh - 1, {items = gateRows, cells = gateCells,
+            empty = "None yet. SET UP a gate in range, or JOIN to be granted one."})
+        ui.card(frame, w3 + 3, ly, w3, lh, "GRANTS HELD", function() return #vaultState.grants .. "" end)
+        ui.List(frame, w3 + 3, ly + 1, w3, lh - 1, {items = function() return vaultState.grants end, cells = heldCells,
+            empty = "None. JOIN while an owner or admin nearby invites."})
+        ui.card(frame, 2 * w3 + 5, ly, R.w - 2 * w3 - 4, lh, "GRANTS ISSUED", function() return #vaultState.issued .. "" end)
+        issuedList = ui.List(frame, 2 * w3 + 5, ly + 1, R.w - 2 * w3 - 4, lh - 1, {items = issuedRows, cells = issuedCells,
+            empty = "None. INVITE hands players nearby a grant."})
+        ui.Button(frame, 2 * w3 + 5, R.h, R.w - 2 * w3 - 4, 1, "CUT OFF", C.red, C.black, function() cutOff(issuedList:cursorItem()) end, {around = C.page})
+    else
+        ui.card(frame, 1, ly, R.w, lh, "", nil)
+        ui.chooser(frame, 2, ly, 26, function() return TITLE[view] end, function()
+            for i, v in ipairs(VIEWS) do if v == view then view = VIEWS[(i - 2) % 3 + 1] break end end
+            clientEnv.accessView = view
+        end, function()
+            for i, v in ipairs(VIEWS) do if v == view then view = VIEWS[i % 3 + 1] break end end
+            clientEnv.accessView = view
+        end, {around = C.head})
+        issuedList = ui.List(frame, 1, ly + 1, R.w, lh - 1, {
+            items = function()
+                if view == "gates" then return gateRows() elseif view == "held" then return vaultState.grants end
+                return issuedRows()
+            end,
+            cells = function(item, i, w)
+                if view == "gates" then return gateCells(item, i, w) elseif view == "held" then return heldCells(item, i, w) end
+                return issuedCells(item, i, w)
+            end,
+            empty = function()
+                return ({gates = "None yet: SET UP or JOIN.", held = "None: JOIN to be granted.", issued = "None: INVITE grants."})[view]
+            end})
+        ui.Button(frame, R.w - 12, R.h, 12, 1, "CUT OFF", C.red, C.black, function()
+            if view ~= "issued" then log("Choose GRANTS ISSUED first.") return end
+            cutOff(issuedList:cursorItem())
+        end, {around = C.page})
+    end
+    return {first = first}
 end
 
 ---------------------------------------------------------------------------- commands
-clientEnv.command({"grants"}, "grants: the grants this device holds and has issued", function()
+clientEnv.command("grants", "grants: the grants this device holds and has issued", function()
     local held, issued = {}, {}
     for _, g in ipairs(vaultState.grants) do held[#held + 1] = g.role .. " at " .. scopeOf(g) .. (g.signer ~= g.owner and (" (by " .. short(g.signer) .. ")") or "") end
     for _, x in ipairs(vaultState.issued) do
@@ -317,9 +317,9 @@ clientEnv.command({"grants"}, "grants: the grants this device holds and has issu
     end
     return ("Held: %s. Issued: %s."):format(#held > 0 and table.concat(held, ", ") or "none", #issued > 0 and table.concat(issued, ", ") or "none")
 end)
-clientEnv.command({"invite"}, "invite: start or stop handing out grants to players nearby", function() toggleInvite() end)
-clientEnv.command({"join"}, "join: ask an owner or admin nearby for a grant", function() join() end)
-clientEnv.command({"cut"}, "cut <name>: cut off a grant you issued", function(args)
+clientEnv.command("invite", "invite: start or stop handing out grants to players nearby", function() toggleInvite() end)
+clientEnv.command("join", "join: ask an owner or admin nearby for a grant", function() join() end)
+clientEnv.command("cut", "cut <name>: cut off a grant you issued", function(args)
     local want = table.concat(args, " "):lower()
     for _, x in ipairs(vaultState.issued) do
         if not x.cut and x.grant.name:lower() == want then return cutOff(x) end
@@ -327,4 +327,11 @@ clientEnv.command({"cut"}, "cut <name>: cut off a grant you issued", function(ar
     return "No grant issued to " .. want .. " that is not cut off."
 end)
 
-return {first = first}
+-- Inviting or joining goes on when the player leaves the screen (client.lua keeps it loaded, and
+-- a tablet on): players may still be on their way to JOIN.
+function M.busy() return host ~= nil or joining end
+function M.close()
+    stopInvite()
+    closed = true
+end
+return M

@@ -5,8 +5,8 @@
 local api = require("api")
 local disco = require("disco")
 local component = require("component")
-local handshake = dofile("/usr/gns/handshake.lua")
-local fingerprint = dofile("/usr/gns/vault.lua").fingerprint
+-- The client's copies of handshake.lua and vault.lua's fingerprint, so neither loads twice.
+local handshake, fingerprint = ...
 
 local peer = {ENDPOINT = "gns-peer", PORT = 162, MAX_TEXT = 200, MAX_ROWS = 50, MAX_NAME = 24}
 

@@ -2,14 +2,13 @@
 -- fingerprint and password; address book backups; the devices blocked from chat and sharing.
 --
 -- Commands: set, get, backup, backups, restore, profile.
-local gns, clientEnv, _, frame, R = ...
+local gns, clientEnv = ...
 local ui = clientEnv.ui
 local C = ui.C
 local computer = require("computer")
 local vaultModule = clientEnv.vaultModule
 local settings = clientEnv.settings
 local log = clientEnv.log
-local wide = R.wide
 local LAYOUTS = {"auto", "compact", "wide"}
 
 local function save() clientEnv.saveSettings() end
@@ -67,69 +66,6 @@ local function setPort(port)
     pcall(modem.open, settings.port)
 end
 
----------------------------------------------------------------------------- the screen
-local aw = wide and 66 or R.w
-ui.card(frame, 1, 1, aw, 12, "DIALING AND SCANNING", nil, function(self)
-    for i, r in ipairs({{"Fast dial", "press the gate's DHD (under 25 s)"},
-        {"Learn gates from scans", "add the gates found in range to the address book"},
-        {"Take shared gates", "without asking first"}}) do
-        local y = i * 2
-        self:text(3, y, r[1], C.text, C.card)
-        self:text(3, y + 1, ui.pad(r[2], i == 1 and aw - 28 or aw - 14), C.faint, C.card)
-    end
-    self:text(3, 8, "Rescan every", C.text, C.card)
-    self:text(3, 9, "Wireless range", C.text, C.card)
-    self:text(3, 10, "Layout", C.text, C.card)
-    self:text(3, 11, "Show addresses, IDCs", C.text, C.card)
-    self:text(3, 12, "Gate port", C.text, C.card)
-end)
-local first = ui.toggle(frame, aw - 9, 2, function() return settings.fastDial end, function(v) settings.fastDial = v save() end)
-ui.toggle(frame, aw - 9, 4, function() return settings.autoLogToDatabase end, function(v) settings.autoLogToDatabase = v save() end)
-ui.toggle(frame, aw - 9, 6, function() return settings.autoAcceptShared end, function(v) settings.autoAcceptShared = v save() end)
-local cx = aw - 25
--- How long a whole dial takes, as on GDS: the glyphs are spread over it; 0 is the fastest.
-ui.chooser(frame, cx, 3, 24, function() return settings.dialSpeed == 0 and "fastest" or ("dial in " .. settings.dialSpeed .. " s") end,
-    function() step("dialSpeed", -5, 0, 120) end, function() step("dialSpeed", 5, 0, 120) end)
-ui.chooser(frame, cx, 8, 24, function() return settings.nearbyScanRate == 0 and "off" or (settings.nearbyScanRate .. " s") end,
-    function() step("nearbyScanRate", -10, 0, 600) end, function() step("nearbyScanRate", 10, 0, 600) end)
-ui.chooser(frame, cx, 9, 24, function() return settings.modemRange .. " blocks" end,
-    function() step("modemRange", -16, 16, 400) end, function() step("modemRange", 16, 16, 400) end)
-ui.chooser(frame, cx, 10, 24, function()
-    return settings.layout == "auto" and ("auto: " .. (ui.wide and "wide" or "compact")) or settings.layout
-end, function() cycleLayout(-1) end, function() cycleLayout(1) end)
-ui.toggle(frame, aw - 9, 11, function() return settings.showCodes end, function(v) settings.showCodes = v save() end)
-ui.chooser(frame, cx, 12, 24, function() return tostring(settings.port) end,
-    function() setPort(math.max(1, settings.port - 1)) end, function() setPort(math.min(65535, settings.port + 1)) end)
-
-local bx, by, bw, bh = 1, 14, R.w, R.h - 13
-if wide then bx, by, bw, bh = 69, 1, R.w - 68, R.h end
-local nameRow = wide and 5 or 3
-local blockedRow = nameRow + (wide and 3 or 2)
-ui.card(frame, bx, by, bw, bh, "THIS DEVICE", nil, function(self)
-    self:text(3, 2, "Fingerprint", C.faint, C.card)
-    self:text(16, 2, clientEnv.vault:fingerprint(), C.amber, C.card)
-    if wide then self:text(3, 3, "Others see it in chat, shares and invitations.", C.faint, C.card) end
-    self:text(3, nameRow, "Name", C.faint, C.card)
-    self:text(16, nameRow, ui.pad(clientEnv.deviceName, bw - 32), C.text, C.card)
-    self:text(3, nameRow + 1, "Vault", C.faint, C.card)
-    self:text(16, nameRow + 1, ui.pad(("%d gates, %d grants held"):format(#clientEnv.database, #clientEnv.vault.state.grants), bw - 32), C.text, C.card)
-    self:text(3, blockedRow, "BLOCKED DEVICES", C.faint, C.card)
-end)
-ui.Button(frame, bx + bw - 14, by + nameRow - 1, 12, 1, "PASSWORD", C.amber, C.black, changePassword)
-local ly = by + blockedRow
-ui.Button(frame, bx + bw - 14, by + nameRow, 12, 1, "BACKUPS", C.raised, C.text, function() clientEnv.showBackups() end)
-ui.Button(frame, bx + bw - 14, by + nameRow + 1, 12, 1, "PROFILES", C.raised, C.text, function() clientEnv.showProfiles() end)
-local blockedList = ui.List(frame, bx, ly, bw - 16, bh - blockedRow - 1, {items = blocked,
-    empty = "Nobody. BLOCK on Chat stops a device's chat and shares.",
-    cells = function(fp) return {{2, fp, C.text}} end})
-ui.Button(frame, bx + bw - 14, ly, 12, 1, "UNBLOCK", C.green, C.black, function()
-    local fp = blockedList:cursorItem()
-    if not fp then return end
-    settings.chatBlacklist[fp] = nil
-    save()
-    log("Unblocked " .. fp .. ".")
-end)
-
 ---------------------------------------------------------------------------- backups
 -- Dated copies of the address book in backups/, sealed under the vault password like the vault
 -- itself. Only the newest KEEP are kept, so they never fill the disk. A copy is named
@@ -186,7 +122,7 @@ local function askRestore(copy)
     clientEnv.ask(("Replace the address book (%d gates) with the backup of %s (%d gates)?"):format(#clientEnv.database, copy.when, copy.gates),
         {title = "RESTORE"}, function() restore(copy) end)
 end
-function clientEnv.showBackups()
+local function showBackups()
     if ui.modalOpen() then return end
     copies = nil
     local w, h = math.min(ui.W - 4, 56), math.min(ui.H - 2, 19)
@@ -207,14 +143,14 @@ function clientEnv.showBackups()
     ui.Button(box, 7 + 2 * bw, h - 1, bw, 1, "CLOSE", C.raised, C.text, close)
     ui.focusSoon(list)
 end
-clientEnv.command({"backup"}, "backup: save a copy of the address book (the newest " .. KEEP .. " are kept)", function() return backup() end)
-clientEnv.command({"backups"}, "backups: the address book backups, newest first", function()
+clientEnv.command("backup", "backup: save a copy of the address book (the newest " .. KEEP .. " are kept)", function() return backup() end)
+clientEnv.command("backups", "backups: the address book backups, newest first", function()
     copies = nil
     local lines = {}
     for i, c in ipairs(backups()) do lines[#lines + 1] = ("%d. %s, %d gates"):format(i, c.when, c.gates) end
     return #lines > 0 and table.concat(lines, "; ") or "No backups yet. backup saves one."
 end)
-clientEnv.command({"restore"}, "restore <n>: put backup n (from backups) in place of the address book, after asking", function(args)
+clientEnv.command("restore", "restore <n>: put backup n (from backups) in place of the address book, after asking", function(args)
     copies = nil
     local copy = backups()[math.tointeger(tonumber(args[1])) or 0]
     if not copy then return "Usage: restore <n>, n from backups" end
@@ -280,7 +216,7 @@ local function profileGates(p)
     ui.Button(box, w - 11, h - 1, 10, 1, "CLOSE", C.raised, C.text, close)
     ui.focusSoon(list)
 end
-function clientEnv.showProfiles()
+local function showProfiles()
     if ui.modalOpen() then return end
     local w, h = math.min(ui.W - 4, 60), math.min(ui.H - 2, 17)
     local box, close = ui.modal(clientEnv.root, clientEnv.shell, w, h, "NETWORK PROFILES")
@@ -321,7 +257,7 @@ function clientEnv.showProfiles()
     ui.focusSoon(list)
 end
 local PROFILE_USAGE = "Usage: profile new <name> <port> | use <name>|all | add|remove <name> <gate> ... | delete <name>"
-clientEnv.command({"profile", "pf"}, "profile: the network profiles; profile new <name> <port>, use <name>|all, add|remove <name> <gate> ..., delete <name>", function(args)
+clientEnv.command("profile", "profile: the network profiles; profile new <name> <port>, use <name>|all, add|remove <name> <gate> ..., delete <name>", function(args)
     local word = (args[1] or ""):lower()
     if word == "" then
         local lines = {}
@@ -353,7 +289,7 @@ end)
 
 ---------------------------------------------------------------------------- commands
 local SWITCHES = {fast = "fastDial", learn = "autoLogToDatabase", take = "autoAcceptShared", codes = "showCodes"}
-clientEnv.command({"set", "s"}, "set fast|learn|take|codes on|off, set speed <s>, set sleep <minutes>|off, set scan <s>, set range <blocks>, set port <n>, set layout auto|compact|wide", function(args)
+clientEnv.command("set", "set fast|learn|take|codes on|off, set speed <s>, set sleep <minutes>|off, set scan <s>, set range <blocks>, set port <n>, set layout auto|compact|wide", function(args)
     local what, v = (args[1] or ""):lower(), (args[2] or ""):lower()
     if SWITCHES[what] then
         if v ~= "on" and v ~= "off" then return "Usage: set " .. what .. " on|off" end
@@ -391,7 +327,7 @@ clientEnv.command({"set", "s"}, "set fast|learn|take|codes on|off, set speed <s>
     end
     return "Usage: set fast|learn|take|codes on|off, speed <s>, sleep <minutes>|off, scan <s>, range <blocks>, port <n>, layout auto|compact|wide"
 end)
-clientEnv.command({"get", "g"}, "get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>", function(args)
+clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>", function(args)
     local what = (args[1] or ""):lower()
     if what == "range" then return settings.modemRange .. " blocks"
     elseif what == "sleep" then return settings.tabletSleep == 0 and "off" or (settings.tabletSleep .. " min" .. (require("component").isAvailable("tablet") and "" or " (not a tablet: stays on)"))
@@ -426,4 +362,72 @@ clientEnv.command({"get", "g"}, "get range|speed|sleep|scan|port|layout|energy|m
     return "Usage: get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>"
 end)
 
-return {first = first}
+---------------------------------------------------------------------------- the screen
+local M = {}
+function M.build(frame, R)
+    local wide = R.wide
+    local aw = wide and 66 or R.w
+    ui.card(frame, 1, 1, aw, 12, "DIALING AND SCANNING", nil, function(self)
+        for i, r in ipairs({{"Fast dial", "press the gate's DHD (under 25 s)"},
+            {"Learn gates from scans", "add the gates found in range to the address book"},
+            {"Take shared gates", "without asking first"}}) do
+            local y = i * 2
+            self:text(3, y, r[1], C.text, C.card)
+            self:text(3, y + 1, ui.pad(r[2], i == 1 and aw - 28 or aw - 14), C.faint, C.card)
+        end
+        self:text(3, 8, "Rescan every", C.text, C.card)
+        self:text(3, 9, "Wireless range", C.text, C.card)
+        self:text(3, 10, "Layout", C.text, C.card)
+        self:text(3, 11, "Show addresses, IDCs", C.text, C.card)
+        self:text(3, 12, "Gate port", C.text, C.card)
+    end)
+    local first = ui.toggle(frame, aw - 9, 2, function() return settings.fastDial end, function(v) settings.fastDial = v save() end)
+    ui.toggle(frame, aw - 9, 4, function() return settings.autoLogToDatabase end, function(v) settings.autoLogToDatabase = v save() end)
+    ui.toggle(frame, aw - 9, 6, function() return settings.autoAcceptShared end, function(v) settings.autoAcceptShared = v save() end)
+    local cx = aw - 25
+    -- How long a whole dial takes, as on GDS: the glyphs are spread over it; 0 is the fastest.
+    ui.chooser(frame, cx, 3, 24, function() return settings.dialSpeed == 0 and "fastest" or ("dial in " .. settings.dialSpeed .. " s") end,
+        function() step("dialSpeed", -5, 0, 120) end, function() step("dialSpeed", 5, 0, 120) end)
+    ui.chooser(frame, cx, 8, 24, function() return settings.nearbyScanRate == 0 and "off" or (settings.nearbyScanRate .. " s") end,
+        function() step("nearbyScanRate", -10, 0, 600) end, function() step("nearbyScanRate", 10, 0, 600) end)
+    ui.chooser(frame, cx, 9, 24, function() return settings.modemRange .. " blocks" end,
+        function() step("modemRange", -16, 16, 400) end, function() step("modemRange", 16, 16, 400) end)
+    ui.chooser(frame, cx, 10, 24, function()
+        return settings.layout == "auto" and ("auto: " .. (ui.wide and "wide" or "compact")) or settings.layout
+    end, function() cycleLayout(-1) end, function() cycleLayout(1) end)
+    ui.toggle(frame, aw - 9, 11, function() return settings.showCodes end, function(v) settings.showCodes = v save() end)
+    ui.chooser(frame, cx, 12, 24, function() return tostring(settings.port) end,
+        function() setPort(math.max(1, settings.port - 1)) end, function() setPort(math.min(65535, settings.port + 1)) end)
+
+    local bx, by, bw, bh = 1, 14, R.w, R.h - 13
+    if wide then bx, by, bw, bh = 69, 1, R.w - 68, R.h end
+    local nameRow = wide and 5 or 3
+    local blockedRow = nameRow + (wide and 3 or 2)
+    ui.card(frame, bx, by, bw, bh, "THIS DEVICE", nil, function(self)
+        self:text(3, 2, "Fingerprint", C.faint, C.card)
+        self:text(16, 2, clientEnv.vault:fingerprint(), C.amber, C.card)
+        if wide then self:text(3, 3, "Others see it in chat, shares and invitations.", C.faint, C.card) end
+        self:text(3, nameRow, "Name", C.faint, C.card)
+        self:text(16, nameRow, ui.pad(clientEnv.deviceName, bw - 32), C.text, C.card)
+        self:text(3, nameRow + 1, "Vault", C.faint, C.card)
+        self:text(16, nameRow + 1, ui.pad(("%d gates, %d grants held"):format(#clientEnv.database, #clientEnv.vault.state.grants), bw - 32), C.text, C.card)
+        self:text(3, blockedRow, "BLOCKED DEVICES", C.faint, C.card)
+    end)
+    ui.Button(frame, bx + bw - 14, by + nameRow - 1, 12, 1, "PASSWORD", C.amber, C.black, changePassword)
+    local ly = by + blockedRow
+    ui.Button(frame, bx + bw - 14, by + nameRow, 12, 1, "BACKUPS", C.raised, C.text, showBackups)
+    ui.Button(frame, bx + bw - 14, by + nameRow + 1, 12, 1, "PROFILES", C.raised, C.text, showProfiles)
+    local blockedList = ui.List(frame, bx, ly, bw - 16, bh - blockedRow - 1, {items = blocked,
+        empty = "Nobody. BLOCK on Chat stops a device's chat and shares.",
+        cells = function(fp) return {{2, fp, C.text}} end})
+    ui.Button(frame, bx + bw - 14, ly, 12, 1, "UNBLOCK", C.green, C.black, function()
+        local fp = blockedList:cursorItem()
+        if not fp then return end
+        settings.chatBlacklist[fp] = nil
+        save()
+        log("Unblocked " .. fp .. ".")
+    end)
+    return {first = first}
+end
+
+return M
