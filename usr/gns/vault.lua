@@ -62,15 +62,22 @@ end
 
 -- A locked vault (the client quit) is never written: a callback answering late would seal
 -- nothing over it.
+-- Sealing a big book can run the computer out of memory (a tablet with Gates open, at about 260
+-- gates): that comes back as nil and "not enough memory", as any other failed save does.
+local function sealTo(self, path, magic, data)
+    local ok, done, why = pcall(function() return replace(path, seal(self, magic, data)) end)
+    if not ok then return nil, tostring(done) end
+    return done, why
+end
 function Vault:save()
     if not self.key or not self.state then return nil, "the vault is locked" end
-    return replace(self.path, seal(self, MAGIC, self.state))
+    return sealTo(self, self.path, MAGIC, self.state)
 end
 
 -- Writes data (a table) to path, sealed under the vault's password.
 function Vault:writeCopy(path, data)
     if not self.key then return nil, "the vault is locked" end
-    return replace(path, seal(self, COPY, data))
+    return sealTo(self, path, COPY, data)
 end
 -- Reads a copy written by writeCopy. One sealed under an older password returns nil and
 -- "older password" unless that password is given.

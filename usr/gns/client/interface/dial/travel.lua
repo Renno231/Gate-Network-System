@@ -45,13 +45,14 @@ local function reachedRow(c, prefer)
 end
 
 local function waitOpen(c, done, want)
-    local stop, dialed
+    local stop, mine
     local function check()
         local s = c.status or {}
         local open = s.state == "open" and s.outgoing and not s.dialing and (not want or reachedRow(c, want) == want)
-        -- A dial seen while this device's waits for the gate is another player's.
-        dialed = dialed or (s.dialing and not (api.queuedGate() == c))
-        if open or (dialed and not s.dialing) then
+        -- The gate took this device's dial (doDial follows it) and is dialing it. The gate answers
+        -- a dial before it sends the change.
+        mine = mine or (s.dialing and c.follow ~= nil and not c.follow.closing)
+        if open or (mine and not s.dialing) then
             stop()
             waiting[stop] = nil
             done(open)

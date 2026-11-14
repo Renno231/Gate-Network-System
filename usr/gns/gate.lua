@@ -32,10 +32,12 @@ local gate = {}
 
 local TYPE, RANK = dialing.TYPE, grants.RANK
 local ROUTE_WAIT = 60 -- seconds a route waits for the gate to be free, and for its wormhole to open
--- JSG leaves some states for idle with no signal: the gate looks again once it should have,
--- after the signal that began them: a Milky Way DHD press locks its chevron in 10 to 29 ticks,
--- a failed dial fails for 53 to 83 (StargateMilkyWayBaseTile, StargateAbstractBaseTile).
-local QUIET_AFTER = {stargate_dhd_chevron_engaged = 1.5, stargate_failed = 4.3}
+-- JSG leaves some states for idle with no signal. A Milky Way DHD press locks its chevron in 10
+-- to 29 ticks (StargateMilkyWayBaseTile): the gate looks again once it should have. "failing" (a
+-- failed dial, 53 to 83 ticks; a Universe ring turning back to rest after a wormhole, as long as
+-- its spin, signalled by nothing: StargateUniverseBaseTile) is looked at again each second
+-- while the gate shows it (node.view).
+local QUIET_AFTER = {stargate_dhd_chevron_engaged = 1.5}
 -- Signals that change nothing a status shows: a ring glyph starting to spin, a traveller, a hit
 -- on the iris, an IDC and its answer (the dialer's own state shows what they did).
 local UNSHOWN = {stargate_spin_start = true, stargate_traveler = true, stargate_event_iris_hit = true,
@@ -1119,7 +1121,7 @@ function gate.start(state, stargate, settings, dhd)
     -- The status, built again only then: the watchers, the callers (current) and the room display
     -- (room.lua) read it as often as they like, at no stargate call between. Each gets a copy, its seconds
     -- open and left moved on from when it was built.
-    local viewed, viewOwn, viewAt
+    local viewed, viewOwn, viewAt, failingCheck
     function node.view()
         local hand = state.handDialed
         local own = table.concat({tostring(dialer.state), tostring(dialer.irisProblem), tostring(settings.name),
@@ -1137,6 +1139,9 @@ function gate.start(state, stargate, settings, dhd)
                 viewed = status(viewed, asked)
             else viewed = status() end
             shown, chevrons, viewOwn, viewAt = {}, {}, own, computer.uptime()
+            if viewed.state == "failing" and not failingCheck then
+                failingCheck = timer(1, function() failingCheck = nil moved() end)
+            end
         end
         local s, since = {}, math.floor(computer.uptime() - viewAt)
         for k, v in pairs(viewed) do s[k] = v end

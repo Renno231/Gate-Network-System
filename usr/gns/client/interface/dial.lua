@@ -596,8 +596,9 @@ local function say(message) if message then log(message) end end
 -- Calls done(open) once c's outgoing wormhole is open (to want's gate, when given), or once the
 -- dial can no longer open: DIAL waits up to 300 s for a busy gate, and the gate gives a dial 120 s
 -- plus its speed.
--- Driven by the gate's changes (this device's dial: the gate sends them); a dial that ended
--- without opening ends the wait.
+-- Driven by the gate's changes (this device's dial: the gate sends them); this device's own dial
+-- ending without opening ends the wait. Another player's dial does not: this device's may be
+-- queued behind it (DIAL on a busy gate).
 local waiting = {}
 clientEnv.onClose[#clientEnv.onClose + 1] = function() for stop in pairs(waiting) do stop() end end
 
@@ -676,7 +677,7 @@ api = {gns = gns, clientEnv = clientEnv, ui = ui, C = C, log = log, say = say, g
     onChange = onChange, connections = connections, link = link, findConnection = findConnection,
     openGate = openGate, fresh = fresh, grantsFor = grantsFor, disengage = disengage, vaultState = vaultState,
     nearest = nearest, dialWhenFree = dialWhenFree, waiting = waiting, GALAXY = GALAXY, GLYPHS = GLYPHS,
-    settings = settings, part = part, queuedGate = function() return queued and queued.gate end}
+    settings = settings, part = part}
 function clientEnv.gateLog(connection) return part("admin").gateLog(connection) end
 function clientEnv.noticeHandDial(c, hand) return part("handdial").notice(c, hand) end
 function clientEnv.showGlyphs() return part("glyphs").show() end

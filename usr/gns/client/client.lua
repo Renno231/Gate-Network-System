@@ -365,7 +365,8 @@ function chat.accept(share)
             added, codes = added + 1, codes + #row.IDCs
         end
     end
-    clientVault:save()
+    local saved, err = clientVault:save()
+    if not saved then clientEnv.log("Vault not saved: " .. tostring(err)) end
     return added, codes
 end
 local hostnameFile = io.open("/etc/hostname")
@@ -702,11 +703,12 @@ function clientEnv.show(name)
     if not SCREEN[name] then return end
     local old = clientEnv.screen
     clientEnv.screen = name
+    -- A screen left closes while its widgets still stand (Destroy empties them).
+    for n in pairs(loaded) do clientEnv.closeInterface(n) end
     if old ~= name and old ~= "dial" and frames[old] then
         frames[old]:Destroy(true)
         frames[old], screenInfo[old] = nil, nil
     end
-    for n in pairs(loaded) do clientEnv.closeInterface(n) end
     if not frames[name] then
         frames[name], screenInfo[name] = screenFrame(function(frame)
             local m, err = clientEnv.loadInterface(name)

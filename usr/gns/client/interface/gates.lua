@@ -431,7 +431,14 @@ function M.build(frame, R)
         clientEnv.dest = r
         clientEnv.show("dial")
     end)
+    -- The row the cursor was on when the screen was last left (close, below).
+    if clientEnv.gatesRow then selectRow(clientEnv.gatesRow) end
     return {first = first}
+end
+-- The screen unloads when left: the cursor's row stays for its next build. A load just for a
+-- command builds no list and leaves it.
+function M.close()
+    if list then clientEnv.gatesRow = current() end
 end
 
 ---------------------------------------------------------------------------- commands
