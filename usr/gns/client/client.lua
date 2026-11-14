@@ -123,6 +123,44 @@ local database = vaultState.database
 clientEnv.database = database
 clientEnv.vault = clientVault
 
+-- A gate row keeps each galaxy's address as one string of glyph names, comma separated: r.MW,
+-- r.PG, r.UN (absent when unknown). Three lists per gate held about twice the memory, and a
+-- tablet holds the whole book; a list is made only where one is used.
+local GALAXIES = {"MW", "PG", "UN"}
+-- The row's address in one galaxy, as a new list.
+local function glyphs(r, galaxy)
+    local out, s = {}, r and r[galaxy]
+    if type(s) == "string" then for g in s:gmatch("[^,]+") do out[#out + 1] = g end end
+    return out
+end
+clientEnv.glyphs = glyphs
+-- All three, as the gate's dial and energy calls, routes and shares take them.
+function clientEnv.address(r) return {MW = glyphs(r, "MW"), PG = glyphs(r, "PG"), UN = glyphs(r, "UN")} end
+-- Sets the row's addresses from lists of glyph names by galaxy, or, with galaxy, that galaxy's
+-- from one list.
+function clientEnv.setAddress(r, address, galaxy)
+    for _, g in ipairs(galaxy and {galaxy} or GALAXIES) do
+        local list = galaxy and address or address and address[g]
+        r[g] = type(list) == "table" and #list > 0 and table.concat(list, ",") or nil
+    end
+    return r
+end
+-- Whether the row's address in galaxy and list (glyph names) start with the same six glyphs:
+-- the same gate.
+function clientEnv.sameSix(r, galaxy, list)
+    local s = r and r[galaxy]
+    if type(s) ~= "string" or type(list) ~= "table" or #list < 6 then return false end
+    local six = table.concat(list, ",", 1, 6)
+    return s:sub(1, #six) == six and (#s == #six or s:byte(#six + 1) == 44) -- 44: ","
+end
+-- A row as books saved before kept it, and shares still send it: Address = {MW = {...}, ...}.
+function clientEnv.flatten(r)
+    local a = r.Address
+    r.Address = nil
+    return type(a) == "table" and clientEnv.setAddress(r, a) or r
+end
+for _, r in ipairs(database) do clientEnv.flatten(r) end
+
 local settingsPath = gns.path.clientDirectory .. "settings.lua"
 -- Client settings, changed on the Settings screen or with set. Unknown or mistyped saved values
 -- are ignored.
@@ -254,7 +292,7 @@ function clientEnv.searchText(r)
     local hay = tostring(r.Name) .. " " .. tostring(r.Type) .. " " .. (clientEnv.place(r) or "")
     if settings.showCodes then
         for _, galaxy in ipairs({"MW", "PG", "UN"}) do
-            hay = hay .. " " .. table.concat((r.Address or {})[galaxy] or {}, " ")
+            if r[galaxy] then hay = hay .. " " .. r[galaxy]:gsub(",", " ") end
         end
     end
     return hay:lower()
@@ -308,9 +346,10 @@ function chat.accept(share)
             same = same and first6(glyphs) == first6((entry.address or {})[kind])
         end
         if not same then row.key = nil end
-        local mw, existing = table.concat(row.Address.MW, ","), nil
+        clientEnv.flatten(row)
+        local existing
         for _, known in ipairs(database) do
-            if known.Name == row.Name and table.concat((known.Address or {}).MW or {}, ",") == mw then existing = known break end
+            if known.Name == row.Name and known.MW == row.MW then existing = known break end
         end
         if existing then
             existing.IDCs = existing.IDCs or {}

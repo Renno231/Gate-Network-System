@@ -22,11 +22,10 @@ local function changed()
     clientEnv.changed()
     require("loom").invalidate()
 end
-local function copy(list) local out = {} for i, v in ipairs(list or {}) do out[i] = v end return out end
 -- A new row; with a network profile in use it belongs to that profile.
 local function newRow(name, galaxy)
     local p = clientEnv.profile()
-    return {Name = name, Type = galaxy or "MW", IDCs = {}, Address = {MW = {}, PG = {}, UN = {}}, Profiles = p and {[p.name] = true} or nil}
+    return {Name = name, Type = galaxy or "MW", IDCs = {}, Profiles = p and {[p.name] = true} or nil}
 end
 local function indexOf(r) for i, x in ipairs(database) do if x == r then return i end end end
 local function shown() return clientEnv.settings.showCodes end
@@ -81,7 +80,7 @@ end
 local function generate(r)
     local address, err = generated(r)
     if not address then return nil, err end
-    r.Address = address
+    clientEnv.setAddress(r, address)
     changed()
     local l = r.Location
     return ("Worked out %s's addresses from dim %s, %s %s %s."):format(r.Name, l.dimension, l.x, l.y, l.z)
@@ -201,7 +200,7 @@ function M.build(frame, R)
     local function editAddress(r, galaxy, start)
         if ui.modalOpen() then return end
         if not shown() then log(HIDDEN) return end
-        local edited = start or {MW = copy(r.Address.MW), PG = copy(r.Address.PG), UN = copy(r.Address.UN)}
+        local edited = start or clientEnv.address(r)
         local note = start and "Generated: SAVE keeps it" or nil
         galaxy = galaxy or r.Type or "MW"
         local w, h = 68, math.min(ui.H - 2, 22)
@@ -249,7 +248,7 @@ function M.build(frame, R)
         end)
         ui.Button(box, bx, 12, 11, 1, "CLEAR", C.red, C.black, function() edited[galaxy] = {} end)
         ui.Button(box, bx, 14, 11, 1, "RESET", C.raised, C.text, function()
-            edited[galaxy] = copy(r.Address[galaxy])
+            edited[galaxy] = clientEnv.glyphs(r, galaxy)
             note = "Saved address back"
         end)
         -- All three galaxies from the location, to look over before SAVE.
@@ -281,7 +280,7 @@ function M.build(frame, R)
         end)
         local half = 14
         ui.Button(box, w // 2 - half - 1, h - 1, half, 1, "SAVE", C.green, C.black, function()
-            r.Address = edited
+            clientEnv.setAddress(r, edited)
             changed()
             close()
             log("Saved " .. r.Name .. "'s address.")
@@ -307,7 +306,7 @@ function M.build(frame, R)
             if not address then log(r.Name .. ": " .. err) return end
             if shown() then editAddress(r, nil, address) return end
             for _, g in ipairs(GALAXIES) do
-                if #((r.Address or {})[g] or {}) > 0 then log(HIDDEN) return end
+                if r[g] then log(HIDDEN) return end
             end
             log((generate(r)))
         end
@@ -327,7 +326,7 @@ function M.build(frame, R)
         self:text(3, 3, "Galaxy", C.faint, C.card)
         self:text(3, 4, ui.pad(clientEnv.place(r) or "Location unknown", dw - 16), C.dim, C.card)
         self:text(3, 6, "ADDRESS", C.faint, C.card)
-        local a = (r.Address or {})[r.Type or "MW"] or {}
+        local a = clientEnv.glyphs(r, r.Type or "MW")
         if not shown() then
             self:text(3, 7, ui.pad(#a > 0 and "Hidden on this device." or "No address yet.", dw - 4), C.dim, C.card)
             self:text(3, ay + 2, "IDCs", C.faint, C.card)
@@ -352,9 +351,8 @@ function M.build(frame, R)
             local oy = ay + 5
             for _, g in ipairs(GALAXIES) do
                 if g ~= r.Type then
-                    local other = (r.Address or {})[g] or {}
                     self:text(3, oy, GALAXY[g], C.faint, C.card)
-                    self:text(14, oy, ui.pad(#other > 0 and table.concat(other, " · ") or "unknown", dw - 16), C.dim, C.card)
+                    self:text(14, oy, ui.pad(r[g] and (r[g]:gsub(",", " · ")) or "unknown", dw - 16), C.dim, C.card)
                     oy = oy + 1
                 end
             end
@@ -474,8 +472,7 @@ clientEnv.command("add", "add <gate> <MW|PG|UN> <glyph> ...: set an address (gly
         glyphs[#glyphs + 1] = g
     end
     if #glyphs > 8 then return "An address has at most 8 glyphs." end
-    r.Address = r.Address or {MW = {}, PG = {}, UN = {}}
-    r.Address[galaxy] = glyphs
+    clientEnv.setAddress(r, glyphs, galaxy)
     changed()
     return ("%s %s %s address: %s"):format(made and "Added" or "Set", r.Name, galaxy, table.concat(glyphs, ", "))
 end)
@@ -496,13 +493,12 @@ local function importAGS(path)
     local file, reason = io.open(path, "r")
     if not file then return "Cannot read " .. path .. ": " .. tostring(reason) end
     local known = {} -- "MW:glyph,glyph,..." → the row with that address
-    local function keys(address, fn)
+    local function keys(r, fn)
         for _, g in ipairs(GALAXIES) do
-            local a = address[g] or {}
-            if #a > 0 then fn(g .. ":" .. table.concat(a, ",")) end
+            if r[g] then fn(g .. ":" .. r[g]) end
         end
     end
-    for _, r in ipairs(database) do keys(r.Address or {}, function(k) known[k] = r end) end
+    for _, r in ipairs(database) do keys(r, function(k) known[k] = r end) end
     local added, skipped = {}, {}
     local env = {HistoryEntry = function() end}
     function env.GateEntry(e)
@@ -513,18 +509,17 @@ local function importAGS(path)
             address[g] = {}
             for i, glyph in ipairs(type(e.gateAddress[g]) == "table" and e.gateAddress[g] or {}) do address[g][i] = tostring(glyph) end
         end
-        local same
-        keys(address, function(k) same = same or known[k] end)
-        if same then skipped[#skipped + 1] = name .. " (as " .. same.Name .. ")" return end
         local galaxy
         for _, g in ipairs(GALAXIES) do if not galaxy and #address[g] > 0 then galaxy = g end end
         if not galaxy then skipped[#skipped + 1] = name .. " (no address)" return end
-        local r = newRow(name, galaxy)
-        r.Address = address
+        local r = clientEnv.setAddress(newRow(name, galaxy), address)
+        local same
+        keys(r, function(k) same = same or known[k] end)
+        if same then skipped[#skipped + 1] = name .. " (as " .. same.Name .. ")" return end
         local idc = math.tointeger(tonumber(e.IDC))
         if idc then r.IDCs = {idc} end
         database[#database + 1] = r
-        keys(address, function(k) known[k] = r end)
+        keys(r, function(k) known[k] = r end)
         added[#added + 1] = name
     end
     local statement, depth, failed, n = {}, 0, nil, 0
@@ -566,7 +561,7 @@ clientEnv.command("gen", "gen <gate> [dim x y z]: work out its addresses from it
     -- As GENERATE: where addresses are hidden, only an empty address is filled.
     if not shown() then
         for _, g in ipairs(GALAXIES) do
-            if #((r.Address or {})[g] or {}) > 0 then return HIDDEN end
+            if r[g] then return HIDDEN end
         end
     end
     if #args > 1 then
@@ -619,7 +614,7 @@ clientEnv.command("edit", "edit <gate> [MW|PG|UN|idc|loc]: put the command that 
     else
         local galaxy = galaxyNamed(what) or "MW"
         local words = {}
-        for _, g in ipairs((r.Address or {})[galaxy] or {}) do words[#words + 1] = (g:gsub(" ", "_")) end
+        for _, g in ipairs(clientEnv.glyphs(r, galaxy)) do words[#words + 1] = (g:gsub(" ", "_")) end
         clientEnv.prefill(("add %d %s %s"):format(i, galaxy, table.concat(words, " ")))
     end
 end)

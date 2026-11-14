@@ -85,7 +85,7 @@ end
 local function share(device, selected, withIDCs)
     local rows, signed = {}, {}
     for _, row in ipairs(selected) do
-        rows[#rows + 1] = {Name = row.Name, Type = row.Type, Address = row.Address, key = row.key, Location = row.Location,
+        rows[#rows + 1] = {Name = row.Name, Type = row.Type, Address = clientEnv.address(row), key = row.key, Location = row.Location,
             IDCs = withIDCs and row.IDCs or {}}
         if row.key and vaultState.book[row.key] then signed[#signed + 1] = vaultState.book[row.key] end
     end

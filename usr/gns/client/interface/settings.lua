@@ -354,10 +354,10 @@ clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|memory|f
     elseif what == "entry" then
         local r, i = clientEnv.findEntry(args[2])
         if not r then return "No gate " .. tostring(args[2]) .. "." end
-        local a = (r.Address or {})[r.Type or "MW"] or {}
+        local a = r[r.Type or "MW"]
         if not settings.showCodes then return ("%d %s [%s] %s · address and IDCs hidden"):format(i, r.Name, tostring(r.Type), clientEnv.place(r) or "location unknown") end
         return ("%d %s [%s] %s · IDCs %s · %s"):format(i, r.Name, tostring(r.Type), clientEnv.place(r) or "location unknown",
-            #(r.IDCs or {}) > 0 and table.concat(r.IDCs, ", ") or "none", #a > 0 and table.concat(a, ", ") or "no address")
+            #(r.IDCs or {}) > 0 and table.concat(r.IDCs, ", ") or "none", a and a:gsub(",", ", ") or "no address")
     end
     return "Usage: get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>"
 end)
