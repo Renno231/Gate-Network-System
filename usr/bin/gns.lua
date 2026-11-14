@@ -92,7 +92,11 @@ local runs = 1
 while (environment.isRepeating == nil and runs == 1) or environment.isRepeating == true do
     if runServer then assert(loadfile(serverPath))(environment) end
     if runClient then
-        local ok, err = pcall(assert(loadfile(clientPath)), environment)
+        -- client.lua sets up and returns the session (nil when the vault stays locked).
+        local ok, err = pcall(function()
+            local session = assert(loadfile(clientPath))(environment)
+            if session then session() end
+        end)
         here.client = nil
         if not ok then error(err, 0) end
     end

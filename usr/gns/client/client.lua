@@ -955,18 +955,21 @@ local function closeClient()
 end
 clientEnv.bucket:add({close = closeClient})
 
-clientEnv.log("GNS client ready. Press ; for commands; SCAN finds the gates in range.")
-while gns.clientActive do
-    rebuild = false
-    component.gpu.freeAllBuffers()
-    ui.setLayout(settings.layout)
-    build()
-    built = true
-    loom.run(root, 0.5)
-    built = false
-    for _, fn in ipairs(clientEnv.onClose) do pcall(fn) end
-    root:Destroy(true)
-    if not rebuild then break end
+-- The session: gns.lua runs it once this file has finished. A file still running keeps all of its
+-- code loaded and whatever its locals last held, so the setup above is freed while the client runs.
+return function()
+    clientEnv.log("GNS client ready. Press ; for commands; SCAN finds the gates in range.")
+    while gns.clientActive do
+        rebuild = false
+        component.gpu.freeAllBuffers()
+        ui.setLayout(settings.layout)
+        build()
+        built = true
+        loom.run(root, 0.5)
+        built = false
+        for _, fn in ipairs(clientEnv.onClose) do pcall(fn) end
+        root:Destroy(true)
+        if not rebuild then break end
+    end
+    clientEnv.bucket:close()
 end
-
-clientEnv.bucket:close()
