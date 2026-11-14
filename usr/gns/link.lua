@@ -3,8 +3,11 @@
 --   its answer     "gnsr", id, ok, results        to the caller's modem, on the call's port
 --   a gate status  "gnss", seq, status            to the devices watching the gate (gate.lua)
 -- Each call and hello is sent once, as on GDS: OC delivers a modem message in range. The caller
--- waits up to WAIT seconds (game time) for the answer; the gate keeps each answer KEEP seconds,
--- so a call that reaches it twice (by two modems) is answered twice and run once.
+-- waits up to WAIT seconds (game time, so lag stretches it) for the answer: measured in the e2e
+-- lanes with several clients per gate and the server at 1.2 to 20 TPS, the slowest call (open, its
+-- handshake) took 21 ticks, so WAIT leaves room for a server CPU about 3 times slower, and a gate
+-- that is gone shows as one in WAIT seconds. The gate keeps each answer KEEP seconds, so a call
+-- that reaches it twice (by two modems) is answered twice and run once.
 -- OC sets every message's sender address, so a gate knows the caller by its modem: gate.lua keeps
 -- what each modem proved with the gate.open handshake and answers "call open first" to one it
 -- does not know (a gate that restarted); a proxy given reopen opens it again and calls once more.
@@ -14,7 +17,7 @@ local computer = require("computer")
 local event = require("event")
 local serialization = require("serialization")
 
-local link = {CALL = "gnsc", REPLY = "gnsr", STATUS = "gnss", WAIT = 10, KEEP = 30}
+local link = {CALL = "gnsc", REPLY = "gnsr", STATUS = "gnss", WAIT = 3, KEEP = 30}
 -- Calls the gate answers over tnet instead: their arguments or answers outgrow a modem message.
 local BIG = {update = true, console = true, gatelog = true}
 

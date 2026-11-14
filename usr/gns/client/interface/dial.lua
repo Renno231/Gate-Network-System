@@ -443,7 +443,7 @@ function poll(connection)
         if findConnection(connection.address) ~= connection then return end -- dropped or replaced meanwhile
         forget(connection)
         if silent(s) then
-            -- Sent again for link.WAIT seconds without an answer: the gate is asleep or gone.
+            -- No answer within link.WAIT seconds: the gate is asleep or gone.
             log(connection.name .. " does not answer; SCAN finds it again.")
         else
             -- It answered and refused: this device's grant was cut off or the gate went private.
