@@ -48,11 +48,6 @@ while #settings.name > 32 do settings.name = unicode.sub(settings.name, 1, -2) e
 settings.idcs = type(settings.idcs) == "table" and settings.idcs or {}
 if settings.kawoosh == nil then settings.kawoosh = true end
 if settings.sleep == nil then settings.sleep = 5 end
--- public on, from before each control had its own setting: anyone may dial.
-if settings.public ~= nil then
-    if settings.public == true then settings.allow = {dial = "anyone"} end
-    settings.public = nil
-end
 -- Returns true, or nil and why (a full disk keeps the old file).
 local function saveSettings()
     return gns.utility.writeFile(settingsPath, "return " .. serialization.serialize(settings))

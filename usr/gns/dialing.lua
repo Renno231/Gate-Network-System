@@ -499,13 +499,10 @@ function dialing.new(stargate, dhd, settings)
         local irisFrom = gap == 0 and from
             or math.max(from, #glyphs + 1 - math.ceil((getIrisType() == "SHIELD" and 1 or 3) / gap))
         -- The Milky Way DHD takes no press until the last one has locked, 10 to 14 ticks after it
-        -- (25 to 29 for the glyph that locks the address), unless the server turns on JSG's old
-        -- DHD mechanics. The second press is tried at once: taken under 10 ticks after the first
-        -- (which JSG's own mechanics never allow), every press goes in a tick after the last;
-        -- refused, each press waits 12 ticks (27 for the last), when most
-        -- have locked, then goes in at the first tick the gate takes it: about 0.2 s a dial
-        -- slower than trying from 10, for a few refused presses instead of a dozen.
-        local pressedAt, lockedAt, early, irisShut = -math.huge, 0, nil, false
+        -- (25 to 29 for the glyph that locks the address). Each press waits 12 ticks (27 for the
+        -- last), when most have locked, then goes in at the first tick the gate takes it: about
+        -- 0.2 s a dial slower than trying from 10, for a few refused presses instead of a dozen.
+        local lockedAt, irisShut = 0, false
         -- What the dial waits for: "clear" (the wormhole open before it closing), "glyph" (glyph i,
         -- once its gap and an abort's clearing have passed), "lock" (the ring's glyph locking),
         -- "engage" (the iris shut, then the gate engaged), "opening" (the wormhole forming),
@@ -536,7 +533,7 @@ function dialing.new(stargate, dhd, settings)
                 if job == j and not stopped then step(name) changed() end
             end)
         end
-        local function retry() return wait(early and 0.05 or math.max(lockedAt - computer.uptime(), 0.05)) end
+        local function retry() return wait(math.max(lockedAt - computer.uptime(), 0.05)) end
         -- Runs on the stargate's events (name and its first value) and the dial's own delays:
         -- the gate's state is never asked while it dials.
         step = function(name, value)
@@ -572,10 +569,7 @@ function dialing.new(stargate, dhd, settings)
                     local byDhd
                     if pressing and (#glyphs <= 7 or i <= 6) then
                         local _, code = dhd.pressButton(glyphs[i])
-                        if code == "dhd_failure_busy" then
-                            if early == nil and computer.uptime() < lockedAt then early = false end
-                            return retry()
-                        end
+                        if code == "dhd_failure_busy" then return retry() end
                         byDhd = code == "dhd_pressed"
                         if byDhd then pressed = pressed + 1 end
                     end
@@ -589,10 +583,8 @@ function dialing.new(stargate, dhd, settings)
                     i = i + 1
                     -- The Milky Way DHD's chevron locks with no signal (StargateMilkyWayBaseTile).
                     if byDhd and own == "MW" then
-                        if computer.uptime() < pressedAt + 0.5 then early = true end
-                        pressedAt = computer.uptime()
-                        phase, lockedAt = "glyph", pressedAt + (i > #glyphs and 1.35 or 0.6)
-                        wait(math.max(gap, early == false and lockedAt - computer.uptime() or 0.05))
+                        phase, lockedAt = "glyph", computer.uptime() + (i > #glyphs and 1.35 or 0.6)
+                        wait(math.max(gap, lockedAt - computer.uptime()))
                     end
                     return
                 end

@@ -28,15 +28,12 @@ end
 
 local function whole(n, max) return math.type(n) == "integer" and n >= 0 and n <= max end
 
--- GNSQ1 for a route that names no hop's gate (as older clients sign), GNSQ2 with the keys.
 local function bytes(r)
-    local keyed = false
-    for _, h in ipairs(r.hops) do keyed = keyed or h.gate ~= nil end
-    local parts = {string.pack(">s1s1s1I4B", keyed and "GNSQ2" or "GNSQ1", r.id, r.key, r.every, #r.hops)}
+    local parts = {string.pack(">s1s1s1I4B", "GNSQ", r.id, r.key, r.every, #r.hops)}
     for _, h in ipairs(r.hops) do
         local a = h.address
         parts[#parts + 1] = glyphs(a.MW or {}) .. glyphs(a.PG or {}) .. glyphs(a.UN or {})
-            .. string.pack(">i4I2", h.idc or -1, h.delay) .. (keyed and string.pack(">s1", h.gate or "") or "")
+            .. string.pack(">i4I2s1", h.idc or -1, h.delay, h.gate or "")
     end
     return table.concat(parts)
 end

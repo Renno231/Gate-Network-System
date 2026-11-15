@@ -82,10 +82,6 @@ function gate.load(path)
         local private, public = ecc.keypair()
         state = {identity = {private = tostring(private), public = tostring(public)}, seq = 0, owner = PUBLIC}
     end
-    if state.book then -- a state from before owners and grants: only the key pair and entry carry over
-        state.entry = state.book[state.identity.public]
-        state.book, state.pins, state.net, state.trust = nil, nil, nil, nil
-    end
     state.cut, state.cutSeq = state.cut or {}, state.cutSeq or 0
     state.admins, state.schedules = state.admins or {}, state.schedules or {}
     state.path = path
@@ -194,13 +190,9 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
         local file = io.open(historyPath, "rb") or io.open(historyPath .. ".new", "rb") -- .new: cut off mid-replace
         local text = file and file:read("*a") or ""
         if file then file:close() end
-        local old = serialization.unserialize(text) -- a log from before: one table of all entries
-        if type(old) == "table" and type(old[1]) == "table" then history, lines = old, math.huge
-        else
-            for line in text:gmatch("[^\n]+") do
-                local e = serialization.unserialize(line)
-                if type(e) == "table" then history[#history + 1], lines = e, lines + 1 end
-            end
+        for line in text:gmatch("[^\n]+") do
+            local e = serialization.unserialize(line)
+            if type(e) == "table" then history[#history + 1], lines = e, lines + 1 end
         end
         while #history > LOG_KEEP do table.remove(history, 1) end
     end
@@ -284,8 +276,6 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
     do
         local file = io.open(byPath, "rb")
         if file then dialBy = file:read("*a") file:close() end
-        dialBy = dialBy or state.dialBy -- a state from before kept it there
-        state.dialBy = nil
     end
     local function noteDialer()
         if dialBy == dialer.by then return end

@@ -212,9 +212,10 @@ local function wakeKnown(answered)
 end
 
 -- Asks the gates in range who they are and opens each as it answers. Another SCAN meanwhile
--- just asks again. quiet (the automatic rescan) reports only when it opened a gate. A scan asked
--- for drops the gates that no longer answer (asleep or gone), wakes the known gates that did not
--- answer and looks again once those have had time to start.
+-- just asks again. Every scan drops the gates that no longer answer (asleep or gone), wakes the
+-- known gates that did not answer and looks again once those have had time to start (that look
+-- wakes none: noWake). quiet (the automatic rescan) reports only the gates it opened or
+-- dropped.
 local wakeTimer
 local poll -- below: a scan polls the gates already open
 -- A dial waiting for its gate (waitToDial, below): dropped with its gate's connection too.
@@ -233,7 +234,7 @@ local function forget(c)
     dropQueued(c)
 end
 
-local function scan(quiet)
+local function scan(quiet, noWake)
     dial.sinceScan = 0
     local woken = 0
     if not quiet then log("Scanning for gates...") end
@@ -243,7 +244,7 @@ local function scan(quiet)
         if waiting > 0 then return end
         if woken > 0 then
             if wakeTimer then event.cancel(wakeTimer) end
-            wakeTimer = event.timer(15, guard(function() wakeTimer = nil scan(true) end))
+            wakeTimer = event.timer(15, guard(function() wakeTimer = nil scan(true, true) end))
         end
         if quiet and opened == 0 then return end
         log(("Found %d gates, opened %d, %d new%s."):format(found, opened, new, refused > 0 and (", " .. refused .. " private") or ""))
@@ -294,7 +295,7 @@ local function scan(quiet)
         local tries = {}
         for _, a in pairs(vaultState.access) do
             if a.silent and a.modem and not seen[a.modem] and not opening[a.modem] and clientEnv.ports()[a.port or 160]
-                and not (quiet and findConnection(a.modem)) then
+                then
                 tries[#tries + 1] = a
             end
         end
@@ -322,27 +323,17 @@ local function scan(quiet)
         finish = function()
             left = left - 1
             if left > 0 then return end
-            -- A quiet scan keeps the gates that did not answer (a lost hello), with no distance known.
-            if quiet then
-                for _, c in ipairs(connections) do
-                    if not seen[c.address] then c.distance = nil end
+            -- A gate open here that no longer answers went to sleep or away: drop it, and wake it
+            -- if this device holds its wake key.
+            for i = #connections, 1, -1 do
+                local c = connections[i]
+                if not seen[c.address] then
+                    forget(c)
+                    log(c.name .. " did not answer the scan; dropped.")
                 end
             end
-            if not quiet then
-                -- A gate open here that no longer answers went to sleep or away: drop it, and wake it
-                -- if this device holds its wake key.
-                local gone = {}
-                for i = #connections, 1, -1 do
-                    local c = connections[i]
-                    if not seen[c.address] then
-                        forget(c)
-                        log(c.name .. " did not answer the scan; dropped.")
-                        gone[c.address] = true
-                    end
-                end
-                woken = wakeKnown(seen)
-                if woken > 0 then log(("Waking %d gate%s that did not answer."):format(woken, woken == 1 and "" or "s")) end
-            end
+            if not noWake then woken = wakeKnown(seen) end
+            if woken > 0 and not quiet then log(("Waking %d gate%s that did not answer."):format(woken, woken == 1 and "" or "s")) end
             done()
         end
         finish()
