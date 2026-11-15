@@ -65,10 +65,10 @@ function console.new(node, settings, saveSettings, dhd, stargate)
     end
     function commands.status(_, out)
         local s = node.dialer.status()
-        out(("%s, %s, iris %s, last dial: %s"):format(settings.name, s.state, tostring(s.iris), s.lastDial))
+        out(("%s, %s, %s, last dial: %s"):format(settings.name, s.state, node.dialer.irisWords(s.iris):lower(), s.lastDial))
         if s.irisProblem then out(s.irisProblem) end
         -- The gate measures the server's speed only when asked: an idle gate's first status starts it.
-        out(("Server %s, DHD %s, kawoosh avoidance %s"):format(s.tps and ("%.1f TPS"):format(s.tps) or "TPS measuring (status again in 5 s)",
+        out(("Server %s, DHD %s, kawoosh avoidance %s"):format(s.tps and (("%.1f"):format(s.tps):gsub("%.0$", "") .. " TPS") or "TPS measuring (status again in 5 s)",
             dhd and "connected" or "none", settings.kawoosh and "on" or "off"))
         out(ownerLine() .. (settings.localOnly and "; commands only from this computer" or ""))
         out(("Port %d, wake key %s, sleep %s"):format(settings.port or 160, state.wake and "set" or "none",
@@ -135,7 +135,7 @@ function console.new(node, settings, saveSettings, dhd, stargate)
             return
         end
         local ok, now = pcall(node.dialer.iris, want)
-        out(ok and ("Iris " .. tostring(now)) or tostring(now))
+        out(ok and node.dialer.irisWords(now) or tostring(now))
     end
     function commands.kawoosh(argument, out)
         local on = onOff(argument)

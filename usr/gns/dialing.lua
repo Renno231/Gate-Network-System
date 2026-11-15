@@ -100,6 +100,16 @@ function dialing.new(stargate, dhd, settings)
         end
         return irisType
     end
+    dialer.irisType = getIrisType
+    -- The iris's state as a player says it, for an iris or a shield: "Iris shut", "Shield going up".
+    local WORDS = {
+        iris = {OPENED = "open", CLOSED = "shut", OPENING = "opening", CLOSING = "closing"},
+        shield = {OPENED = "down", CLOSED = "up", OPENING = "going down", CLOSING = "going up"},
+    }
+    function dialer.irisWords(state)
+        local shield = getIrisType() == "SHIELD"
+        return (shield and "Shield " or "Iris ") .. (WORDS[shield and "shield" or "iris"][state] or tostring(state):lower())
+    end
     local function hasIris()
         local t = getIrisType()
         return t ~= nil and t ~= "NULL"
@@ -458,7 +468,10 @@ function dialing.new(stargate, dhd, settings)
         end
         -- Closing, failing, or a chevron locking: the gate is busy until it is idle again.
         if gateState ~= "idle" and gateState ~= "open" then error("already dialing", 0) end
-        if not cost.canOpen then error(("not enough power: %d RF to open"):format(cost.open), 0) end
+        if not cost.canOpen then
+            error(("not enough power: %d RF to open, %d stored, %d RF/t to keep it open"):format(cost.open,
+                math.floor(stargate.getEnergyStored()), cost.keepAlive), 0)
+        end
 
         -- Keep glyphs already engaged when they start this address; otherwise start over.
         local from, dialed = 1, dialedGlyphs(stargate)
@@ -480,13 +493,27 @@ function dialing.new(stargate, dhd, settings)
         local gap, nextAt = speed / #glyphs, 0
         local avoid = settings.kawoosh ~= false and hasIris()
         local i, closedIris, pressing, pressed, kawooshed = from, false, fast, 0, false
+        -- The iris shuts while the glyphs go in, so it is shut when the gate engages: from the
+        -- first glyph on a fast dial, else the glyphs before the end that cover its 3 s (a shield's
+        -- 1 s), as on GDS.
+        local irisFrom = gap == 0 and from
+            or math.max(from, #glyphs + 1 - math.ceil((getIrisType() == "SHIELD" and 1 or 3) / gap))
+        -- The Milky Way DHD takes no press until the last one has locked, 10 to 14 ticks after it
+        -- (25 to 29 for the glyph that locks the address), unless the server turns on JSG's old
+        -- DHD mechanics. The second press is tried at once: taken under 10 ticks after the first
+        -- (which JSG's own mechanics never allow), every press goes in a tick after the last;
+        -- refused, each press waits 12 ticks (27 for the last), when most
+        -- have locked, then goes in at the first tick the gate takes it: about 0.2 s a dial
+        -- slower than trying from 10, for a few refused presses instead of a dozen.
+        local pressedAt, lockedAt, early, irisShut = -math.huge, 0, nil, false
         -- What the dial waits for: "clear" (the wormhole open before it closing), "glyph" (glyph i,
-        -- once its gap and an abort's clearing have passed), "lock" (the glyph before locking),
+        -- once its gap and an abort's clearing have passed), "lock" (the ring's glyph locking),
         -- "engage" (the iris shut, then the gate engaged), "opening" (the wormhole forming),
         -- "kawoosh" (the iris opening again after it).
         local phase = gateState == "open" and "clear" or "glyph"
         local j = {}
         job = j
+        dialer.ring = false -- true once a glyph is engaged by turning the ring, not pressed at the DHD
         note("dialing")
         local function finish(text)
             if job == j then endJob() end
@@ -509,6 +536,7 @@ function dialing.new(stargate, dhd, settings)
                 if job == j and not stopped then step(name) changed() end
             end)
         end
+        local function retry() return wait(early and 0.05 or math.max(lockedAt - computer.uptime(), 0.05)) end
         -- Runs on the stargate's events (name and its first value) and the dial's own delays:
         -- the gate's state is never asked while it dials.
         step = function(name, value)
@@ -528,9 +556,8 @@ function dialing.new(stargate, dhd, settings)
                 if name ~= "stargate_wormhole_closed_fully" then return end
                 phase = "glyph"
             elseif phase == "lock" then
-                -- The ring's glyph and the Pegasus DHD's signal once the gate is idle again; the
-                -- Milky Way DHD's chevron locks 10 to 14 ticks after the press with no signal.
-                if name ~= "stargate_spin_chevron_engaged" and name ~= "locked" then return end
+                -- The ring's glyph and the Pegasus DHD's signal once the gate is idle again.
+                if name ~= "stargate_spin_chevron_engaged" then return end
                 if j.timer then event.cancel(j.timer) j.timer = nil end
                 phase = "glyph"
             end
@@ -538,36 +565,44 @@ function dialing.new(stargate, dhd, settings)
                 local ready = math.max(nextAt, abortedAt + ABORT_CLEAR)
                 if computer.uptime() < ready then return wait(ready - computer.uptime()) end
                 if i <= #glyphs then
+                    if avoid and not closedIris and i >= irisFrom then closedIris = true irisTo("CLOSED") end
                     -- A DHD without the chevron upgrade locks the 7th symbol it takes as the last
                     -- one, and then the gate takes no more: on a longer address the DHD presses
                     -- the first 6 and the ring engages the rest.
                     local byDhd
                     if pressing and (#glyphs <= 7 or i <= 6) then
                         local _, code = dhd.pressButton(glyphs[i])
-                        if code == "dhd_failure_busy" then return wait(0.25) end
+                        if code == "dhd_failure_busy" then
+                            if early == nil and computer.uptime() < lockedAt then early = false end
+                            return retry()
+                        end
                         byDhd = code == "dhd_pressed"
                         if byDhd then pressed = pressed + 1 end
                     end
                     if not byDhd then
-                        pressing = false
+                        pressing, dialer.ring = false, true
                         local spun, code, message = stargate.engageSymbol(glyphs[i])
                         if code == "stargate_failure_busy" then return wait(0.25) end
                         if not spun then return fail("dial failed: " .. plain(message or code)) end
                     end
                     nextAt, phase = computer.uptime() + gap, "lock"
-                    -- The last glyph's chevron opens first: 25 to 29 ticks (StargateMilkyWayBaseTile).
-                    if byDhd and own == "MW" then wait(i == #glyphs and 1.5 or 0.75, "locked") end
-                    -- The iris shuts while the last glyph locks, so the kawoosh meets it.
-                    if i == #glyphs and avoid then closedIris = true irisTo("CLOSED") end
                     i = i + 1
+                    -- The Milky Way DHD's chevron locks with no signal (StargateMilkyWayBaseTile).
+                    if byDhd and own == "MW" then
+                        if computer.uptime() < pressedAt + 0.5 then early = true end
+                        pressedAt = computer.uptime()
+                        phase, lockedAt = "glyph", pressedAt + (i > #glyphs and 1.35 or 0.6)
+                        wait(math.max(gap, early == false and lockedAt - computer.uptime() or 0.05))
+                    end
                     return
                 end
                 phase = "engage"
             end
             if phase == "engage" then
-                if avoid then
+                if avoid and not irisShut then
                     closedIris = true
-                    if not irisTo("CLOSED") then return end -- stargate_iris_closed steps again
+                    irisShut = irisTo("CLOSED")
+                    if not irisShut then return end -- stargate_iris_closed steps again
                 end
                 local engaged, why, busy
                 if pressing and own == "MW" then
@@ -578,7 +613,7 @@ function dialing.new(stargate, dhd, settings)
                     engaged, why, busy = result == "stargate_engage", message or code, code == "stargate_failure_busy"
                     if reason then why = why .. ": " .. tostring(reason):lower():gsub("_", " ") end
                 end
-                if busy then return wait(0.25) end
+                if busy then return retry() end
                 if not engaged then return fail("dial failed: " .. plain(why)) end
                 phase = "opening"
                 note("engaged")
@@ -717,6 +752,9 @@ function dialing.new(stargate, dhd, settings)
             if s.outgoing and dialer.keepAlive then s.left = math.floor((s.energy or 0) / math.max(dialer.keepAlive, 1) / 20) end
         end
         s.type, s.irisProblem, s.dialing, s.lastDial = dialer.gateType(), dialer.irisProblem, job ~= nil, dialer.state
+        -- The ring turns only while GNS engages glyphs with it: a DHD press (a fast dial under
+        -- 25 s, or a player at the DHD) locks chevrons with the ring still.
+        s.spinning = job ~= nil and dialer.ring or nil
         s.capacity, s.target, s.tps = capacity, dialer.target, dialer.tps()
         return s
     end

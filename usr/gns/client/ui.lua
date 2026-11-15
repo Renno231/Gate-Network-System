@@ -15,6 +15,7 @@ local component = require("component")
 local computer = require("computer")
 local event = require("event")
 local unicode = require("unicode")
+local keyboard = require("keyboard")
 local ulen, usub = unicode.len, unicode.sub
 
 local ui = {}
@@ -744,9 +745,10 @@ local function bandPixel(gate, G, c, b, x, y, now)
     return c[b]
 end
 
--- look() -> state ("idle", "dial", "open" or "iris"), lit chevrons {[position] = true}, and the
--- galaxy ("MW", "PG" or "UN"). iris(), when given, -> the gate's iris state ("OPENED",
--- "CLOSING", "CLOSED", "OPENING") and type ("IRIS_TITANIUM", "IRIS_TRINIUM", "SHIELD", ...).
+-- look() -> state ("idle", "dial", "open" or "iris"), lit chevrons {[position] = true}, the
+-- galaxy ("MW", "PG" or "UN"), chevrons engaged, of total, and whether the real ring is turning.
+-- iris(), when given, -> the gate's iris state ("OPENED", "CLOSING", "CLOSED", "OPENING") and
+-- type ("IRIS_TITANIUM", "IRIS_TRINIUM", "SHIELD", ...).
 local Gate = class(Widget)
 function Gate:new(parent, x, y, Rh, look, bg, iris)
     local G = geometry(Rh)
@@ -832,7 +834,7 @@ function Gate:_follow(state)
     self._still = still
 end
 -- Moves the glyph track and the chevron flashes on to now; true while any of them moves.
-function Gate:_turn(state, lit, engaged, total, theme, now)
+function Gate:_turn(state, lit, engaged, total, theme, now, spinning)
     local dt = math.min(0.25, now - (self._turnAt or now))
     self._turnAt = now
     local litAt, was, moving = self._litAt, self._lit, false
@@ -842,7 +844,7 @@ function Gate:_turn(state, lit, engaged, total, theme, now)
         if litAt[p] and now - litAt[p] < FLASH then moving = true end
     end
     self._lit = lit
-    if state == "dial" and engaged and total and engaged < total then
+    if state == "dial" and spinning and engaged and total and engaged < total then
         if self._engaged and engaged ~= self._engaged then self._dir = -self._dir end
         self._engaged = engaged
         self._spin, self._settle, moving = (self._spin or 0) + self._dir * TURN * dt, nil, true
@@ -889,7 +891,7 @@ end
 function Gate:draw()
     if not self:visible() then return end
     local part = gpu.part(self) -- a turning ring redraws only the gate
-    local state, lit, theme, engaged, total = self._look()
+    local state, lit, theme, engaged, total, spinning = self._look()
     self:_follow(state)
     local key = {state, theme or "MW"}
     for p = 1, 9 do key[#key + 1] = lit[p] and "1" or "0" end
@@ -916,7 +918,7 @@ function Gate:draw()
         end
     end
     local now = computer.uptime()
-    local moving = self:_turn(state, lit, engaged, total, theme, now)
+    local moving = self:_turn(state, lit, engaged, total, theme, now, spinning)
     if moving or self._spin then self:_overlay(x0, y0, now) end
     gpu.partEnd(part)
     -- 5 fps on the gate's own computer, where the gate needs the time.
@@ -1059,7 +1061,7 @@ function BrailleGate:draw()
     if not self:visible() then return end
     local part = gpu.part(self)
     local B, G = self._B, self._G
-    local state, lit, theme, engaged, total = self._look()
+    local state, lit, theme, engaged, total, spinning = self._look()
     self:_follow(state)
     local key = {state, theme or "MW"}
     for p = 1, 9 do key[#key + 1] = lit[p] and "1" or "0" end
@@ -1082,7 +1084,7 @@ function BrailleGate:draw()
         gpu.set(x0 + x, y0 + y, s)
     end
     local now = computer.uptime()
-    local moving = self:_turn(state, lit, engaged, total, theme, now)
+    local moving = self:_turn(state, lit, engaged, total, theme, now, spinning)
     local band, inner = moving or self._spin ~= nil, self._inside.shown
     if band or inner then
         local cells = self._whole and B.all or ((inner and B.inner or "") .. (band and B.band or ""))
@@ -1116,11 +1118,26 @@ ui.BrailleGate = BrailleGate
 ---------------------------------------------------------------------------- modal dialogs
 -- Focuses w once the current event is handled. loom gives a touched widget the focus after its
 -- touch callback runs, which would take the focus from a dialog that the touch just opened.
+local pendingFocus
 function ui.focusSoon(w)
+    pendingFocus = w
     event.timer(0, function()
+        if pendingFocus == w then pendingFocus = nil end
         pcall(w.focus, w)
         loom.invalidate()
     end)
+end
+-- A key pressed as a dialog opens: the event library hands it and focusSoon's timer out in no set
+-- order, so it may come first, while nothing has the focus. It goes to the widget about to be
+-- focused (the dialog's text field, say), not lost. True if it took the key.
+function ui.keyBeforeFocus(char, code, player)
+    local w = pendingFocus
+    pendingFocus = nil
+    if not (w and pcall(w.focus, w)) then return false end
+    local ok, used = pcall(w._key or function() end, w, char, code, keyboard.isControlDown(), player)
+    if not (ok and used) and (code == 28 or code == 156 or code == 57) then pcall(input.activate, w, player) end
+    loom.invalidate()
+    return true
 end
 -- A centred dialog over shell (the frame behind it). While it is open nothing behind it takes
 -- touches or focus. Returns its frame and close(); content goes in the frame (coordinates

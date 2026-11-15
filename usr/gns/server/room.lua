@@ -26,7 +26,7 @@ local function clock(seconds)
 end
 
 -- Draws once: dialer status s, the gate's name, the traveller log.
-local function draw(gpu, s, name, travellers, flash)
+local function draw(gpu, s, name, travellers, flash, irisWords)
     local W, H = gpu.getResolution()
     gpu.setBackground(BLACK)
     gpu.fill(1, 1, W, H, " ")
@@ -74,7 +74,7 @@ local function draw(gpu, s, name, travellers, flash)
     line(headline, colour)
     if open then
         line("Open " .. clock(s.open) .. (s.left and ("  ·  " .. clock(s.left) .. " left") or ""), TEXT)
-        line("Iris " .. tostring(s.iris), s.iris == "CLOSED" and RED or TEXT)
+        line(irisWords(s.iris), s.iris == "CLOSED" and RED or TEXT)
     end
     y = y + 1
     line("TRAVELLERS", DIM)
@@ -102,7 +102,7 @@ function room.run(node, settings)
         local key = table.concat({s.state, engaged, tostring(s.iris), tostring(s.alarm and flash), tostring(s.open), #node.dialer.travellers})
         if key ~= last then
             last = key
-            draw(gpu, s, settings.name or "Gate", node.dialer.travellers, flash)
+            draw(gpu, s, settings.name or "Gate", node.dialer.travellers, flash, node.dialer.irisWords)
         end
         return s.state ~= "idle" or engaged > 0 or s.dialing or s.alarm
     end

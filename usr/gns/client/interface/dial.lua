@@ -500,18 +500,53 @@ clientEnv.fresh = fresh
 -- What the chosen dial costs, as the energy command last asked it (the gate's energy check, a
 -- few stargate calls), for the destination card.
 local cost = {}
-local function costText(c, r)
+-- An amount in few characters, rounded down: 950, 1.5k, 12k, 1M, 2.5M (no ".0").
+local function short(n)
+    if n < 1e3 then return tostring(math.floor(n)) end
+    local unit, v = "k", n / 1e3
+    if n >= 1e6 then unit, v = "M", n / 1e6 end
+    v = v >= 10 and math.floor(v) or math.floor(v * 10) / 10
+    return (v == math.floor(v) and ("%d"):format(v) or ("%.1f"):format(v)) .. unit
+end
+-- How long, as a player reads it: 45 s, 12 min, 1 h 23 min.
+local function span(seconds)
+    seconds = math.floor(tonumber(seconds) or 0)
+    if seconds < 60 then return seconds .. " s" end
+    if seconds < 3600 then return seconds // 60 .. " min" end
+    local m = seconds % 3600 // 60
+    return seconds // 3600 .. " h" .. (m > 0 and (" " .. m .. " min") or "")
+end
+local function costText(c, r, compact)
     if cost.from ~= c or cost.dest ~= r then return "" end
-    if cost.error then return "Cannot dial: " .. cost.error, true end
+    if cost.error then return compact and "cannot dial" or ("Cannot dial: " .. cost.error), true end
     local x = cost.result
     if not x then return "" end
-    local k = function(n) n = tonumber(n) or 0 return n >= 1e4 and ("%dk"):format(n // 1000) or tostring(math.floor(n)) end
     -- The energy now (the gate's status), against the cost asked once (as dialer.cost works it out).
     local energy = tonumber(c.status and c.status.energy) or tonumber(x.energy) or 0
     local open, keepAlive = tonumber(x.open) or 0, tonumber(x.keepAlive) or 0
-    if energy < open then return ("Not enough power: %s RF to open, %s stored"):format(k(open), k(energy)), true end
-    return ("%s RF to open · %s RF/t open · %d s on stored power"):format(k(open), k(keepAlive),
-        math.floor((energy - open) / math.max(keepAlive, 1) / 20))
+    if energy < open then return ("Not enough power: %s RF to open, %s stored"):format(short(open), short(energy)), true end
+    local lasts = span((energy - open) / math.max(keepAlive, 1) / 20)
+    if compact then return ("%s RF · %s open"):format(short(open), lasts) end
+    return ("%s RF to open · %s RF/t open · %s on stored power"):format(short(open), short(keepAlive), lasts)
+end
+-- Asks the dialing gate what dialing r costs (the gate's energy check, a few stargate calls), when
+-- a player picks a destination or a gate to dial from: the Ready line and the destination card
+-- show it. report: also log it (the energy command).
+local function askCost(c, r, report)
+    if not c or not r or (cost.from == c and cost.dest == r and not report) then return end
+    if r.Name == c.name and not report then return end -- the gate itself: nothing to dial
+    cost.from, cost.dest, cost.result, cost.error = c, r, nil, nil
+    c.proxy:async(guard(function(ok, x)
+        if cost.from ~= c or cost.dest ~= r then return end
+        if ok ~= true then
+            -- Said in the log too: the tablet's Ready line has room only for "cannot dial".
+            cost.error = tostring(x)
+            log(("%s to %s: %s"):format(c.name, r.Name, tostring(x)))
+            return
+        end
+        cost.at, cost.result = computer.uptime(), x
+        if report then log(("%s to %s: %d glyphs. %s."):format(c.name, r.Name, x.glyphs, (costText(c, r)))) end
+    end)).energy(clientEnv.address(r))
 end
 
 -- The automatic rescan (Settings; off by default, as on GDS). No gate is asked anything else.
@@ -555,9 +590,9 @@ local function doDial(connection, r, idc, onBusy, waited, after)
             log(connection.name .. ": dial refused: " .. tostring(result))
             return
         end
-        log(("Dialing %s from %s: %d glyphs%s, %d RF, open for %d s%s."):format(r.Name, connection.name,
+        log(("Dialing %s from %s: %d glyphs%s, %d RF, open for %s%s."):format(r.Name, connection.name,
             result.glyphs, result.from > 1 and (" from glyph " .. result.from) or "", result.open,
-            result.seconds, result.fast and ", DHD" or ""))
+            span(result.seconds), result.fast and ", DHD" or ""))
         connection.follow = {last = "dialing", idc = idc} -- the gate sends its changes
     end)).dial(clientEnv.address(r), opts)
     return ("Dialing %s from %s%s%s..."):format(r.Name, connection.name,
@@ -621,11 +656,21 @@ function disengage(connection)
         if ok == true and result == "closing" then connection.follow = {closing = true} end
     end)).closeWormhole()
 end
+-- What a player calls the iris's state, or the shield's: "iris shut", "shield going up".
+local IRIS_WORDS = {
+    iris = {OPENED = "open", CLOSED = "shut", OPENING = "opening", CLOSING = "closing"},
+    shield = {OPENED = "down", CLOSED = "up", OPENING = "going down", CLOSING = "going up"},
+}
+local function irisKind(s) return s and s.irisType == "SHIELD" and "shield" or "iris" end
+local function irisSays(s, state)
+    local what = irisKind(s)
+    return what .. " " .. (IRIS_WORDS[what][state] or tostring(state):lower())
+end
 -- want: "open", "close" or nil (the other way).
 local function iris(connection, want)
     if not connection then return "No gate in range." end
     connection.proxy:async(guard(function(ok, result)
-        log(connection.name .. (ok == true and (": iris " .. tostring(result)) or (": iris refused: " .. tostring(result))))
+        log(connection.name .. ": " .. (ok == true and irisSays(connection.status, result) or (irisKind(connection.status) .. " refused: " .. tostring(result))))
     end)).iris(want)
 end
 
@@ -686,6 +731,7 @@ clientEnv.command({"from", "f"}, "from [gate]: choose the gate to dial from; alo
     if not c then return "No gate " .. args[1] .. " in range." end
     clientEnv.from = c
     poll(c)
+    askCost(c, row())
     return "Dialing from " .. c.name .. "."
 end)
 
@@ -694,11 +740,7 @@ clientEnv.command({"energy", "e"}, "energy [gate]: what dialing it from the dial
     local r = args[1] and clientEnv.findEntry(args[1]) or row()
     if not c then return "No gate in range." end
     if not r then return "Choose a gate to dial." end
-    c.proxy:async(guard(function(ok, x)
-        if ok ~= true then log(("%s to %s: %s"):format(c.name, r.Name, tostring(x))) return end
-        cost.from, cost.dest, cost.at, cost.result, cost.error = c, r, computer.uptime(), x, nil
-        log(("%s to %s: %d glyphs. %s."):format(c.name, r.Name, x.glyphs, (costText(c, r))))
-    end)).energy(clientEnv.address(r))
+    askCost(c, r, true)
 end)
 
 -- The less used features live in interface/dial/<part>.lua, loaded when used: their code stays
@@ -749,7 +791,7 @@ local function gateLook()
     elseif s.dialing or engaged > 0 or s.state == "dialing" then
         state = "dial"
     end
-    return state, ui.litChevrons(math.min(engaged, total), total), galaxyOf(c), engaged, total
+    return state, ui.litChevrons(math.min(engaged, total), total), galaxyOf(c), engaged, total, s.spinning == true
 end
 -- The dialing gate's iris: its state and type, for the drawn gate.
 local function irisLook()
@@ -763,6 +805,14 @@ local function slow(s)
     if not tps or tps >= 18 then return "" end
     return (" · server at %.0f TPS: %.0fx slower"):format(tps, 20 / math.max(tps, 0.1))
 end
+-- On a tablet the gate line also says what the iris (or shield) is doing when it is not simply
+-- open, or why it cannot be worked; the IRIS button only works it. The computer has an iris card.
+local function irisNote(s)
+    if wide then return "" end
+    if s.irisProblem then return " · " .. irisKind(s) .. ": " .. s.irisProblem, true end
+    if s.iris == "CLOSED" or s.iris == "OPENING" or s.iris == "CLOSING" then return " · " .. irisSays(s, s.iris) end
+    return ""
+end
 local function headline()
     local c = clientEnv.fromGate()
     local state, _, _, engaged, total = gateLook()
@@ -770,18 +820,22 @@ local function headline()
     local name = r and r.Name or "?"
     if not c then return "NO GATE", "No gate in range: SCAN looks for gates. Press ; for commands.", C.dim end
     local s = c.status or {}
+    local note, problem = irisNote(s)
     if state == "iris" then
-        local shield = s.irisType == "SHIELD"
-        return shield and "SHIELD UP" or "IRIS CLOSED",
-            ((s.outgoing or s.dialing) and ("Wormhole to " .. name) or "Incoming wormhole") .. (shield and " · shield up" or " · iris closed"), C.red
+        return s.irisType == "SHIELD" and "SHIELD UP" or "IRIS CLOSED",
+            ((s.outgoing or s.dialing) and ("Wormhole to " .. name) or "Incoming wormhole") .. " · " .. irisSays(s, "CLOSED"), C.red
     elseif state == "open" then
-        return "WORMHOLE OPEN", s.outgoing and ("Wormhole open to " .. name) or "Incoming wormhole", C.sky
+        return "WORMHOLE OPEN", (s.outgoing and ("Wormhole open to " .. name) or "Incoming wormhole") .. note, problem and C.red or C.sky
     elseif state == "dial" then
         return engaged == 0 and "DIALING" or (engaged >= total and ("CHEVRON " .. total .. " LOCKED") or ("CHEVRON " .. engaged .. " ENGAGED")),
-            ("Dialing · chevron %d of %d engaged"):format(engaged, total) .. slow(s), C.amber
+            ("Dialing%s · chevron %d of %d engaged"):format(note, engaged, total) .. slow(s), problem and C.red or C.amber
     end
-    local price = wide and "" or (costText(c, r))
-    return "READY", ("Ready · %s to %s, %d glyphs%s"):format(c.name, name, #plannedGlyphs(c, r), price ~= "" and (" · " .. price) or ""), C.dim
+    local price, cannot = "", false
+    if not wide then price, cannot = costText(c, r, true) end
+    -- On a tablet the glyph row below shows the glyphs: the line keeps its room for the cost.
+    local count = wide and (", %d glyphs"):format(#plannedGlyphs(c, r)) or ""
+    return "READY", ("Ready%s · %s to %s%s%s"):format(note, c.name, name, count, price ~= "" and (" · " .. price) or ""),
+        (problem or cannot) and C.red or (note ~= "" and C.text or C.dim)
 end
 local function chips(self, x, y, w, pitch, h)
     local c = clientEnv.fromGate()
@@ -800,8 +854,7 @@ local function chips(self, x, y, w, pitch, h)
 end
 local function energy(s)
     local e, cap = tonumber(s.energy) or 0, tonumber(s.capacity)
-    local text = e >= 1e6 and ("%.1fM RF"):format(e / 1e6) or (e >= 1e3 and ("%dk RF"):format(e // 1000) or (math.floor(e) .. " RF"))
-    return text, cap and cap > 0 and e / cap or nil
+    return short(e) .. " RF", cap and cap > 0 and e / cap or nil
 end
 local function fromNote()
     local c = clientEnv.fromGate()
@@ -814,6 +867,7 @@ local function cycle(step)
     for i, c in ipairs(connections) do if c == clientEnv.fromGate() then at = i end end
     clientEnv.from = connections[(at - 1 + step) % #connections + 1]
     poll(clientEnv.from)
+    askCost(clientEnv.from, row())
 end
 local function fromName() local c = clientEnv.fromGate() return c and c.name or "no gate" end
 
@@ -842,10 +896,20 @@ local function bookNote()
     if not p then return #database .. " gates" end
     return ("%s · %d gates"):format(p.name, #bookItems())
 end
+-- Enter in the search: with one gate left, that gate is picked and dialed.
+local function dialOnlyMatch()
+    local list = bookItems()
+    if #list ~= 1 then
+        if search ~= "" then log(#list == 0 and "No gate matches." or (#list .. " gates match: type more, or touch one.")) end
+        return
+    end
+    clientEnv.dest = list[1].r
+    say(dialWhenFree(clientEnv.fromGate(), list[1].r))
+end
 local function bookList(x, y, w, h, columns, pitch)
     return ui.List(frame, x, y, w, h, {items = bookItems, pitch = pitch, empty = "No gates yet. SCAN learns the gates in range; Gates adds your own.",
         cells = columns, selected = function(item) return item.r == row() end,
-        press = function(item) clientEnv.dest = item.r end})
+        press = function(item) clientEnv.dest = item.r askCost(clientEnv.fromGate(), item.r) end})
 end
 local function dialLabel()
     local state = gateLook()
@@ -880,12 +944,13 @@ if wide then
         self:text(3, 4, "Energy", C.faint, C.card)
         if fraction then self:bar(11, 4, 32, fraction, C.amber, C.card) end
         self:text(fraction and 45 or 11, 4, text, C.text, C.card)
-        self:text(3, 5, "Iris", C.faint, C.card)
-        self:text(11, 5, tostring(s.iris), s.iris == "CLOSED" and C.red or C.green, C.card)
+        local kind = irisKind(s)
+        self:text(3, 5, kind == "shield" and "Shield" or "Iris", C.faint, C.card)
+        self:text(11, 5, ui.pad(IRIS_WORDS[kind][s.iris] or tostring(s.iris):lower(), 11), s.iris == "CLOSED" and C.red or C.green, C.card)
         if s.irisProblem then
             self:text(23, 5, ui.pad(s.irisProblem, rw - 24), C.red, C.card)
         else
-            self:text(23, 5, ui.pad(s.tps and ("Server %.1f TPS"):format(tonumber(s.tps) or 0) or "", rw - 24), C.dim, C.card)
+            self:text(23, 5, ui.pad(s.tps and ("Server " .. ("%.1f"):format(tonumber(s.tps) or 0):gsub("%.0$", "") .. " TPS") or "", rw - 24), C.dim, C.card)
         end
     end)
     local left = ui.chooser(frame, rx + 1, 2, 22, fromName, function() cycle(-1) end, function() cycle(1) end)
@@ -924,7 +989,7 @@ if wide then
         end
     end)
     ui.card(frame, rx, 16, rw, 13, "ADDRESS BOOK", bookNote)
-    ui.Field(frame, rx + 1, 17, rw - 12, {placeholder = "⌕ search gates", changed = function(t) search = t end})
+    ui.Field(frame, rx + 1, 17, rw - 12, {placeholder = "⌕ search gates", changed = function(t) search = t end, submit = dialOnlyMatch})
     ui.Button(frame, rx + rw - 10, 17, 9, 1, "GLYPHS", C.raised, C.text, function() clientEnv.showGlyphs() end)
     bookList(rx, 18, rw, 11, function(item, _, w)
         local r = item.r
@@ -962,7 +1027,7 @@ else
     -- SCAN, DIAL, DISENGAGE and IRIS.
     local lw, rx = 25, 28
     local rw = R.w - rx + 1
-    ui.Field(frame, 1, 1, lw, {placeholder = "⌕ search", changed = function(t) search = t end, around = C.page})
+    ui.Field(frame, 1, 1, lw, {placeholder = "⌕ search", changed = function(t) search = t end, submit = dialOnlyMatch, around = C.page})
     first = bookList(1, 2, lw, 9, function(item, _, w)
         local r = item.r
         return {{1, ui.pad(tostring(item.i), 3), C.faint}, {4, ui.pad(r.Name, w - 11)}, {w - 6, tostring(r.Type or ""), C.dim},
@@ -992,21 +1057,20 @@ else
             return {{1, ui.pad(c.name or "?", w - 14)}, {w - 12, ui.pad(far, 5), C.faint}, {w - 6, ui.pad(tag, 6), tag == "public" and C.dim or C.amber}}
         end,
         selected = function(c) return c == clientEnv.fromGate() end,
-        press = function(c) clientEnv.from = c poll(c) end})
-    -- The dialing gate's energy and iris.
-    ui.Paint(frame, 1, 17, lw, 1, function(self)
-        self:fill(1, 1, lw, 1, C.page)
+        press = function(c) clientEnv.from = c poll(c) askCost(c, row()) end})
+    -- The dialing gate's energy, and the IRIS button at the end of the line (the gate line says
+    -- what the iris is doing).
+    ui.Paint(frame, 1, 17, lw - 7, 1, function(self)
+        self:fill(1, 1, lw - 7, 1, C.page)
         local c = clientEnv.fromGate()
         local s = c and c.status
         if not s then return end
         local text, fraction = energy(s)
         local x = 1
-        if fraction then self:bar(1, 1, 3, fraction, C.amber, C.page) x = 5 end
-        self:text(x, 1, text, C.text, C.page)
-        x = x + unicode.len(text) + 2
-        local shut = s.iris == "CLOSED" or s.irisProblem
-        self:text(x, 1, ui.pad(s.irisProblem and ("iris: " .. s.irisProblem) or ("iris " .. tostring(s.iris):lower()), lw - x + 1), shut and C.red or C.dim, C.page)
+        if fraction then self:bar(1, 1, 7, fraction, C.amber, C.page) x = 9 end
+        self:text(x, 1, ui.pad(text, lw - 7 - x), C.text, C.page)
     end)
+    ui.Button(frame, lw - 5, 17, 6, 1, "IRIS", C.blue, C.black, function() say(iris(clientEnv.fromGate())) end, {around = C.page})
 
     -- One touch to claim the gate picked in range when it is unregistered and it is plain which
     -- network it joins: the profile in use, or the only one, on the gate's port. The gate takes
@@ -1044,14 +1108,19 @@ else
         end
         if #lines > 0 then return p, lines end
     end
-    -- One tap for the gate picked in range: SET UP an unregistered one with its profile, or give
-    -- one of this device's gates its profile's settings again. Yellow text on the page, not a
-    -- yellow bar: SCAN and the energy line are yellow right above and below it.
+    -- One tap for the gate picked in range: SET UP an unregistered one with its profile, give
+    -- one of this device's gates its profile's settings again, or SAVE the address just dialed by
+    -- hand at its DHD (not in the book). Yellow text on the page, not a yellow bar: SCAN and the
+    -- energy line are yellow right above and below it.
     local function oneTap(c)
         local p = mainProfile(c)
         if p then return ("▸ SET UP %s · %s"):format(c.name, p.name), function() say(part("admin").setup(c, p)) end end
         local q, lines = profileChanges(c)
         if q then return ("▸ APPLY %s to %s"):format(q.name, c.name), function() say(part("admin").apply(c, q, lines)) end end
+        local hand = c and c.unsaved and c.status and c.status.handDialed
+        if hand and hand.time == c.unsaved then
+            return "▸ SAVE hand dial", function() say(part("handdial").save({})) end
+        end
     end
     local tap = ui.Button(frame, 1, 18, lw, 1, function()
         local label = oneTap(clientEnv.fromGate())
@@ -1135,15 +1204,14 @@ else
     gate = ui.BrailleGate(frame, rx, 4, 15, gateLook, C.page, irisLook)
     gate:visible(false)
 
-    -- Four buttons the same size.
-    local bw = (R.w - 6) // 4
+    -- The three big buttons, the same size; IRIS is the small one on the energy line.
+    local bw = (R.w - 4) // 3
     local function at(n) return 1 + (n - 1) * (bw + 2) end
     ui.Button(frame, at(1), 19, bw, 3, "SCAN", C.amber, C.black, function() say(scan(false)) end, {around = C.page})
     ui.Button(frame, at(2), 19, bw, 3, dialLabel, C.green, C.black, function()
         say(dialWhenFree(clientEnv.fromGate(), row()))
     end, {around = C.page})
-    ui.Button(frame, at(3), 19, bw, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
-    ui.Button(frame, at(4), 19, R.w - at(4) + 1, 3, "IRIS", C.blue, C.black, function() say(iris(clientEnv.fromGate())) end, {around = C.page})
+    ui.Button(frame, at(3), 19, R.w - at(3) + 1, 3, "DISENGAGE", C.red, C.black, function() say(disengage(clientEnv.fromGate())) end, {around = C.page})
 end
 
 -- The first time the client opens, wake the known gates and look for gates straight away.

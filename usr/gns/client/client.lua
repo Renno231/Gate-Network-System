@@ -772,7 +772,11 @@ local function build()
             for _, s in ipairs(SCREENS) do if s[1] == clientEnv.screen then self:text(9, 1, s[3], C.dim, C.side) end end
         end
         local x = W - 6 - (gns.isRepeating and 10 or 0)
-        self:text(x, 1, os.date("%H:%M"), C.dim, C.side)
+        -- The time, or under a fifth of this device's charge left, the charge in red.
+        local most = computer.maxEnergy()
+        local charge = most > 0 and computer.energy() / most or 1
+        if charge < 0.2 then self:text(x, 1, ("▮%3d%%"):format(math.floor(charge * 100)), C.red, C.side)
+        else self:text(x, 1, os.date("%H:%M"), C.dim, C.side) end
         local from = clientEnv.fromGate()
         if from and (wide or not gns.isRepeating) then
             local tag, colour, name = from.tag, from.tag == "public" and C.dim or C.amber, from.name
@@ -924,7 +928,8 @@ local function build()
 end
 
 -- Keys no control used: 1-6 screens, ; the command bar, L the activity log, Q quit.
-loom.onKey(function(char, code)
+loom.onKey(function(char, code, player)
+    if ui.keyBeforeFocus(char, code, player) then return end
     if code == 1 then -- Escape: drop the focus (closes nothing)
         local f = loom.focused()
         if f then f:blur() end

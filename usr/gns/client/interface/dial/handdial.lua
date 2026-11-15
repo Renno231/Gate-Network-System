@@ -25,6 +25,7 @@ end
 
 local function notice(c, hand)
     if type(hand.address) ~= "table" or inBook(hand) then return end
+    c.unsaved = hand.time -- Dial's one-tap line offers SAVE until it is saved
     log(("%s was dialed by hand at %s: save [name] keeps the address."):format(c.name, tostring(hand.time)))
 end
 
@@ -39,6 +40,7 @@ local function saveHandDial(c, name)
     for i, glyph in ipairs(glyphs) do names[i] = tostring(glyph) end
     local p = clientEnv.profile()
     database[#database + 1] = clientEnv.setAddress({Name = name, Type = galaxy, IDCs = {}, Profiles = p and {[p.name] = true} or nil}, names, galaxy)
+    c.unsaved = nil
     clientEnv.changed()
     loom.invalidate()
     if not settings.showCodes then return ("Saved %s as gate %d (addresses are hidden on this device)."):format(name, #database) end

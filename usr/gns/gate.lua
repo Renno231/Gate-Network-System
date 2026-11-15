@@ -1147,7 +1147,7 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
     local function shape(s)
         return table.concat({tostring(s.state), tostring(s.outgoing), tostring(s.iris), tostring(s.irisProblem),
             tostring(s.dialing), tostring(s.lastDial), #(s.glyphs or {}), tostring(s.name), tostring(s.alarm),
-            tostring(s.seq), tostring(s.handDialed and s.handDialed.time)}, "|")
+            tostring(s.seq), tostring(s.handDialed and s.handDialed.time), tostring(s.spinning)}, "|")
     end
     local USE = {status = true, dial = true, closeWormhole = true, sendIdc = true, iris = true, queue = true}
     local function onCall(_, to, from, p, _, kind, id, method, payload)

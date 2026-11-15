@@ -383,7 +383,7 @@ clientEnv.command("set", "set fast|learn|take|codes on|off, set speed <s>, set s
     end
     return "Usage: set fast|learn|take|codes on|off, speed <s>, sleep <minutes>|off, scan <s>, range <blocks>, port <n>, layout auto|compact|wide"
 end)
-clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>", function(args)
+clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|battery|memory|fingerprint|entries|entry <gate>", function(args)
     local what = (args[1] or ""):lower()
     if what == "range" then return settings.modemRange .. " blocks"
     elseif what == "sleep" then return settings.tabletSleep == 0 and "off" or (settings.tabletSleep .. " min" .. (require("component").isAvailable("tablet") and "" or " (not a tablet: stays on)"))
@@ -392,6 +392,13 @@ clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|memory|f
     elseif what == "layout" then return settings.layout .. " (now " .. (ui.wide and "wide" or "compact") .. ")"
     elseif what == "port" then return tostring(settings.port)
     elseif what == "fingerprint" then return clientEnv.vault:fingerprint()
+    elseif what == "battery" then
+        -- This device's own charge (a tablet's battery; a computer's from its power network).
+        local computer, most = require("computer"), require("computer").maxEnergy()
+        local tablet = require("component").isAvailable("tablet")
+        if most <= 0 then return "No power stored." end
+        return ("%s: %d%% (%d of %d)"):format(tablet and "Battery" or "Power", math.floor(100 * computer.energy() / most),
+            math.floor(computer.energy()), math.floor(most))
     elseif what == "memory" then
         -- OC collects the garbage before every 10th resume, so one reading has up to nine
         -- resumes' garbage in it: the best of a reading a tick for 2 s is what is free after one.
@@ -415,7 +422,7 @@ clientEnv.command("get", "get range|speed|sleep|scan|port|layout|energy|memory|f
         return ("%d %s [%s] %s · IDCs %s · %s"):format(i, r.Name, tostring(r.Type), clientEnv.place(r) or "location unknown",
             #(r.IDCs or {}) > 0 and table.concat(r.IDCs, ", ") or "none", a and a:gsub(",", ", ") or "no address")
     end
-    return "Usage: get range|speed|sleep|scan|port|layout|energy|memory|fingerprint|entries|entry <gate>"
+    return "Usage: get range|speed|sleep|scan|port|layout|energy|battery|memory|fingerprint|entries|entry <gate>"
 end)
 
 ---------------------------------------------------------------------------- the screen
