@@ -19,9 +19,11 @@ local KAWOOSH_TICKS = 20 -- ticks after the wormhole opens before the iris opens
 -- JSG's abort clears the glyphs at once and again later (its STARGATE_FAIL task: 53 ticks from
 -- idle, 83 while the ring dials): a glyph engaged in between is lost.
 local ABORT_CLEAR = 4.2
--- The TPS probe's span of game time: under 5 s a tick's rounding is over 1 %; over a minute, the
--- figure would average an idle stretch instead of the server now.
-local SPAN_MIN, SPAN_MAX = 5, 60
+-- The TPS probe's span of game time. 2 s: a DHD dial engages its glyphs in about 5 s, so the
+-- figure is there while chevrons still engage, and a tick's rounding (2.5 % in 2 s) stays well
+-- inside the gap to the 18 TPS a player is told about. Over a minute, the figure would average
+-- an idle stretch instead of the server now.
+local SPAN_MIN, SPAN_MAX = 2, 60
 
 -- The glyphs of a "[A, B, C]" dialedAddress.
 local function dialedGlyphs(stargate)

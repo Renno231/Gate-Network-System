@@ -790,11 +790,11 @@ local function irisLook()
     local s = c and c.status
     if s then return s.iris, s.irisType end
 end
--- A lagging server (the gate's TPS probe): every wait takes 20 / TPS times as long in real time.
+-- A lagging server (the gate's TPS probe), said as players say it.
 local function slow(s)
     local tps = tonumber(s.tps)
     if not tps or tps >= 18 then return "" end
-    return (" · server at %.0f TPS: %.0fx slower"):format(tps, 20 / math.max(tps, 0.1))
+    return (" · server at %.0f TPS"):format(tps)
 end
 -- On a tablet the gate line also says what the iris (or shield) is doing when it is not simply
 -- open, or why it cannot be worked; the IRIS button only works it. The computer has an iris card.
