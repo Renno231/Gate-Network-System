@@ -790,11 +790,10 @@ local function irisLook()
     local s = c and c.status
     if s then return s.iris, s.irisType end
 end
--- A lagging server (the gate's TPS probe), said as players say it.
+-- A lagging server (the gate's TPS probe): its TPS, drawn in red after the dialing line.
 local function slow(s)
     local tps = tonumber(s.tps)
-    if not tps or tps >= 18 then return "" end
-    return (" · server at %.0f TPS"):format(tps)
+    if tps and tps < 18 then return ("%.0f TPS"):format(tps) end
 end
 -- On a tablet the gate line also says what the iris (or shield) is doing when it is not simply
 -- open, or why it cannot be worked; the IRIS button only works it. The computer has an iris card.
@@ -819,7 +818,7 @@ local function headline()
         return "WORMHOLE OPEN", (s.outgoing and ("Wormhole open to " .. name) or "Incoming wormhole") .. note, problem and C.red or C.sky
     elseif state == "dial" then
         return engaged == 0 and "DIALING" or (engaged >= total and ("CHEVRON " .. total .. " LOCKED") or ("CHEVRON " .. engaged .. " ENGAGED")),
-            ("Dialing%s · chevron %d of %d engaged"):format(note, engaged, total) .. slow(s), problem and C.red or C.amber
+            ("Dialing%s · chevron %d of %d engaged"):format(note, engaged, total), problem and C.red or C.amber, slow(s)
     end
     local price, cannot = "", false
     if not wide then price, cannot = costText(c, r, true) end
@@ -915,10 +914,12 @@ if wide then
     local gw = ui.gateSize(22)
     ui.Gate(frame, 1 + (71 - gw) // 2, 1, 22, gateLook, C.page, irisLook)
     ui.Paint(frame, 1, 38, 71, 8, function(self)
-        local big, detail, colour = headline()
+        local big, detail, colour, lag = headline()
         self:fill(1, 1, 71, 8, C.page)
         self:big(36, 1, big, colour, C.page)
-        self:text(1, 5, ui.center(detail, 71), C.dim, C.page)
+        local line = lag and (detail .. " · " .. lag) or detail
+        self:text(1, 5, ui.center(line, 71), C.dim, C.page)
+        if lag then self:text((71 - unicode.len(line)) // 2 + 1 + unicode.len(line) - unicode.len(lag), 5, lag, C.red, C.page) end
         chips(self, 2, 7, 71, 10, 2)
     end)
     local rx, rw = 75, R.w - 75
@@ -1130,8 +1131,10 @@ else
     -- What is happening, and the destination's address (each glyph's first three letters, amber
     -- as they engage), with GLYPHS (dial by touching glyphs) at the end of it.
     ui.Paint(frame, rx, 1, rw, 1, function(self)
-        local _, detail, colour = headline()
-        self:text(1, 1, ui.pad(detail, rw), colour, C.page)
+        local _, detail, colour, lag = headline()
+        self:text(1, 1, ui.pad(lag and (detail .. " · " .. lag) or detail, rw), colour, C.page)
+        local at = lag and unicode.len(detail) + 4
+        if at and at + unicode.len(lag) - 1 <= rw then self:text(at, 1, lag, C.red, C.page) end
     end)
     local aw = rw - 9
     ui.Paint(frame, rx, 2, aw, 1, function(self)
