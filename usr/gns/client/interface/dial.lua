@@ -82,7 +82,9 @@ end
 -- cards (it answered by local delivery, link.lua), else its distance with unit, else nil.
 local function away(c, unit)
     if component.list("modem")[c.address] then return "this computer" end
-    return c.distance and (math.floor(c.distance) .. unit) or nil
+    if not c.distance then return nil end
+    local n = math.floor(c.distance)
+    return n .. (n == 1 and (unit:gsub("blocks", "block")) or unit)
 end
 local function byDistance(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end
 local function isAdmin(c) return c and (c.role == "admin" or c.role == "owner") end
@@ -774,7 +776,8 @@ local function gateLook()
     local total = math.max(#(s.target or {}), #plannedGlyphs(c, row()), 1)
     local engaged = #(s.glyphs or {})
     local state = "idle"
-    if s.state == "open" then
+    -- "unstable": the wormhole bursting open (or collapsing), drawn open from the burst's start.
+    if s.state == "open" or s.state == "unstable" then
         state = s.iris == "CLOSED" and "iris" or "open"
         engaged = total
     elseif s.dialing and s.iris == "CLOSED" and engaged >= total then
@@ -815,7 +818,8 @@ local function headline()
         return s.irisType == "SHIELD" and "SHIELD UP" or "IRIS CLOSED",
             ((s.outgoing or s.dialing) and ("Wormhole to " .. name) or "Incoming wormhole") .. " · " .. irisSays(s, "CLOSED"), C.red
     elseif state == "open" then
-        return "WORMHOLE OPEN", (s.outgoing and ("Wormhole open to " .. name) or "Incoming wormhole") .. note, problem and C.red or C.sky
+        -- While it bursts open JSG does not say which way: a dial still under way is this gate's.
+        return "WORMHOLE OPEN", ((s.outgoing or s.dialing) and ("Wormhole open to " .. name) or "Incoming wormhole") .. note, problem and C.red or C.sky
     elseif state == "dial" then
         return engaged == 0 and "DIALING" or (engaged >= total and ("CHEVRON " .. total .. " LOCKED") or ("CHEVRON " .. engaged .. " ENGAGED")),
             ("Dialing%s · chevron %d of %d engaged"):format(note, engaged, total), problem and C.red or C.amber, slow(s)
