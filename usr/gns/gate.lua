@@ -920,8 +920,9 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
             dialer.by = session.key
             noteDialer()
             record(("%s dialed %s"):format(who(session), addressText(address)))
-            -- closeAfter: the wormhole closes that many seconds after it opens, unless closed or
-            -- dialed over meanwhile (GDS's close timer).
+            -- closeAfter: the wormhole closes that many seconds after it opens (counted from when it
+            -- is stable, not from the end of the dial, which waits out the kawoosh and the iris
+            -- opening again), unless closed or dialed over meanwhile (GDS's close timer).
             local after = math.tointeger(tonumber(opts.closeAfter))
             if after and after > 0 then
                 local mine = {}
@@ -930,7 +931,7 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
                 waitFor(function() return timedDial ~= mine or not dialer.busy() end,
                     120 + (tonumber(opts.speed) or 0) + 10, function(ended)
                     if not ended or timedDial ~= mine or not dialer.openedAt or dialer.incoming then return end
-                    timer(after, function()
+                    timer(math.max(after - (computer.uptime() - (dialer.stableAt or dialer.openedAt)), 0.05), function()
                         local s, out = stargate.getGateStatus()
                         if timedDial ~= mine or s ~= "open" or not out then return end
                         timedDial = nil
