@@ -298,7 +298,6 @@ function dialing.new(stargate, dhd, settings)
 
     local function onClose()
         dialer.incoming, dialer.openedAt, idc, admitted, adopted, stable, letting = false, nil, nil, nil, nil, nil, nil
-        dialer.stableAt = nil
         -- A dial of GNS's own already under way (dialed over this wormhole) keeps its dialer.
         if not job then dialer.by = nil end
         -- Only an iris GNS shut: one an admin shut by hand stays shut.
@@ -619,7 +618,7 @@ function dialing.new(stargate, dhd, settings)
             end
             if phase == "opening" then
                 if name ~= "stargate_wormhole_stabilized" or not value then return end
-                phase, dialer.stableAt = "kawoosh", computer.uptime()
+                phase = "kawoosh"
                 if closedIris then return wait(KAWOOSH_TICKS / 20, "kawoosh") end
             end
             if name == "kawoosh" then kawooshed = true end
