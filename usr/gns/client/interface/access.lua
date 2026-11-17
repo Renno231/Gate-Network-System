@@ -2,8 +2,7 @@
 -- SET UP makes an unregistered gate this device's; INVITE hands players nearby a grant (as the
 -- owner, or as an admin for the owner whose admin grant this device holds); JOIN asks for one;
 -- CUT OFF ends a grant this device issued, at every gate it covers that this device opens.
--- See docs/design/networks.md. Widget callbacks cannot wait, so each step continues in a
--- callback.
+-- Widget callbacks cannot wait, so each step continues in a callback.
 --
 -- vaultState.grants: the grants held. vaultState.issued: {grant, scope, cut}.
 -- vaultState.access[gate key] = {name, modem, port, wake, owner, role}.

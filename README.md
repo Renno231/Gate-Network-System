@@ -40,7 +40,8 @@ memory gets the wide layout with the big drawn gate.
 
 ### From the internet (a computer or tablet with an internet card)
 
-1. If the computer runs plain OpenOS, install QuickOS first, then follow its install wizard:
+1. Start with OpenOS installed on the computer's or tablet's hard drive and an internet card in
+   it. Install QuickOS, then follow its install wizard:
 
    ```
    pastebin run id5ZWJp8
@@ -302,10 +303,3 @@ The client's commands (`;` then `help`) are listed on its Guide screen.
 - **A client on the gate's computer** reaches its gate like any other (it shows as "this
   computer"). `local on` makes it the only device that controls the gate; travellers still get
   through the iris with an IDC or a GDO pass. While a client runs there, the gate does not sleep.
-
-## Design
-
-[docs/design/authentication.md](docs/design/authentication.md) describes the identities,
-handshake, signed entries and vault; [docs/design/networks.md](docs/design/networks.md) the
-networks: ports, wake keys, owners, grants, dial-back, passes and the off-world alarm;
-[docs/design/gds-parity.md](docs/design/gds-parity.md) what GNS keeps from GDS and why.

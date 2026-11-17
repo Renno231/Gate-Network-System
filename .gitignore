@@ -6,3 +6,5 @@ usr/gns/client/settings.lua
 usr/gns/client/vault
 usr/gns/server/settings.lua
 usr/gns/server/state
+
+docs/

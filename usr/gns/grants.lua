@@ -1,6 +1,6 @@
 -- GNS grants: who may use or control a gate. A grant is signed by the gate's owner (or, for a
 -- user grant, by one of the owner's admins), so a gate checks it offline and keeps no list of
--- members. See docs/design/networks.md.
+-- members.
 --
 -- grant = {owner, gate, holder, name, role, serial, signer, by, sig}
 --   owner   the owner's public key

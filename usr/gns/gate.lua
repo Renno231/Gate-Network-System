@@ -2,7 +2,7 @@
 -- in GDS; console, update and gatelog, too big for one message, over QuickOS api. The gate keeps
 -- its settings, its own key pair and signed entry, its owner's key, the grants it has cut off and
 -- the OC users of its computer; never other gates' entries (the address book lives on clients).
--- See docs/design/networks.md. Every function except open needs a device that has passed open
+-- Every function except open needs a device that has passed open
 -- (handshake.lua: over link the gate keeps what each modem proved), and a role:
 --   guest  status and energy: a stranger on an owned gate that lets anyone use one of its controls
 --   user   dial, close their own dial, the iris, GDO, signed pass, routes and dial-back

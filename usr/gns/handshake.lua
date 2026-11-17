@@ -2,7 +2,7 @@
 -- The client signs  "GNS2" | "client" | nonce | client modem | gate modem
 -- The gate signs    "GNS2" | "gate"   | nonce | client modem | gate modem
 -- OC sets the sender address of a modem message, so a proof only works from the device that
--- made it, to the gate it was made for. See docs/design/authentication.md.
+-- made it, to the gate it was made for.
 local ecc = require("ecc")
 
 local handshake = {ENDPOINT = "gns", PORT = 160}
