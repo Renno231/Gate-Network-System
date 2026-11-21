@@ -26,7 +26,7 @@ local gate = dofile(gns.path.gns .. "gate.lua")
 local handshake = dofile(gns.path.gns .. "handshake.lua")
 local fingerprint = dofile(gns.path.gns .. "vault.lua").fingerprint
 
--- gns.stargate and gns.dhd: stand-ins for tests.
+-- gns.stargate and gns.dhd, when set, take the place of the stargate and DHD components.
 local stargate = gns.stargate or component.stargate
 local dhd = gns.dhd or (component.isAvailable("dhd") and component.dhd or nil)
 
@@ -107,7 +107,7 @@ commands.room = function(argument)
     end
     room.run(node, settings)
 end
-for name, command in pairs(gns.commands or {}) do commands[name] = command end -- from test stand-ins
+for name, command in pairs(gns.commands or {}) do commands[name] = command end -- extra console commands, when set
 
 local function loop()
     if settings.room then room.run(node, settings) end

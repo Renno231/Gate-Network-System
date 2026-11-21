@@ -535,7 +535,7 @@ function gate.start(state, stargate, settings, dhd, saveSettings)
     -- other device sees the route and its IDCs; a hop without one is offered to each GNS gate in
     -- range, and only the gate the previous hop dialed takes it (its queue checks the address).
     -- Over link.lua each message is sent once: JSG's relay carries it about 10 blocks past the far
-    -- gate (networks.md), shut iris or not. Gates are tried one at a time: a first open's
+    -- gate, shut iris or not. Gates are tried one at a time: a first open's
     -- signature checks hold this computer for seconds.
     -- No gate answers when the far computer is still starting (the incoming wormhole's DHD
     -- redstone woke it): started, it asks for the IDC again (dialing.lua), and the hello goes once more.

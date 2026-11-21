@@ -3,9 +3,9 @@
 --   its answer     "gnsr", id, ok, results        to the caller's modem, on the call's port
 --   a gate status  "gnss", seq, status            to the devices watching the gate (gate.lua)
 -- Each call and hello is sent once, as on GDS: OC delivers a modem message in range. The caller
--- waits up to WAIT seconds (game time, so lag stretches it) for the answer: measured in the e2e
--- lanes with several clients per gate and the server at 1.2 to 20 TPS, the slowest call (open, its
--- handshake) took 21 ticks, so WAIT leaves room for a server CPU about 3 times slower, and a gate
+-- waits up to WAIT seconds (game time, so lag stretches it) for the answer: measured with several
+-- clients per gate and the server at 1.2 to 20 TPS, the slowest call (open, its handshake) took
+-- 21 ticks, so WAIT leaves room for a server CPU about 3 times slower, and a gate
 -- that is gone shows as one in WAIT seconds. The gate keeps each answer KEEP seconds, so a call
 -- that reaches it twice (by two modems) is answered twice and run once.
 -- OC sets every message's sender address, so a gate knows the caller by its modem: gate.lua keeps
